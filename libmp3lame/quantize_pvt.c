@@ -173,7 +173,7 @@ FLOAT   pow20[Q_MAX + Q_MAX2 + 1];
 FLOAT   ipow20[Q_MAX];
 FLOAT   pow43[PRECALC_SIZE];
 /* initialized in first call to iteration_init */
-#ifdef TAKEHIRO_IEEE754_HACK
+#if TAKEHIRO_IEEE754_HACK
 FLOAT   adj43asm[PRECALC_SIZE];
 #else
 FLOAT   adj43[PRECALC_SIZE];
@@ -352,7 +352,7 @@ iteration_init(lame_internal_flags * gfc)
         for (i = 1; i < PRECALC_SIZE; i++)
             pow43[i] = pow((FLOAT) i, 4.0 / 3.0);
 
-#ifdef TAKEHIRO_IEEE754_HACK
+#if TAKEHIRO_IEEE754_HACK
         adj43asm[0] = 0.0;
         for (i = 1; i < PRECALC_SIZE; i++)
             adj43asm[i] = i - 0.5 - pow(0.5 * (pow43[i - 1] + pow43[i]), 0.75);
@@ -427,7 +427,7 @@ iteration_init(lame_internal_flags * gfc)
  * bugfixes rh 8/01: often allocated more than the allowed 4095 bits
  ************************************************************************/
 int
-on_pe(lame_internal_flags * gfc, const FLOAT pe[][2], int targ_bits[2], int mean_bits, int gr, int cbr)
+on_pe(lame_internal_flags * gfc, const FLOAT pe[2][2], int targ_bits[2], int mean_bits, int gr, int cbr)
 {
     SessionConfig_t const *const cfg = &gfc->cfg;
     int     extra_bits = 0, tbits, bits;
@@ -632,7 +632,10 @@ calc_xmin(lame_internal_flags const *gfc,
             rh3 = rh2;
         }
         xmin = rh3;
-        {
+        /* ATHonly keeps the ATH computed above and drops the masking the
+           psychoacoustic model derived from the signal, which is what the
+           setting asks for. */
+        if (!cfg->ATHonly) {
             FLOAT const e = ratio->en.l[gsfb];
             if (e > 1e-12f) {
                 FLOAT   x;
@@ -722,7 +725,8 @@ calc_xmin(lame_internal_flags const *gfc,
                 rh3 = rh2;
             }
             xmin = rh3;
-            {
+            /* As above, and ATHshort asks for it on short blocks only. */
+            if (!cfg->ATHonly && !cfg->ATHshort) {
                 FLOAT const e = ratio->en.s[sfb][b];
                 if (e > 1e-12f) {
                     FLOAT   x;

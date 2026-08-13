@@ -178,7 +178,9 @@ putbits2(lame_internal_flags * gfc, int val, int j)
         assert(j < MAX_LENGTH); /* 32 too large on 32 bit machines */
         assert(bs->buf_bit_idx < MAX_LENGTH);
 
-        bs->buf[bs->buf_byte_idx] |= ((val >> j) << bs->buf_bit_idx);
+        /* (val >> j) can carry the sign bit; shift it as unsigned so positioning
+           it into the byte is defined. Only the low 8 bits are kept. */
+        bs->buf[bs->buf_byte_idx] |= (unsigned int) (val >> j) << bs->buf_bit_idx;
         bs->totbit += k;
     }
 }
@@ -209,7 +211,9 @@ putbits_noheaders(lame_internal_flags * gfc, int val, int j)
         assert(j < MAX_LENGTH); /* 32 too large on 32 bit machines */
         assert(bs->buf_bit_idx < MAX_LENGTH);
 
-        bs->buf[bs->buf_byte_idx] |= ((val >> j) << bs->buf_bit_idx);
+        /* (val >> j) can carry the sign bit; shift it as unsigned so positioning
+           it into the byte is defined. Only the low 8 bits are kept. */
+        bs->buf[bs->buf_byte_idx] |= (unsigned int) (val >> j) << bs->buf_bit_idx;
         bs->totbit += k;
     }
 }
@@ -277,7 +281,7 @@ writeheader(lame_internal_flags * gfc, int val, int j)
         j -= k;
         assert(j < MAX_LENGTH); /* >> 32  too large for 32 bit machines */
         esv->header[esv->h_ptr].buf[ptr >> 3]
-            |= ((val >> j)) << (8 - (ptr & 7) - k);
+            |= (unsigned int) (val >> j) << (8 - (ptr & 7) - k);
         ptr += k;
     }
     esv->header[esv->h_ptr].ptr = ptr;
@@ -287,16 +291,21 @@ writeheader(lame_internal_flags * gfc, int val, int j)
 static int
 CRC_update(int value, int crc)
 {
+    /* Shift the running CRC and the data through unsigned locals: crc grows past
+       bit 30 here, so the signed <<= 1 was a shift into/of the sign bit. The
+       tested bits (0x10000) and the polynomial XOR are unchanged, so the CRC is
+       identical. */
+    unsigned int uv = (unsigned int) value << 8;
+    unsigned int uc = (unsigned int) crc;
     int     i;
-    value <<= 8;
     for (i = 0; i < 8; i++) {
-        value <<= 1;
-        crc <<= 1;
+        uv <<= 1;
+        uc <<= 1;
 
-        if (((crc ^ value) & 0x10000))
-            crc ^= CRC16_POLYNOMIAL;
+        if (((uc ^ uv) & 0x10000))
+            uc ^= CRC16_POLYNOMIAL;
     }
-    return crc;
+    return (int) uc;
 }
 
 
@@ -368,7 +377,7 @@ encodeSideInfo2(lame_internal_flags * gfc, int bitsPerFrame)
 
         for (gr = 0; gr < 2; gr++) {
             for (ch = 0; ch < cfg->channels_out; ch++) {
-                gr_info *const gi = &l3_side->tt[gr][ch];
+                gr_info const *const gi = &l3_side->tt[gr][ch];
                 writeheader(gfc, gi->part2_3_length + gi->part2_length, 12);
                 writeheader(gfc, gi->big_values / 2, 9);
                 writeheader(gfc, gi->global_gain, 8);
@@ -379,12 +388,8 @@ encodeSideInfo2(lame_internal_flags * gfc, int bitsPerFrame)
                     writeheader(gfc, gi->block_type, 2);
                     writeheader(gfc, gi->mixed_block_flag, 1);
 
-                    if (gi->table_select[0] == 14)
-                        gi->table_select[0] = 16;
-                    writeheader(gfc, gi->table_select[0], 5);
-                    if (gi->table_select[1] == 14)
-                        gi->table_select[1] = 16;
-                    writeheader(gfc, gi->table_select[1], 5);
+                    writeheader(gfc, resolve_huffman_table(gi->table_select[0]), 5);
+                    writeheader(gfc, resolve_huffman_table(gi->table_select[1]), 5);
 
                     writeheader(gfc, gi->subblock_gain[0], 3);
                     writeheader(gfc, gi->subblock_gain[1], 3);
@@ -392,15 +397,9 @@ encodeSideInfo2(lame_internal_flags * gfc, int bitsPerFrame)
                 }
                 else {
                     writeheader(gfc, 0, 1); /* window_switching_flag */
-                    if (gi->table_select[0] == 14)
-                        gi->table_select[0] = 16;
-                    writeheader(gfc, gi->table_select[0], 5);
-                    if (gi->table_select[1] == 14)
-                        gi->table_select[1] = 16;
-                    writeheader(gfc, gi->table_select[1], 5);
-                    if (gi->table_select[2] == 14)
-                        gi->table_select[2] = 16;
-                    writeheader(gfc, gi->table_select[2], 5);
+                    writeheader(gfc, resolve_huffman_table(gi->table_select[0]), 5);
+                    writeheader(gfc, resolve_huffman_table(gi->table_select[1]), 5);
+                    writeheader(gfc, resolve_huffman_table(gi->table_select[2]), 5);
 
                     assert(0 <= gi->region0_count && gi->region0_count < 16);
                     assert(0 <= gi->region1_count && gi->region1_count < 8);
@@ -421,7 +420,7 @@ encodeSideInfo2(lame_internal_flags * gfc, int bitsPerFrame)
 
         gr = 0;
         for (ch = 0; ch < cfg->channels_out; ch++) {
-            gr_info *const gi = &l3_side->tt[gr][ch];
+            gr_info const *const gi = &l3_side->tt[gr][ch];
             writeheader(gfc, gi->part2_3_length + gi->part2_length, 12);
             writeheader(gfc, gi->big_values / 2, 9);
             writeheader(gfc, gi->global_gain, 8);
@@ -432,12 +431,8 @@ encodeSideInfo2(lame_internal_flags * gfc, int bitsPerFrame)
                 writeheader(gfc, gi->block_type, 2);
                 writeheader(gfc, gi->mixed_block_flag, 1);
 
-                if (gi->table_select[0] == 14)
-                    gi->table_select[0] = 16;
-                writeheader(gfc, gi->table_select[0], 5);
-                if (gi->table_select[1] == 14)
-                    gi->table_select[1] = 16;
-                writeheader(gfc, gi->table_select[1], 5);
+                writeheader(gfc, resolve_huffman_table(gi->table_select[0]), 5);
+                writeheader(gfc, resolve_huffman_table(gi->table_select[1]), 5);
 
                 writeheader(gfc, gi->subblock_gain[0], 3);
                 writeheader(gfc, gi->subblock_gain[1], 3);
@@ -445,15 +440,9 @@ encodeSideInfo2(lame_internal_flags * gfc, int bitsPerFrame)
             }
             else {
                 writeheader(gfc, 0, 1); /* window_switching_flag */
-                if (gi->table_select[0] == 14)
-                    gi->table_select[0] = 16;
-                writeheader(gfc, gi->table_select[0], 5);
-                if (gi->table_select[1] == 14)
-                    gi->table_select[1] = 16;
-                writeheader(gfc, gi->table_select[1], 5);
-                if (gi->table_select[2] == 14)
-                    gi->table_select[2] = 16;
-                writeheader(gfc, gi->table_select[2], 5);
+                writeheader(gfc, resolve_huffman_table(gi->table_select[0]), 5);
+                writeheader(gfc, resolve_huffman_table(gi->table_select[1]), 5);
+                writeheader(gfc, resolve_huffman_table(gi->table_select[2]), 5);
 
                 assert(0 <= gi->region0_count && gi->region0_count < 16);
                 assert(0 <= gi->region1_count && gi->region1_count < 8);
@@ -558,9 +547,10 @@ huffman_coder_count1(lame_internal_flags * gfc, gr_info const *gi)
   Implements the pseudocode of page 98 of the IS
   */
 inline static int
-Huffmancode(lame_internal_flags * const gfc, const unsigned int tableindex,
+Huffmancode(lame_internal_flags * const gfc, const unsigned int table_select,
             int start, int end, gr_info const *gi)
 {
+    const unsigned int tableindex = resolve_huffman_table(table_select);
     struct huffcodetab const *const h = &ht[tableindex];
     unsigned int const linbits = h->xlen;
     int     i, bits = 0;
@@ -985,12 +975,13 @@ format_bitstream(lame_internal_flags * gfc)
 
 
 static int
-do_gain_analysis(lame_internal_flags * gfc, unsigned char* buffer, int minimum)
+do_gain_analysis(LAME_UNUSED lame_internal_flags * gfc, LAME_UNUSED unsigned char* buffer,
+                 LAME_UNUSED int minimum)
 {
+#ifdef HAVE_MPG123
     SessionConfig_t const *const cfg = &gfc->cfg;
     RpgStateVar_t const *const rsv = &gfc->sv_rpg;
     RpgResult_t *const rov = &gfc->ov_rpg;
-#ifdef DECODE_ON_THE_FLY
     if (cfg->decode_on_the_fly) { /* decode the frame */
         sample_t pcm_buf[2][1152];
         int     mp3_in = minimum;
@@ -1093,7 +1084,7 @@ copy_buffer(lame_internal_flags * gfc, unsigned char *buffer, int size, int mp3d
 }
 
 
-void
+int
 init_bit_stream_w(lame_internal_flags * gfc)
 {
     EncStateVar_t *const esv = &gfc->sv_enc;
@@ -1102,10 +1093,15 @@ init_bit_stream_w(lame_internal_flags * gfc)
     esv->header[esv->h_ptr].write_timing = 0;
 
     gfc->bs.buf = lame_calloc(unsigned char, BUFFER_SIZE);
+    if (gfc->bs.buf == NULL) {
+        ERRORF(gfc, "Error: can't allocate bitstream buffer\n");
+        return -1;
+    }
     gfc->bs.buf_size = BUFFER_SIZE;
     gfc->bs.buf_byte_idx = -1;
     gfc->bs.buf_bit_idx = 0;
     gfc->bs.totbit = 0;
+    return 0;
 }
 
 /* end of bitstream.c */

@@ -26,6 +26,16 @@
 
 /* $Id$ */
 
+/*!
+  \file   lame.c
+  \brief  The LAME MP3 encoding engine.
+
+  Holds the encoder lifecycle of the public API, described with the group
+  those functions belong to: \ref api_encoding. Most of this file is the
+  engine behind them and is not part of the interface, so the group is named
+  on each public function rather than opened over the file.
+*/
+
 #ifdef HAVE_CONFIG_H
 # include <config.h>
 #endif
@@ -379,7 +389,7 @@ lame_init_qval(lame_global_flags * gfp)
 
     case 8:
         gfp->quality = 7;
-        /*lint --fallthrough */
+        /* fall through */
     case 7:            /* use psymodel (for short block and m/s switching), but no noise shapping */
         cfg->noise_shaping = 0;
         cfg->noise_shaping_amp = 0;
@@ -476,6 +486,21 @@ lame_init_qval(lame_global_flags * gfp)
         break;
     }
 
+    /*  Amplified noise shaping degrades CBR and ABR instead of improving them,
+     *  which is why the faster quality settings, the ones that leave it off,
+     *  sound better than the slower ones. It dates from the point where CBR
+     *  and ABR were switched over to the newer VBR psychoacoustic model
+     *  without adapting their encoding loops to it, so the amplification
+     *  decides against a distortion measure that no longer means what it did.
+     *  VBR is unaffected.
+     *
+     *  Until those loops are reconciled with the psychoacoustic model, keep
+     *  the amplification out of the modes it hurts. This treats the symptom;
+     *  the interaction itself is still to be repaired.
+     */
+    if (cfg->vbr == vbr_off || cfg->vbr == vbr_abr) {
+        cfg->noise_shaping_amp = 0;
+    }
 }
 
 
@@ -484,6 +509,56 @@ static double
 linear_int(double a, double b, double m)
 {
     return a + m * (b - a);
+}
+
+
+/* A frame carries its side information and then whatever is left, shared
+   between its granules. Below this many bits per granule there is not enough
+   left to place a granule at all, whatever the audio is: the bit allocation
+   goes negative and the quantization loop cannot meet its target.
+
+   Eight is measured rather than chosen. It is the boundary in every one of the
+   28 combinations of MPEG version, sample rate, channel count and CRC that
+   were tried, identically for near-silent and for full-scale material, and it
+   is also exactly what the tightest configuration the standard's bitrate
+   tables allow - MPEG-2 at 24 kHz and 8 kbit/s, two channels with CRC - leaves
+   over. So it cannot be raised without refusing a stream that is legal and
+   encodes correctly today. */
+#define MIN_MEAN_BITS_PER_GRANULE 8
+
+/* The bits a frame at this bitrate leaves for audio, per granule. Padding is
+   not counted: a padded frame is one byte larger, so leaving it out asks the
+   question of the smaller of the two frame sizes, which is the one that has to
+   work. */
+static int
+mean_bits_per_granule(SessionConfig_t const *const cfg, int kbps)
+{
+    int const frame_bits = 8 * ((cfg->version + 1) * 72000 * kbps
+                                / cfg->samplerate_out);
+
+    return (frame_bits - 8 * cfg->sideinfo_len) / cfg->mode_gr;
+}
+
+static int
+frame_has_room_for_audio(SessionConfig_t const *const cfg)
+{
+    return mean_bits_per_granule(cfg, cfg->avg_bitrate)
+        >= MIN_MEAN_BITS_PER_GRANULE;
+}
+
+/* The lowest bitrate that would work for this sample rate and channel count,
+   for a caller who has asked for one that does not, or 0 if the format has
+   none. */
+static int
+lowest_usable_free_format_bitrate(SessionConfig_t const *const cfg)
+{
+    int     kbps;
+
+    for (kbps = 8; kbps <= 640; ++kbps) {
+        if (mean_bits_per_granule(cfg, kbps) >= MIN_MEAN_BITS_PER_GRANULE)
+            return kbps;
+    }
+    return 0;
 }
 
 
@@ -536,6 +611,33 @@ linear_int(double a, double b, double m)
  *  lame_init_qval(gfp);
  *
  ********************************************************************/
+/*! Validate the settings and prepare the encoder for use. */
+/*!
+  \ingroup api_encoding
+  Called once, after \c lame_init() and after every parameter the caller wants
+  to change, and before the first \c lame_encode_buffer(). It checks what was
+  set, derives everything that was left at its default from it, allocates the
+  encoding buffers and writes the leading tags into the bitstream (through
+  \c lame_init_bitstream()).
+
+  This is where a bad combination of settings is reported, not where it was
+  set: the setters accept a value in range without knowing what it will be
+  combined with. Every parameter has a default, so an instance straight from
+  \c lame_init() initializes successfully - as CD-format stereo input at
+  44.1 kHz - which means a caller that forgets to describe its input gets a
+  wrong encode rather than an error.
+
+  Calling it a second time on the same instance is refused rather than
+  ignored, so parameters cannot be changed once encoding has been prepared.
+  A caller that needs different settings starts a new instance.
+
+  \param gfp the encoder instance from \c lame_init().
+  \return 0 on success; -1 if the settings could not be used - the input
+          sample rate, output sample rate or channel count makes no sense, a
+          buffer could not be allocated, or the instance was already
+          initialized. The instance stays valid after a failure and must still
+          be released with \c lame_close().
+*/
 int
 lame_init_params(lame_global_flags * gfp)
 {
@@ -585,24 +687,46 @@ lame_init_params(lame_global_flags * gfp)
     gfc->report_dbg = gfp->report.debugf;
     gfc->report_err = gfp->report.errorf;
 
-    if (gfp->asm_optimizations.amd3dnow)
-        gfc->CPU_features.AMD_3DNow = has_3DNow();
-    else
-        gfc->CPU_features.AMD_3DNow = 0;
-
-    if (gfp->asm_optimizations.mmx)
-        gfc->CPU_features.MMX = has_MMX();
-    else
-        gfc->CPU_features.MMX = 0;
-
-    if (gfp->asm_optimizations.sse) {
-        gfc->CPU_features.SSE = has_SSE();
+    /* A request for no vector routines is also a request not to ask the
+       processor about them.  On x86 these probes are the library's only use
+       of the CPUID instruction, and there are machines - the reason the
+       option is
+       documented as a rescue for a failing start-up - where executing it is
+       itself the failure, so a caller who has already decided against the
+       vector code must be able to stop the question being asked.  Under AUTO
+       the answer is what chooses the set, so there it has to be asked. */
+    if (gfp->vector_routines_request != VECTOR_IMPL_NONE
+        && gfp->asm_optimizations.sse) {
         gfc->CPU_features.SSE2 = has_SSE2();
+        /* AVX2 sits on top of SSE2, so it can be disabled on its own while the
+           SSE2 tier stays; disabling SSE removes the whole group above. */
+        gfc->CPU_features.AVX2 = gfp->asm_optimizations.avx2 ? has_AVX2() : 0;
+        /* The deprecated mask has no name for AVX-512 and must not grow one -
+           that is what lame_set_vector_routines() is for - so the rung above
+           inherits the AVX2 bit rather than being unreachable from the old
+           API or, worse, immune to it: a caller of the old API asking for no
+           AVX2 is asking for nothing wider than SSE2. */
+        gfc->CPU_features.AVX512 = gfp->asm_optimizations.avx2 ? has_AVX512() : 0;
     }
     else {
-        gfc->CPU_features.SSE = 0;
         gfc->CPU_features.SSE2 = 0;
+        gfc->CPU_features.AVX2 = 0;
+        gfc->CPU_features.AVX512 = 0;
     }
+
+    /* Set apart from the block above because the deprecated mask has no say
+       over it: that enumeration names x86 instruction-set families, and
+       teaching it a word for this one is precisely what
+       lame_set_vector_routines() exists to avoid.  So the ARM rung answers to
+       the request alone - which still means none turns it off, and still
+       means none asks the operating system nothing. */
+    gfc->CPU_features.NEON =
+        (gfp->vector_routines_request != VECTOR_IMPL_NONE) ? has_NEON() : 0;
+
+    /* One decision, here, before anything asks.  Every consumer of
+       vector_implementation() - the Huffman, quantization and FFT init and
+       the encode loops - runs later than this point. */
+    vector_impl_init(gfc, gfp->vector_routines_request);
 
 
     cfg->vbr = gfp->VBR;
@@ -638,7 +762,7 @@ lame_init_params(lame_global_flags * gfp)
 
     if (cfg->vbr == vbr_off && gfp->brate == 0) {
         /* no bitrate or compression ratio specified, use 11.025 */
-        if (EQ(gfp->compression_ratio, 0))
+        if (EQ(gfp->compression_ratio, 0.0))
             gfp->compression_ratio = 11.025; /* rate to compress a CD down to exactly 128000 bps */
     }
 
@@ -923,20 +1047,14 @@ lame_init_params(lame_global_flags * gfp)
         else {
             gfp->brate = FindNearestBitrate(gfp->brate, cfg->version, cfg->samplerate_out);
             gfc->ov_enc.bitrate_index = BitrateIndex(gfp->brate, cfg->version, cfg->samplerate_out);
-            if (gfc->ov_enc.bitrate_index <= 0) {
-                /* This never happens, because of preceding FindNearestBitrate!
-                 * But, set a sane value, just in case
-                 */
-                assert(0);
-                gfc->ov_enc.bitrate_index = 8;
-            }
         }
     }
     else {
         gfc->ov_enc.bitrate_index = 1;
     }
 
-    init_bit_stream_w(gfc);
+    if (init_bit_stream_w(gfc) != 0)
+        return -1;
 
     j = cfg->samplerate_index + (3 * cfg->version) + 6 * (cfg->samplerate_out < 16000);
     for (i = 0; i < SBMAX_l + 1; i++)
@@ -1084,26 +1202,12 @@ lame_init_params(lame_global_flags * gfp)
                 FindNearestBitrate(gfp->VBR_min_bitrate_kbps, cfg->version, cfg->samplerate_out);
             cfg->vbr_min_bitrate_index =
                 BitrateIndex(gfp->VBR_min_bitrate_kbps, cfg->version, cfg->samplerate_out);
-            if (cfg->vbr_min_bitrate_index < 0) {
-                /* This never happens, because of preceding FindNearestBitrate!
-                 * But, set a sane value, just in case
-                 */
-                assert(0);
-                cfg->vbr_min_bitrate_index = 1;
-            }
         }
         if (gfp->VBR_max_bitrate_kbps) {
             gfp->VBR_max_bitrate_kbps =
                 FindNearestBitrate(gfp->VBR_max_bitrate_kbps, cfg->version, cfg->samplerate_out);
             cfg->vbr_max_bitrate_index =
                 BitrateIndex(gfp->VBR_max_bitrate_kbps, cfg->version, cfg->samplerate_out);
-            if (cfg->vbr_max_bitrate_index < 0) {
-                /* This never happens, because of preceding FindNearestBitrate!
-                 * But, set a sane value, just in case
-                 */
-                assert(0);
-                cfg->vbr_max_bitrate_index = cfg->samplerate_out < 16000 ? 8 : 14;
-            }
         }
         gfp->VBR_min_bitrate_kbps = bitrate_table[cfg->version][cfg->vbr_min_bitrate_index];
         gfp->VBR_max_bitrate_kbps = bitrate_table[cfg->version][cfg->vbr_max_bitrate_index];
@@ -1125,6 +1229,31 @@ lame_init_params(lame_global_flags * gfp)
     cfg->vbr_avg_bitrate_kbps = gfp->VBR_mean_bitrate_kbps;
     cfg->compression_ratio = gfp->compression_ratio;
 
+    /* A free format bitrate is the caller's own number rather than one from
+       the standard's tables, so this is the first point at which anything has
+       looked at whether a frame that size can hold a frame at all. It is asked
+       here because it needs the side information length, the number of
+       granules and the output sample rate, and this is where the last of them
+       is known. */
+    if (cfg->free_format && !frame_has_room_for_audio(cfg)) {
+        int const lowest = lowest_usable_free_format_bitrate(cfg);
+
+        if (lowest > 0) {
+            ERRORF(gfc, "Error: a free format stream at %d Hz with %d channel(s) "
+                   "cannot be encoded at %d kbit/s - a frame that size has no "
+                   "room for audio beside its own side information. The lowest "
+                   "usable bitrate here is %d kbit/s.\n",
+                   cfg->samplerate_out, cfg->channels_out, cfg->avg_bitrate,
+                   lowest);
+        }
+        else {
+            ERRORF(gfc, "Error: a free format stream at %d Hz with %d channel(s) "
+                   "cannot be encoded at any bitrate this format allows.\n",
+                   cfg->samplerate_out, cfg->channels_out);
+        }
+        return -1;
+    }
+
     /* initialize internal qval settings */
     lame_init_qval(gfp);
 
@@ -1132,9 +1261,8 @@ lame_init_params(lame_global_flags * gfp)
     /*  automatic ATH adjustment on
      */
     if (gfp->athaa_type < 0)
-        gfc->ATH->use_adjust = 3;
-    else
-        gfc->ATH->use_adjust = gfp->athaa_type;
+        gfp->athaa_type = 3;
+    gfc->ATH->use_adjust = gfp->athaa_type;
 
 
     /* initialize internal adaptive ATH settings  -jd */
@@ -1276,7 +1404,8 @@ lame_init_params(lame_global_flags * gfp)
     (void) lame_init_bitstream(gfp);
 
     iteration_init(gfc);
-    (void) psymodel_init(gfp);
+    if (psymodel_init(gfp) != 0)
+        return -1;
 
     cfg->buffer_constraint = get_max_frame_buffer_size_by_constraint(cfg, gfp->strict_ISO);
 
@@ -1297,7 +1426,7 @@ lame_init_params(lame_global_flags * gfp)
         }
     }
 
-#ifdef DECODE_ON_THE_FLY
+#ifdef HAVE_MPG123
     if (cfg->decode_on_the_fly && !gfp->decode_only) {
         if (gfc->hip) {
             hip_decode_exit(gfc->hip);
@@ -1314,22 +1443,22 @@ lame_init_params(lame_global_flags * gfp)
     return 0;
 }
 
-static void
-concatSep(char* dest, char const* sep, char const* str)
-{
-    if (*dest != 0) strcat(dest, sep);
-    strcat(dest, str);
-}
+/*! Report the encoding parameters that were settled on. */
+/*!
+  \ingroup api_encoding
+  Writes a short human-readable summary - version, CPU features in use, input
+  and output sample rate and any resampling between them, the encoding mode -
+  through the message callback (\c lame_set_msgf()), which by default prints
+  to \c stderr. This is what the \c lame command line prints at the start of
+  an encode.
 
-/*
- *  print_config
- *
- *  Prints some selected information about the coding parameters via
- *  the macro command MSGF(), which is currently mapped to lame_errorf
- *  (reports via a error function?), which is a printf-like function
- *  for <stderr>.
- */
+  Meant to be called after \c lame_init_params(), because most of what it
+  reports is derived there rather than set by the caller. The text is for
+  people, not for parsing: it changes between versions, and a program that
+  wants a value should ask for it with the corresponding getter.
 
+  \param gfp an initialized encoder instance.
+*/
 void
 lame_print_config(const lame_global_flags * gfp)
 {
@@ -1343,45 +1472,29 @@ lame_print_config(const lame_global_flags * gfp)
 #if (LAME_ALPHA_VERSION)
     MSGF(gfc, "warning: alpha versions should be used for testing only\n");
 #endif
-    if (gfc->CPU_features.MMX
-        || gfc->CPU_features.AMD_3DNow || gfc->CPU_features.SSE || gfc->CPU_features.SSE2) {
-        char    text[256] = { 0 };
-        int     fft_asm_used = 0;
-#ifdef HAVE_NASM
-        if (gfc->CPU_features.AMD_3DNow) {
-            fft_asm_used = 1;
-        }
-        else if (gfc->CPU_features.SSE) {
-            fft_asm_used = 2;
-        }
-#else
-# if defined( HAVE_XMMINTRIN_H ) && defined( MIN_ARCH_SSE )
-        {
-            fft_asm_used = 3;
-        }
-# endif
-#endif
-        if (gfc->CPU_features.MMX) {
-#ifdef MMX_choose_table
-            concatSep(text, ", ", "MMX (ASM used)");
-#else
-            concatSep(text, ", ", "MMX");
-#endif
-        }
-        if (gfc->CPU_features.AMD_3DNow) {
-            concatSep(text, ", ", (fft_asm_used == 1) ? "3DNow! (ASM used)" : "3DNow!");
-        }
-        if (gfc->CPU_features.SSE) {
-#if defined(HAVE_XMMINTRIN_H)
-            concatSep(text, ", ", "SSE (ASM used)");
-#else
-            concatSep(text, ", ", (fft_asm_used == 2) ? "SSE (ASM used)" : "SSE");
-#endif
-        }
-        if (gfc->CPU_features.SSE2) {
-            concatSep(text, ", ", (fft_asm_used == 3) ? "SSE2 (ASM used)" : "SSE2");
-        }
-        MSGF(gfc, "CPU features: %s\n", text);
+    {
+        char    text[256];
+        char    disp[VECTOR_IMPL_NAME_MAX];
+
+        /* What could be selected here, rather than what the processor
+           happens to carry: a set this build does not have is not a choice,
+           and reporting it invites the question of why it was not used.
+
+           Not asked at all when the caller asked for none, because building
+           this list is the probe: the promise that none leaves the processor
+           uninterrogated would be worth nothing if a report could break it,
+           and a request for diagnostic output is exactly what someone whose
+           machine cannot survive the probe would reach for. */
+        if (gfp->vector_routines_request != VECTOR_IMPL_NONE
+            && vector_impl_available_list(text, sizeof text)[0] != '\0')
+            MSGF(gfc, "CPU features: %s\n", text);
+
+        /* Always printed, "NONE" included. It answers "which set did this
+           encode run", and no line at all would be indistinguishable from a
+           version that does not report it. */
+        MSGF(gfc, "vector routines: %s\n",
+             vector_impl_display(vector_impl_name(vector_implementation(gfc)),
+                                 disp, sizeof disp));
     }
 
     if (cfg->channels_in == 2 && cfg->channels_out == 1 /* mono */ ) {
@@ -1416,11 +1529,25 @@ lame_print_config(const lame_global_flags * gfp)
 }
 
 
-/**     rh:
- *      some pretty printing is very welcome at this point!
- *      so, if someone is willing to do so, please do it!
- *      add more, if you see more...
- */
+/*! Report the full internal encoder configuration. */
+/*!
+  \ingroup api_encoding
+  A far more detailed counterpart to \c lame_print_config(): dozens of lines
+  covering the psychoacoustic settings, the filters, the quantization
+  parameters and the VBR configuration, again through the message callback
+  (\c lame_set_msgf()). This is what the \c lame command line prints under
+  \c --verbose.
+
+  Meant for diagnosing an encode, so it is only meaningful after
+  \c lame_init_params(). The layout is not stable across versions and is not
+  meant to be parsed.
+
+  \param gfp an initialized encoder instance.
+
+  \todo The output is a dense dump of settings. Friendlier formatting would
+        help, and any part of the configuration it does not yet print should
+        be added.
+*/
 void
 lame_print_internals(const lame_global_flags * gfp)
 {
@@ -1603,7 +1730,7 @@ save_gain_values(lame_internal_flags * gfc)
     /* save the ReplayGain value */
     if (cfg->findReplayGain) {
         FLOAT const RadioGain = (FLOAT) GetTitleGain(rsv->rgdata);
-        if (NEQ(RadioGain, GAIN_NOT_ENOUGH_SAMPLES)) {
+        if (NEQ(RadioGain, (FLOAT) GAIN_NOT_ENOUGH_SAMPLES)) {
             rov->RadioGain = (int) floor(RadioGain * 10.0 + 0.5); /* round to nearest */
         }
         else {
@@ -1613,13 +1740,22 @@ save_gain_values(lame_internal_flags * gfc)
 
     /* find the gain and scale change required for no clipping */
     if (cfg->findPeakSample) {
-        rov->noclipGainChange = (int) ceil(log10(rov->PeakSample / 32767.0) * 20.0 * 10.0); /* round up */
+        if (rov->PeakSample > 0) {
+            rov->noclipGainChange = (int) ceil(log10(rov->PeakSample / 32767.0) * 20.0 * 10.0); /* round up */
 
-        if (rov->noclipGainChange > 0) { /* clipping occurs */
-            rov->noclipScale = floor((32767.0f / rov->PeakSample) * 100.0f) / 100.0f; /* round down */
+            if (rov->noclipGainChange > 0) { /* clipping occurs */
+                rov->noclipScale = floor((32767.0f / rov->PeakSample) * 100.0f) / 100.0f; /* round down */
+            }
+            else        /* no clipping */
+                rov->noclipScale = -1.0f;
         }
-        else            /* no clipping */
+        else {
+            /* Material with no non-zero sample has no peak to measure against,
+               and the logarithm of zero is not a number this can carry. It
+               cannot clip either, so it gets the answer that says so. */
+            rov->noclipGainChange = 0;
             rov->noclipScale = -1.0f;
+        }
     }
 }
 
@@ -1746,7 +1882,8 @@ lame_encode_buffer_sample_t(lame_internal_flags * gfc,
         in_buffer_ptr[0] = in_buffer[0];
         in_buffer_ptr[1] = in_buffer[1];
         /* copy in new samples into mfbuf, with resampling */
-        fill_buffer(gfc, mfbuf, &in_buffer_ptr[0], nsamples, &n_in, &n_out);
+        if (fill_buffer(gfc, mfbuf, &in_buffer_ptr[0], nsamples, &n_in, &n_out) < 0)
+            return LAME_NOMEM;
 
         /* compute ReplayGain of resampled input if requested */
         if (cfg->findReplayGain && !cfg->decode_on_the_fly)
@@ -1818,8 +1955,43 @@ enum PCMSampleType
 ,   pcm_double_type
 };
 
-static void
-lame_copy_inbuffer(lame_internal_flags* gfc, 
+/*
+ * An IEEE-754 value is NaN or infinite exactly when every exponent bit is set.
+ *
+ * The library is built with -ffast-math, under which the compiler is entitled
+ * to assume that neither ever occurs and to delete a test for one. It sees
+ * through the spelling: reading the raw bit pattern is not enough by itself,
+ * because the integer comparison below is recognised as a floating point class
+ * test and folded to a constant just as isfinite() or x!=x would be. The value
+ * therefore reaches the comparison through a volatile object, whose contents
+ * the compiler may not reason about.
+ */
+static int
+pcm_float_is_finite(float const x)
+{
+    float volatile opaque = x;
+    float   sample;
+    uint32_t bits;
+
+    sample = opaque;
+    memcpy(&bits, &sample, sizeof bits);
+    return ((bits >> 23) & 0xFFu) != 0xFFu;
+}
+
+static int
+pcm_double_is_finite(double const x)
+{
+    double volatile opaque = x;
+    double  sample;
+    uint64_t bits;
+
+    sample = opaque;
+    memcpy(&bits, &sample, sizeof bits);
+    return ((bits >> 52) & 0x7FFu) != 0x7FFu;
+}
+
+static int
+lame_copy_inbuffer(lame_internal_flags* gfc,
                    void const* l, void const* r, int nsamples,
                    enum PCMSampleType pcm_type, int jump, FLOAT s)
 {
@@ -1835,39 +2007,56 @@ lame_copy_inbuffer(lame_internal_flags* gfc,
     m[1][0] = s * cfg->pcm_transform[1][0];
     m[1][1] = s * cfg->pcm_transform[1][1];
 
+    /* Integer sample types cannot represent NaN or infinity, so they are taken
+     * as given; only the floating point ones are screened.
+     */
+#define VALIDATE_NONE(sl, sr)
+#define VALIDATE_FLOAT(sl, sr) \
+    if (!pcm_float_is_finite(sl) || !pcm_float_is_finite(sr)) { \
+        return -1; \
+    }
+#define VALIDATE_DOUBLE(sl, sr) \
+    if (!pcm_double_is_finite(sl) || !pcm_double_is_finite(sr)) { \
+        return -1; \
+    }
+
     /* make a copy of input buffer, changing type to sample_t */
-#define COPY_AND_TRANSFORM(T) \
+#define COPY_AND_TRANSFORM(T, VALIDATE) \
 { \
     T const *bl = l, *br = r; \
     int     i; \
     for (i = 0; i < nsamples; i++) { \
-        sample_t const xl = *bl; \
-        sample_t const xr = *br; \
-        sample_t const u = xl * m[0][0] + xr * m[0][1]; \
-        sample_t const v = xl * m[1][0] + xr * m[1][1]; \
-        ib0[i] = u; \
-        ib1[i] = v; \
+        VALIDATE(*bl, *br) \
+        { \
+            sample_t const xl = *bl; \
+            sample_t const xr = *br; \
+            sample_t const u = xl * m[0][0] + xr * m[0][1]; \
+            sample_t const v = xl * m[1][0] + xr * m[1][1]; \
+            ib0[i] = u; \
+            ib1[i] = v; \
+        } \
         bl += jump; \
         br += jump; \
     } \
 }
     switch ( pcm_type ) {
-    case pcm_short_type: 
-        COPY_AND_TRANSFORM(short int);
+    case pcm_short_type:
+        COPY_AND_TRANSFORM(short int, VALIDATE_NONE);
         break;
     case pcm_int_type:
-        COPY_AND_TRANSFORM(int);
+        COPY_AND_TRANSFORM(int, VALIDATE_NONE);
         break;
     case pcm_long_type:
-        COPY_AND_TRANSFORM(long int);
+        COPY_AND_TRANSFORM(long int, VALIDATE_NONE);
         break;
     case pcm_float_type:
-        COPY_AND_TRANSFORM(float);
+        COPY_AND_TRANSFORM(float, VALIDATE_FLOAT);
         break;
     case pcm_double_type:
-        COPY_AND_TRANSFORM(double);
+        COPY_AND_TRANSFORM(double, VALIDATE_DOUBLE);
         break;
     }
+    return 0;
 }
 
 
@@ -1888,17 +2077,39 @@ lame_encode_buffer_template(lame_global_flags * gfp,
                 return -2;
             }
             /* make a copy of input buffer, changing type to sample_t */
-            if (cfg->channels_in > 1) {
-                if (buffer_l == 0 || buffer_r == 0) {
-                    return 0;
+            {
+                int     rc;
+
+                if (cfg->channels_in > 1) {
+                    if (buffer_l == 0 || buffer_r == 0) {
+                        return 0;
+                    }
+                    rc = lame_copy_inbuffer(gfc, buffer_l, buffer_r, nsamples, pcm_type, aa, norm);
+                } else {
+                    if (buffer_l == 0) {
+                        return 0;
+                    }
+                    /* An interleaved entry point reads the two channels from a
+                     * single buffer with a stride of two. On a mono session
+                     * there is only one channel in that buffer and no length to
+                     * bound the second read, so this walks one channel's worth
+                     * of samples past its end. Reject the combination rather
+                     * than read outside the caller's buffer; a mono session
+                     * takes its samples through the non-interleaved entry
+                     * points, which is what the interleaving front ends already
+                     * do.
+                     */
+                    if (aa != 1) {
+                        return LAME_BADINPUTDATA;
+                    }
+                    rc = lame_copy_inbuffer(gfc, buffer_l, buffer_l, nsamples, pcm_type, aa, norm);
                 }
-                lame_copy_inbuffer(gfc, buffer_l, buffer_r, nsamples, pcm_type, aa, norm);
-            }
-            else {
-                if (buffer_l == 0) {
-                    return 0;
+                /* A non-finite sample would spread through the psycho acoustic
+                 * model and turn the whole frame into noise.
+                 */
+                if (rc != 0) {
+                    return LAME_BADINPUTDATA;
                 }
-                lame_copy_inbuffer(gfc, buffer_l, buffer_l, nsamples, pcm_type, aa, norm);
             }
 
             return lame_encode_buffer_sample_t(gfc, nsamples, mp3buf, mp3buf_size);
@@ -1966,6 +2177,24 @@ lame_encode_buffer_interleaved_ieee_double(lame_t gfp,
 }
 
 
+/*! Encode PCM given as \c int, using the full range of the type. */
+/*!
+  \ingroup api_encoding
+  As \c lame_encode_buffer(), but the samples are \c int and full scale is the
+  whole range of that type, +/- 2^(8*sizeof(int)-1), rather than the +/- 32768
+  the \c short entry point takes. Keeping the family's scaling here would throw
+  away the precision the wider type is being used for, so this entry point
+  differs in what it expects and not only in the type it accepts.
+
+  \param gfp          the encoder instance.
+  \param pcm_l        PCM data for the left channel.
+  \param pcm_r        PCM data for the right channel.
+  \param nsamples     number of samples per channel.
+  \param mp3buf       receives the encoded MP3 stream.
+  \param mp3buf_size  size of \a mp3buf in bytes, or 0 to declare the buffer
+                      large enough and skip the check.
+  \return As \c lame_encode_buffer().
+*/
 int
 lame_encode_buffer_int(lame_global_flags * gfp,
                        const int pcm_l[], const int pcm_r[], const int nsamples,
@@ -1977,6 +2206,25 @@ lame_encode_buffer_int(lame_global_flags * gfp,
 }
 
 
+/*! Encode PCM given as \c long, using the full range of the type. */
+/*!
+  \ingroup api_encoding
+  As \c lame_encode_buffer(), but the samples are \c long and full scale is the
+  whole range of that type, +/- 2^(8*sizeof(long)-1).
+
+  This is the \c long entry point to use for data that fills a \c long;
+  \c lame_encode_buffer_long() takes the same type but expects the range of a
+  \c short.
+
+  \param gfp          the encoder instance.
+  \param pcm_l        PCM data for the left channel.
+  \param pcm_r        PCM data for the right channel.
+  \param nsamples     number of samples per channel.
+  \param mp3buf       receives the encoded MP3 stream.
+  \param mp3buf_size  size of \a mp3buf in bytes, or 0 to declare the buffer
+                      large enough and skip the check.
+  \return As \c lame_encode_buffer().
+*/
 int
 lame_encode_buffer_long2(lame_global_flags * gfp,
                          const long pcm_l[],  const long pcm_r[], const int nsamples,
@@ -1988,6 +2236,25 @@ lame_encode_buffer_long2(lame_global_flags * gfp,
 }
 
 
+/*! Encode PCM given as \c long, scaled as if it were \c short. */
+/*!
+  \ingroup api_encoding
+  As \c lame_encode_buffer(), but the samples are \c long. They are still
+  expected in the range of a \c short, +/- 32768, so the wider type carries no
+  more precision than a \c short would.
+
+  \c lame_encode_buffer_long2() takes the same type with the range that type
+  implies, and is the one to use for data that fills a \c long.
+
+  \param gfp          the encoder instance.
+  \param pcm_l        PCM data for the left channel.
+  \param pcm_r        PCM data for the right channel.
+  \param nsamples     number of samples per channel.
+  \param mp3buf       receives the encoded MP3 stream.
+  \param mp3buf_size  size of \a mp3buf in bytes, or 0 to declare the buffer
+                      large enough and skip the check.
+  \return As \c lame_encode_buffer().
+*/
 int
 lame_encode_buffer_long(lame_global_flags * gfp,
                         const long pcm_l[], const long pcm_r[], const int nsamples,
@@ -1999,6 +2266,27 @@ lame_encode_buffer_long(lame_global_flags * gfp,
 
 
 
+/*! Encode interleaved PCM given as \c short. */
+/*!
+  \ingroup api_encoding
+  As \c lame_encode_buffer(), but both channels arrive in one buffer, their
+  samples alternating, left channel first.
+
+  A session set to one input channel (\c lame_set_num_channels()) is refused
+  with #LAME_BADINPUTDATA. An interleaved buffer is read as two channels with a
+  stride of two, and a buffer holding one channel has no second channel to
+  read; single-channel input goes through the non-interleaved entry points.
+  Encoding two input channels down to a mono output is not affected.
+
+  \param gfp          the encoder instance.
+  \param pcm          PCM data for both channels, interleaved.
+  \param nsamples     number of samples in one channel, which is half the
+                      number of values in \a pcm.
+  \param mp3buf       receives the encoded MP3 stream.
+  \param mp3buf_size  size of \a mp3buf in bytes, or 0 to declare the buffer
+                      large enough and skip the check.
+  \return As \c lame_encode_buffer().
+*/
 int
 lame_encode_buffer_interleaved(lame_global_flags * gfp,
                                short int pcm[], int nsamples,
@@ -2009,6 +2297,25 @@ lame_encode_buffer_interleaved(lame_global_flags * gfp,
 }
 
 
+/*! Encode interleaved PCM given as \c int, using the full range of the type. */
+/*!
+  \ingroup api_encoding
+  As \c lame_encode_buffer_interleaved(), but the samples are \c int and full
+  scale is the whole range of that type, +/- 2^(8*sizeof(int)-1), as for
+  \c lame_encode_buffer_int().
+
+  A session set to one input channel is refused with #LAME_BADINPUTDATA, for
+  the reason given at \c lame_encode_buffer_interleaved().
+
+  \param gfp          the encoder instance.
+  \param pcm          PCM data for both channels, interleaved.
+  \param nsamples     number of samples in one channel, which is half the
+                      number of values in \a pcm.
+  \param mp3buf       receives the encoded MP3 stream.
+  \param mp3buf_size  size of \a mp3buf in bytes, or 0 to declare the buffer
+                      large enough and skip the check.
+  \return As \c lame_encode_buffer().
+*/
 int
 lame_encode_buffer_interleaved_int(lame_t gfp,
                                    const int pcm[], const int nsamples,
@@ -2031,6 +2338,30 @@ lame_encode_buffer_interleaved_int(lame_t gfp,
  Because we set the reservoir=0, they will also decode seperately
  with no errors.
 *********************************************************************/
+/*! Finish one MP3 of a gapless series, keeping the encoder running. */
+/*!
+  \ingroup api_encoding
+  Completes the current frame with ancillary data and empties the MP3 buffer,
+  but keeps the buffered PCM and the encoder state, so encoding continues into
+  the next output file. It also resets the bit reservoir, which is what lets
+  the resulting files decode both separately and concatenated without a gap.
+
+  Unlike \c lame_encode_flush() this writes no ID3v1 tag. Call
+  \c lame_init_bitstream() before writing the next file if it needs its own
+  leading tags.
+
+  This is the "no gap" half of the encoder's split-file support; the caller
+  still has to tell the encoder how many files there are and which one this is
+  (\c lame_set_nogap_total(), \c lame_set_nogap_currentindex()).
+
+  \param gfp             the encoder instance.
+  \param mp3buffer       where the remaining MP3 data is written; at least
+                         7200 bytes to hold everything a flush can emit.
+  \param mp3buffer_size  size of \a mp3buffer in bytes, or 0 to declare the
+                         buffer large enough and skip the check.
+  \return the number of bytes written to \a mp3buffer, which may be 0; a
+          negative value on failure, -3 if the instance is not usable.
+*/
 int
 lame_encode_flush_nogap(lame_global_flags * gfp, unsigned char *mp3buffer, int mp3buffer_size)
 {
@@ -2050,8 +2381,22 @@ lame_encode_flush_nogap(lame_global_flags * gfp, unsigned char *mp3buffer, int m
 }
 
 
-/* called by lame_init_params.  You can also call this after flush_nogap
-   if you want to write new id3v2 and Xing VBR tags into the bitstream */
+/*! Start a new bitstream: write the leading tags and reset the counters. */
+/*!
+  \ingroup api_encoding
+  Writes the ID3v2 tag (unless the caller has taken that over with
+  \c lame_set_write_id3tag_automatic()) and the Xing/LAME header to the front
+  of the stream, and zeroes the frame number, the histograms and the peak
+  sample.
+
+  \c lame_init_params() already does this, so a caller encoding one file never
+  needs it. It exists for the file after that: call it following
+  \c lame_encode_flush_nogap() to give the next output file its own leading
+  tags and its own statistics.
+
+  \param gfp the encoder instance.
+  \return 0 on success, -3 if the instance is not usable.
+*/
 int
 lame_init_bitstream(lame_global_flags * gfp)
 {
@@ -2111,6 +2456,31 @@ calc_mp3buffer_size_remaining( int mp3buffer_size, int mp3count)
 /* then write id3 v1 tags into bitstream.                        */
 /*****************************************************************/
 
+/*! Finish the stream: encode what is still buffered and emit the last frames. */
+/*!
+  \ingroup api_encoding
+  The last encoding call for a file. It pads the buffered PCM with silence so
+  the final frame is complete, encodes it, empties the MP3 buffer and - if the
+  library is writing tags itself, see \c lame_set_write_id3tag_automatic() -
+  appends the ID3v1 tag. The amount of padding it added is recorded in the
+  LAME header, so a decoder that reads that header does not play it back.
+
+  Calling it twice is harmless: the second call finds nothing buffered and
+  returns 0.
+
+  This does not release the instance. \c lame_close() still has to be called,
+  and the statistics and tag calls (\c lame_get_lametag_frame(),
+  \c lame_mp3_tags_fid(), the histograms) are meant to be used between the
+  two, while the encoder state still exists.
+
+  \param gfp             the encoder instance.
+  \param mp3buffer       where the final MP3 data is written; at least 7200
+                         bytes to hold everything a flush can emit.
+  \param mp3buffer_size  size of \a mp3buffer in bytes, or 0 to declare the
+                         buffer large enough and skip the check.
+  \return the number of bytes written to \a mp3buffer, which may be 0; a
+          negative value on failure, -3 if the instance is not usable.
+*/
 int
 lame_encode_flush(lame_global_flags * gfp, unsigned char *mp3buffer, int mp3buffer_size)
 {
@@ -2255,6 +2625,23 @@ lame_encode_flush(lame_global_flags * gfp, unsigned char *mp3buffer, int mp3buff
  *
  ***********************************************************************/
 
+/*! Release an encoder instance and everything it allocated. */
+/*!
+  \ingroup api_encoding
+  The last call for an instance. It frees the internal buffers and, for an
+  instance that came from \c lame_init(), the instance itself, so the pointer
+  must not be used again afterwards.
+
+  Call it on any instance \c lame_init() returned, including one whose
+  \c lame_init_params() failed - a failed initialization still leaves buffers
+  to release. It is not a substitute for \c lame_encode_flush(): closing
+  without flushing first discards whatever PCM was still buffered and leaves
+  the file without its final frames and ID3v1 tag.
+
+  \param gfp the encoder instance, or \c NULL, which does nothing.
+  \return 0 on success; -3 if the instance had already lost its internal
+          state, in which case everything that could still be freed was.
+*/
 int
 lame_close(lame_global_flags * gfp)
 {
@@ -2289,6 +2676,27 @@ lame_encode_finish(lame_global_flags * gfp, unsigned char *mp3buffer, int mp3buf
 #else
 #endif
 
+/*! Flush the stream and release the instance in one call. */
+/*!
+  \ingroup api_encoding
+  \deprecated Obsolete. Its declaration is compiled out of the installed
+  \c lame.h, so no new program can call it; the definition is still built and
+  exported only so that programs linked against an older release keep working.
+  New code calls \c lame_encode_flush() and then \c lame_close().
+
+  Combining the two loses the window between them: once this returns, the
+  encoder state is gone, so the statistics calls and \c lame_mp3_tags_fid()
+  can no longer be used to complete the VBR header.
+
+  \param gfp             the encoder instance.
+  \param mp3buffer       where the final MP3 data is written; at least 7200
+                         bytes.
+  \param mp3buffer_size  size of \a mp3buffer in bytes, or 0 to skip the
+                         check.
+  \return what \c lame_encode_flush() returned - the number of bytes written,
+          or a negative value on failure. The instance is released either way,
+          and any error from the release itself is not reported.
+*/
 int
 lame_encode_finish(lame_global_flags * gfp, unsigned char *mp3buffer, int mp3buffer_size)
 {
@@ -2304,6 +2712,30 @@ lame_encode_finish(lame_global_flags * gfp, unsigned char *mp3buffer, int mp3buf
 /*****************************************************************/
 void    lame_mp3_tags_fid(lame_global_flags * gfp, FILE * fpStream);
 
+/*! Write the finished LAME tag into an already written MP3 file. */
+/*!
+  \ingroup api_tags
+  The LAME tag - the leading frame carrying the Xing/Info header, the seek
+  table and the encoder's own fields - can only be completed once the encode
+  is, because it counts what the encode produced. LAME reserves a frame for it
+  at the front of the stream and this call fills that frame in.
+
+  So it comes last: after \c lame_encode_flush(), and after every byte of MP3
+  data has been written to \a fpStream. It seeks to the end of the file, reads
+  the front of it to step over an ID3v2 tag if one is there, and writes the
+  frame at the position that leaves - so the stream has to be a real file,
+  opened for reading as well as writing. A stream that cannot seek is not
+  usable here.
+
+  Nothing is written, and nothing is reported, if the encode is not producing a
+  LAME tag at all (\c lame_set_bWriteVbrTag()).
+
+  \c lame_get_lametag_frame() is the alternative for a caller that would rather
+  place the frame itself.
+
+  \param gfp       the encoder instance.
+  \param fpStream  the MP3 file, positioned anywhere, open for update.
+*/
 void
 lame_mp3_tags_fid(lame_global_flags * gfp, FILE * fpStream)
 {
@@ -2460,9 +2892,9 @@ lame_init_old(lame_global_flags * gfp)
     gfp->findReplayGain = 0;
     gfp->decode_on_the_fly = 0;
 
-    gfp->asm_optimizations.mmx = 1;
-    gfp->asm_optimizations.amd3dnow = 1;
     gfp->asm_optimizations.sse = 1;
+    gfp->asm_optimizations.avx2 = 1;
+    gfp->vector_routines_request = VECTOR_IMPL_AUTO;
 
     gfp->preset = 0;
 
@@ -2483,6 +2915,45 @@ lame_init_old(lame_global_flags * gfp)
 }
 
 
+/*! Create an encoder instance and fill it with the default settings. */
+/*!
+  \ingroup api_encoding
+  The first call of the encoding API. It allocates the context every other
+  \c lame_* function takes, and sets every parameter to its default, so a
+  caller only has to set what it wants to differ from the default.
+
+  Nothing is validated and no encoding state exists yet - that happens in
+  \c lame_init_params(), which must be called once all parameters have been
+  set. The usual sequence is:
+
+  \code
+  lame_global_flags *gfp = lame_init();
+  if (gfp == NULL)
+      return -1;                       // out of memory
+  lame_set_in_samplerate(gfp, 44100);
+  lame_set_num_channels(gfp, 2);
+  lame_set_VBR(gfp, vbr_default);
+  if (lame_init_params(gfp) < 0) {     // validates and locks the settings
+      lame_close(gfp);
+      return -1;                       // the settings were not usable
+  }
+  // ... lame_encode_buffer() per block of PCM ...
+  lame_encode_flush(gfp, mp3buf, sizeof mp3buf);
+  lame_close(gfp);
+  \endcode
+
+  Every instance obtained here must be released with \c lame_close(), which
+  is also the right call after a failed \c lame_init_params().
+
+  All encoder state lives in the returned instance, so two encoders need one
+  instance each. That is a statement about where the state is kept, not a
+  concurrency guarantee: **LAME promises no thread safety at all**, and a
+  caller that uses it from more than one thread is responsible for its own
+  serialization.
+
+  \return a pointer to a new encoder instance, owned by the caller, or
+          \c NULL if memory could not be allocated.
+*/
 lame_global_flags *
 lame_init(void)
 {
@@ -2532,6 +3003,19 @@ lame_init(void)
  *
  */
 
+/*! The bitrate each slot of the histograms stands for. */
+/*!
+  \ingroup api_statistics
+  Fills \a bitrate_kbps with the 14 bitrates of the MPEG version this instance
+  is encoding to, in the same order as the slots of \c lame_bitrate_hist() -
+  so the two are read side by side to turn a count into a bitrate.
+
+  A free-format encode has one bitrate rather than a choice of 14: slot 0 then
+  holds it and the other 13 are set to -1.
+
+  \param gfp           the encoder instance.
+  \param bitrate_kbps  receives 14 bitrates in kbps.
+*/
 void
 lame_bitrate_kbps(const lame_global_flags * gfp, int bitrate_kbps[14])
 {
@@ -2554,6 +3038,17 @@ lame_bitrate_kbps(const lame_global_flags * gfp, int bitrate_kbps[14])
 }
 
 
+/*! How many frames were written at each bitrate. */
+/*!
+  \ingroup api_statistics
+  Fills \a bitrate_count with the number of frames written at each of the 14
+  bitrates, which is what a VBR encode's bitrate distribution is made of. A CBR
+  encode puts every frame in one slot. \c lame_bitrate_kbps() says which
+  bitrate each slot is.
+
+  \param gfp            the encoder instance.
+  \param bitrate_count  receives 14 frame counts.
+*/
 void
 lame_bitrate_hist(const lame_global_flags * gfp, int bitrate_count[14])
 {
@@ -2580,6 +3075,16 @@ lame_bitrate_hist(const lame_global_flags * gfp, int bitrate_count[14])
 }
 
 
+/*! How many frames were written in each stereo mode. */
+/*!
+  \ingroup api_statistics
+  Fills \a stmode_count with the number of frames written in each of the four
+  stereo modes, over all bitrates. This is the figure that says how much of a
+  joint-stereo encode actually came out mid/side.
+
+  \param gfp           the encoder instance.
+  \param stmode_count  receives 4 frame counts.
+*/
 void
 lame_stereo_mode_hist(const lame_global_flags * gfp, int stmode_count[4])
 {
@@ -2598,6 +3103,17 @@ lame_stereo_mode_hist(const lame_global_flags * gfp, int stmode_count[4])
 
 
 
+/*! Stereo modes broken down by bitrate. */
+/*!
+  \ingroup api_statistics
+  Fills \a bitrate_stmode_count with the frame counts of
+  \c lame_stereo_mode_hist() split by bitrate slot, so
+  <tt>[bitrate][stereo mode]</tt>. Summing a column gives what
+  \c lame_stereo_mode_hist() reports.
+
+  \param gfp                   the encoder instance.
+  \param bitrate_stmode_count  receives 14 by 4 frame counts.
+*/
 void
 lame_bitrate_stereo_mode_hist(const lame_global_flags * gfp, int bitrate_stmode_count[14][4])
 {
@@ -2630,6 +3146,21 @@ lame_bitrate_stereo_mode_hist(const lame_global_flags * gfp, int bitrate_stmode_
 }
 
 
+/*! How often each block type was chosen. */
+/*!
+  \ingroup api_statistics
+  Fills \a btype_count with the number of times each block type was used, over
+  all bitrates. The slots are 0 normal, 1 start, 2 short, 3 stop, 4 mixed, and
+  slot 5 the total of the other five.
+
+  These are not frame counts. The block type is chosen per granule and per
+  channel, so one frame contributes as many counts as it has granules times
+  channels - four for a stereo MPEG-1 frame - and slot 5 is what to divide by
+  to get a proportion.
+
+  \param gfp          the encoder instance.
+  \param btype_count  receives 5 counts and their total.
+*/
 void
 lame_block_type_hist(const lame_global_flags * gfp, int btype_count[6])
 {
@@ -2648,6 +3179,17 @@ lame_block_type_hist(const lame_global_flags * gfp, int btype_count[6])
 
 
 
+/*! Block types broken down by bitrate. */
+/*!
+  \ingroup api_statistics
+  Fills \a bitrate_btype_count with the counts of \c lame_block_type_hist()
+  split by bitrate slot, so <tt>[bitrate][block type]</tt>, including the
+  per-bitrate total in column 5. Summing a column gives what
+  \c lame_block_type_hist() reports.
+
+  \param gfp                  the encoder instance.
+  \param bitrate_btype_count  receives 14 by 6 counts.
+*/
 void
 lame_bitrate_block_type_hist(const lame_global_flags * gfp, int bitrate_btype_count[14][6])
 {

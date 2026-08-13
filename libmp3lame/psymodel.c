@@ -1440,7 +1440,7 @@ L3psycho_anal_vbr(lame_internal_flags * gfc,
 
     /* block type  */
     int     ns_attacks[4][4] = { {0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0} };
-    int     uselongblock[2];
+    int     uselongblock[2] = { 1, 1 };
 
     /* usual variables like loop indices, etc..    */
     int     chn, sb, sblock;
@@ -1900,6 +1900,8 @@ psymodel_init(lame_global_flags const *gfp)
     memset(norm, 0, sizeof(norm));
 
     gd = lame_calloc(PsyConst_t, 1);
+    if (gd == 0)
+        return -1;
     gfc->cd_psy = gd;
 
     gd->force_short_block_calc = gfp->experimentalZ;

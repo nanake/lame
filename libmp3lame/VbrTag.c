@@ -218,7 +218,7 @@ IsVbrTag(const unsigned char *buf)
     return (isTag0 || isTag1);
 }
 
-#define SHIFT_IN_BITS_VALUE(x,n,v) ( x = (x << (n)) | ( (v) & ~(-1 << (n)) ) )
+#define SHIFT_IN_BITS_VALUE(x,n,v) ( x = (x << (n)) | ( (v) & ~(~0u << (n)) ) )
 
 static void
 setLameTagFrameHeader(lame_internal_flags const *gfc, unsigned char *buffer)
@@ -394,10 +394,8 @@ GetVbrTag(VBRTAGDATA * pTagData, const unsigned char *buf)
     }
 
     if (head_flags & TOC_FLAG) {
-        if (pTagData->toc != NULL) {
-            for (i = 0; i < NUMTOCENTRIES; i++)
-                pTagData->toc[i] = buf[i];
-        }
+        for (i = 0; i < NUMTOCENTRIES; i++)
+            pTagData->toc[i] = buf[i];
         buf += NUMTOCENTRIES;
     }
 
@@ -435,12 +433,10 @@ GetVbrTag(VBRTAGDATA * pTagData, const unsigned char *buf)
     fprintf(stderr, "enc_delay  = %i \n", enc_delay);
     fprintf(stderr, "enc_padding= %i \n", enc_padding);
     fprintf(stderr, "toc:\n");
-    if (pTagData->toc != NULL) {
-        for (i = 0; i < NUMTOCENTRIES; i++) {
-            if ((i % 10) == 0)
-                fprintf(stderr, "\n");
-            fprintf(stderr, " %3d", (int) (pTagData->toc[i]));
-        }
+    for (i = 0; i < NUMTOCENTRIES; i++) {
+        if ((i % 10) == 0)
+            fprintf(stderr, "\n");
+        fprintf(stderr, " %3d", (int) (pTagData->toc[i]));
     }
     fprintf(stderr, "\n***************** END OF VBR TAG INFO ***************\n");
 #endif
@@ -593,7 +589,6 @@ PutLameVBR(lame_global_flags const *gfp, size_t nMusicLength, uint8_t * pbtStrea
     SessionConfig_t const *const cfg = &gfc->cfg;
 
     int     nBytesWritten = 0;
-    int     i;
 
     int     enc_delay = gfc->ov_enc.encoder_delay; /* encoder delay */
     int     enc_padding = gfc->ov_enc.encoder_padding; /* encoder padding  */
@@ -776,6 +771,12 @@ PutLameVBR(lame_global_flags const *gfp, size_t nMusicLength, uint8_t * pbtStrea
     CreateI4(&pbtStreamBuffer[nBytesWritten], nQuality);
     nBytesWritten += 4;
 
+    /*! \par LAME tag: encoder-version sub-field, fixed 9-byte width.
+     *  \c szVersion (\c get_lame_tag_encoder_short_version()) must fit in
+     *  9 bytes - see the \c \\par blocks in that function's doc comment in
+     *  \c version.c for the exact byte budget, the reason the width can't
+     *  be changed, and the compile-time check that enforces it. `strncpy`
+     *  silently truncates (and skips the NUL terminator) if it doesn't fit. */
     strncpy((char *) &pbtStreamBuffer[nBytesWritten], szVersion, 9);
     nBytesWritten += 9;
 
@@ -870,6 +871,33 @@ skipId3v2(FILE * fpStream)
 
 
 
+/*! Hand the finished LAME tag frame to the caller instead of writing it. */
+/*!
+  \ingroup api_tags
+  Builds the same frame \c lame_mp3_tags_fid() would write - the Xing/Info
+  header, the seek table and the encoder's own fields - and copies it into
+  \a buffer, leaving it to the caller to put it in the right place. That is the
+  call to use when the output is not a file this library can seek in, or when
+  the caller is assembling the stream itself.
+
+  Like the writing form it comes last, after \c lame_encode_flush(): the frame
+  reports what the encode produced.
+
+  Where it goes is not a free choice. LAME reserved an empty frame for the tag
+  at the front of the audio data, and this frame replaces that one. Unless the
+  caller wrote something of its own ahead of the audio, that is the start of
+  the file, or the first thing after an ID3v2 tag; a caller that writes its own
+  leading data has to remember where the reserved frame ended up.
+
+  \param gfp     the encoder instance.
+  \param buffer  receives the frame.
+  \param size    the size of \a buffer in bytes.
+  \return the number of bytes written to \a buffer; 0 if this encode has no
+          LAME tag to hand over. If \a buffer is too small, the return value is
+          the size the frame needs, which is larger than \a size - so a result
+          greater than \a size means nothing was written and the call should be
+          repeated with a buffer that big.
+*/
 size_t
 lame_get_lametag_frame(lame_global_flags const *gfp, unsigned char *buffer, size_t size)
 {

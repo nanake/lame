@@ -1,0 +1,20 @@
+<Solution>
+  <Configurations>
+    <BuildType Name="Debug" />
+    <BuildType Name="Release" />
+    <Platform Name="Win32" />
+  </Configurations>
+  <Folder Name="/ACM/">
+    <Project Path="vs_lame_acm.vcxproj">
+    </Project>
+    <Project Path="vs_lame_acm_adbg.vcxproj">
+    </Project>
+    <Project Path="vs_lame_acm_tinyxml.vcxproj">
+    </Project>
+  </Folder>
+  <Project Path="vs_lame_dshow.vcxproj">
+  </Project>
+  <Project Path="vs_lame_test.vcxproj">
+  </Project>
+  <Project Path="vs_libmp3lame.vcxproj" />
+</Solution>

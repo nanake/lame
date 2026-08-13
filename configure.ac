@@ -1,16 +1,11 @@
 dnl $Id$
 dnl
 dnl
-dnl don't forget to set ASM_FOR_ARCH to a space delimited list of
-dnl processor architectures, for which assembler routines exist
-dnl
-dnl
 dnl Exported and configured variables:
 dnl CC
 dnl CFLAGS
 dnl LDFLAGS
 dnl LDADD
-dnl NASM
 
 dnl extra vars for frontend:
 dnl FRONTEND_LDFLAGS
@@ -20,11 +15,12 @@ dnl FRONTEND_LDADD
 dnl extra vars for libmp3lame:
 dnl LIBMP3LAME_LDADD
 
-AC_PREREQ([2.71])
-AC_INIT([lame],[3.101],[lame-dev@lists.sf.net])
+AC_PREREQ([2.73])
+AC_INIT([lame],[4.1],[lame-dev@lists.sourceforge.net])
 AC_CONFIG_SRCDIR([libmp3lame/lame.c])
 AC_CONFIG_MACRO_DIRS([m4])
 AC_LANG([C])
+AC_USE_SYSTEM_EXTENSIONS
 
 dnl check system
 AC_CANONICAL_HOST
@@ -40,6 +36,14 @@ AH_BOTTOM([#endif /* LAME_CONFIG_H */])
 AM_MAINTAINER_MODE
 AM_MAKE_INCLUDE
 PKG_PROG_PKG_CONFIG([])
+
+dnl for doc/Makefile's "doxygen" target - Graphviz is optional, so this must
+dnl not fail configure if it's absent
+AC_ARG_WITH([dot],
+  [AS_HELP_STRING([--with-dot=PATH], [path to Graphviz's dot tool, used by Doxygen for diagrams (default: autodetect on PATH)])],
+  [AS_IF([test "x$withval" = xno], [DOT=], [DOT="$withval"])],
+  [AC_PATH_PROG([DOT], [dot])])
+AC_SUBST([DOT])
 
 dnl check environment
 AC_SEARCH_LIBS([strerror],[cposix])
@@ -119,6 +123,35 @@ if test "x${GCC}" = "xyes"; then
 fi
 
 
+dnl LAME_CHECK_CFLAG(FLAG, VARIABLE)
+dnl   Append FLAG to shell VARIABLE if the C compiler accepts it.  -Werror is
+dnl   added so that a flag which only warns (e.g. clang's "unknown argument")
+dnl   still counts as a rejection, and -O2 is added so that flags which are
+dnl   only meaningful with optimization (e.g. _FORTIFY_SOURCE) probe correctly.
+AC_DEFUN([LAME_CHECK_CFLAG],
+[AC_MSG_CHECKING([whether $CC accepts $1])
+lame_check_flag_save=$CFLAGS
+CFLAGS="$CFLAGS -O2 $1 -Werror"
+AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[]], [[]])],
+  [lame_check_flag_ok=yes], [lame_check_flag_ok=no])
+CFLAGS=$lame_check_flag_save
+AC_MSG_RESULT([$lame_check_flag_ok])
+AS_IF([test "x$lame_check_flag_ok" = xyes], [$2="[$]{$2} $1"])
+])
+
+dnl LAME_CHECK_LDFLAG(FLAG, VARIABLE)
+dnl   Append FLAG to shell VARIABLE if the compiler driver / linker accepts it.
+AC_DEFUN([LAME_CHECK_LDFLAG],
+[AC_MSG_CHECKING([whether the linker accepts $1])
+lame_check_flag_save=$LDFLAGS
+LDFLAGS="$LDFLAGS $1 -Werror"
+AC_LINK_IFELSE([AC_LANG_PROGRAM([[]], [[]])],
+  [lame_check_flag_ok=yes], [lame_check_flag_ok=no])
+LDFLAGS=$lame_check_flag_save
+AC_MSG_RESULT([$lame_check_flag_ok])
+AS_IF([test "x$lame_check_flag_ok" = xyes], [$2="[$]{$2} $1"])
+])
+
 
 AC_CHECK_HEADER(dmalloc.h)
 if test "${ac_cv_header_dmalloc_h}" = "yes"; then
@@ -137,16 +170,124 @@ AC_CHECK_HEADERS( \
 		 unistd.h \
 		 linux/soundcard.h)
 
-dnl Checks for actually working SSE intrinsics
-AC_MSG_CHECKING(working SSE intrinsics)
-AC_COMPILE_IFELSE(
+dnl LAME_SSE2_PROBE(RESULT-VARIABLE)
+dnl   Compile the vector routines' own construct: an SSE2 intrinsic inside a
+dnl   function carrying the per-function target attribute they use.  Testing a
+dnl   bare intrinsic instead would ask "is SSE2 the compiler's default here",
+dnl   which is a stricter question than the source asks and answers no on
+dnl   32-bit x86.  Used below, after CFLAGS is final - see there for why.
+AC_DEFUN([LAME_SSE2_PROBE],
+[AC_COMPILE_IFELSE(
 	[AC_LANG_PROGRAM(
-		[[#include <xmmintrin.h>]],
-		[[_mm_sfence();]])],
-	[AC_DEFINE([HAVE_XMMINTRIN_H], [1], [Define if SSE intrinsics work.])
-	 ac_cv_header_xmmintrin_h=yes],
-	[ac_cv_header_xmmintrin_h=no])
-AC_MSG_RESULT(${ac_cv_header_xmmintrin_h})
+		[[#include <xmmintrin.h>
+		  #if defined (__GNUC__) && ((__GNUC__ > 4) || ((__GNUC__ == 4) && (__GNUC_MINOR__ >= 2)))
+		  #define SSE2_TARGET __attribute__((target("sse2")))
+		  #else
+		  #define SSE2_TARGET
+		  #endif
+		  static float probe_out;
+		  SSE2_TARGET static void probe(void)
+		  {
+		      __m128 v = _mm_set_ps(1.f, 2.f, 3.f, 4.f);
+		      _mm_store_ss(&probe_out, _mm_sqrt_ps(_mm_mul_ps(v, v)));
+		  }]],
+		[[probe();]])],
+	[$1=yes], [$1=no])])
+
+dnl LAME_NEON_PROBE(RESULT-VARIABLE)
+dnl   Compile the ARM vector routine's own constructs.  Three of them, because
+dnl   they do not all answer alike: the pairwise add over register halves is
+dnl   the one spelling of "fold adjacent lanes" that exists on both 32- and
+dnl   64-bit ARM, the lane read is how an index reaches a general register,
+dnl   and the compare-and-subtract is how the clamp counter is kept.  A probe
+dnl   on a bare vld1q would accept a toolchain that cannot build the file.
+dnl   No array subscripts anywhere in here.  A `[' is m4's quote character, so
+dnl   an int m[4] inside AC_LANG_PROGRAM comes out of the macro expansion as
+dnl   literal [[4]] and the probe fails to compile for a reason that has
+dnl   nothing to do with NEON - which reads exactly like "this toolchain has no
+dnl   NEON".  The quadrigraphs would work; not needing them is simpler.
+AC_DEFUN([LAME_NEON_PROBE],
+[AC_COMPILE_IFELSE(
+	[AC_LANG_PROGRAM(
+		[[#include <arm_neon.h>
+		  static int probe_out;
+		  static void probe(const int *p, int xlen)
+		  {
+		      int32x4_t v = vmulq_s32(vld1q_s32(p), vdupq_n_s32(xlen));
+		      int32x4_t c = vdupq_n_s32(0);
+		      int32x2_t h;
+		      c = vsubq_s32(c, vreinterpretq_s32_u32(vcgtq_s32(v, vdupq_n_s32(14))));
+		      v = vminq_s32(v, vdupq_n_s32(15));
+		      h = vpadd_s32(vget_low_s32(v), vget_high_s32(v));
+		      probe_out = vget_lane_s32(h, 0) + vgetq_lane_s32(c, 0);
+		  }]],
+		[[probe((const int *) 0, 16);]])],
+	[$1=yes], [$1=no])])
+
+dnl LAME_AVX2_PROBE(RESULT-VARIABLE)
+dnl   The same question one tier up.  Both an integer and a floating point
+dnl   construct are compiled, because they do not answer alike: GCC on 32-bit
+dnl   x86 with -ffast-math accepts the integer one under the target attribute
+dnl   and rejects the float one, so probing integers alone would promise a
+dnl   tier the build cannot finish.
+AC_DEFUN([LAME_AVX2_PROBE],
+[AC_COMPILE_IFELSE(
+	[AC_LANG_PROGRAM(
+		[[#include <immintrin.h>
+		  #if defined (__GNUC__) && ((__GNUC__ > 4) || ((__GNUC__ == 4) && (__GNUC_MINOR__ >= 2)))
+		  #define AVX2_TARGET __attribute__((target("avx2")))
+		  #else
+		  #define AVX2_TARGET
+		  #endif
+		  static const float probe_tbl[8] = { 0, 1, 2, 3, 4, 5, 6, 7 };
+		  static int probe_i;
+		  static float probe_f;
+		  AVX2_TARGET static void probe(void)
+		  {
+		      __m256i i = _mm256_set1_epi32(1);
+		      __m256i m = _mm256_max_epi16(_mm256_packs_epi32(i, i), _mm256_setzero_si256());
+		      probe_i = _mm256_extract_epi16(m, 0);
+		      _mm_store_ss(&probe_f, _mm256_castps256_ps128(_mm256_i32gather_ps(probe_tbl, i, 4)));
+		  }]],
+		[[probe();]])],
+	[$1=yes], [$1=no])])
+
+dnl LAME_AVX512_PROBE(RESULT-VARIABLE)
+dnl   One tier further up, and asking for four subsets rather than one: the
+dnl   kernels narrow to sixteen bits (BW), use the packed integer forms (DQ)
+dnl   and address the shorter widths on the same encodings (VL), so a compiler
+dnl   that offers only the foundation cannot build them.  Integer and floating
+dnl   point are both compiled here for the reason given above.
+AC_DEFUN([LAME_AVX512_PROBE],
+[AC_COMPILE_IFELSE(
+	[AC_LANG_PROGRAM(
+		[[#include <immintrin.h>
+		  #if defined (__GNUC__) && ((__GNUC__ > 4) || ((__GNUC__ == 4) && (__GNUC_MINOR__ >= 2)))
+		  #define AVX512_TARGET __attribute__((target("avx512f,avx512vl,avx512bw,avx512dq")))
+		  #else
+		  #define AVX512_TARGET
+		  #endif
+		  static const float probe_tbl@<:@16@:>@ = {
+		      0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15
+		  };
+		  static const int probe_itbl@<:@16@:>@ = {
+		      0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15
+		  };
+		  static int probe_i;
+		  static float probe_f;
+		  AVX512_TARGET static void probe(void)
+		  {
+		      __m512i i = _mm512_set1_epi32(1);
+		      __m512i g = _mm512_i32gather_epi32(i, probe_itbl, 4);
+		      __mmask16 m = _mm512_cmpgt_epu32_mask(i, _mm512_setzero_si512());
+		      __m512i p = _mm512_packs_epi32(g, g);
+		      probe_i = _mm512_reduce_max_epi32(p) + (int) m;
+		      _mm_store_ss(&probe_f,
+		                   _mm512_castps512_ps128(
+		                       _mm512_i32gather_ps(i, probe_tbl, 4)));
+		  }]],
+		[[probe();]])],
+	[$1=yes], [$1=no])])
 
 dnl Checks for typedefs, structures, and compiler characteristics.
 AC_C_CONST
@@ -393,42 +534,77 @@ dnl Checks for library functions.
 AC_FUNC_ALLOCA
 AC_CHECK_FUNCS(gettimeofday strtol)
 
+dnl For the ARM capability probe in libmp3lame/util.c.  The header and the
+dnl function are separate questions - a system can have <sys/auxv.h> and only
+dnl one of the two ways of reading it - so both are asked, and util.c includes
+dnl what the answers say exists rather than guessing from platform macros.
+AC_CHECK_HEADERS(sys/auxv.h machine/elf.h asm/hwcap.h)
+AC_CHECK_FUNCS(elf_aux_info getauxval sysctlbyname)
+
 if test "X${ac_cv_func_strtol}" != "Xyes"; then
 	AC_MSG_ERROR([function strtol is mandatory])
 fi
 
-dnl Check if we are on a mingw system, which needs libwsock32
-SOCKETFUNCTION=unknown
-AC_CHECK_FUNCS(socket)
-if test $ac_cv_func_socket = no; then
-	# maybe it is in libsocket
-	AC_CHECK_LIB(socket, socket, [AC_DEFINE(HAVE_SOCKET)
-	LIBS="$LIBS -lsocket"])
-	if test "X${ac_cv_lib_socket_socket}" != "Xyes"; then
-		SOCKETFUNCTION=NO
-	else
-		case ${host_os} in
-		*solaris*)
-			LIBS="$LIBS -lnsl"
-			;;
-		esac
+dnl The RTP sender is the only thing here that opens a socket, and it needs the
+dnl name resolver as well: socket(), getaddrinfo() and inet_ntop() together.
+dnl Probing them as a set, by linking the calls the code actually makes, is what
+dnl makes the answer usable - a system can have socket() in libc and the resolver
+dnl somewhere else, and MinGW has all three in ws2_32 and none of them in libc,
+dnl which an AC_CHECK_LIB(socket, socket) can never discover.
+dnl The result goes into SOCKET_LIBS, which only mp3rtp links, rather than into
+dnl the LIBS every target inherits.
+SOCKET_LIBS=
+lame_have_sockets=no
+lame_socket_save_LIBS="${LIBS}"
+AC_MSG_CHECKING([for the socket and resolver library])
+for lame_socket_try in "" "-lws2_32" "-lsocket -lnsl" "-lsocket"; do
+	LIBS="${lame_socket_save_LIBS} ${lame_socket_try}"
+	AC_LINK_IFELSE([AC_LANG_PROGRAM([[
+#ifdef _WIN32
+# include <winsock2.h>
+# include <ws2tcpip.h>
+#else
+# include <sys/types.h>
+# include <sys/socket.h>
+# include <netinet/in.h>
+# include <arpa/inet.h>
+# include <netdb.h>
+#endif
+	]], [[
+	struct addrinfo *res = 0;
+	char text[64];
+	(void) socket(AF_INET, SOCK_DGRAM, 0);
+	(void) getaddrinfo("localhost", "5004", 0, &res);
+	freeaddrinfo(res);
+	(void) inet_ntop(AF_INET, text, text, sizeof(text));
+	]])], [lame_have_sockets=yes])
+	if test ${lame_have_sockets} = yes; then
+		SOCKET_LIBS="${lame_socket_try}"
+		break
 	fi
+done
+LIBS="${lame_socket_save_LIBS}"
+if test ${lame_have_sockets} = yes; then
+	if test "X${SOCKET_LIBS}" = "X"; then
+		AC_MSG_RESULT([none needed])
+	else
+		AC_MSG_RESULT([${SOCKET_LIBS}])
+	fi
+	AC_DEFINE(HAVE_SOCKET, 1, [Define if socket, getaddrinfo and inet_ntop are usable])
+else
+	AC_MSG_RESULT([not found])
 fi
+AC_SUBST(SOCKET_LIBS)
 
 dnl Initialize configuration variables for the Makefile
 CFLAGS=${CFLAGS}
 CONFIG_DEFS=${CONFIG_DEFS}
-NASM=
 INCLUDES="-I\$(top_srcdir)/include -I\$(srcdir)"
 FRONTEND_LDFLAGS=
 FRONTEND_CFLAGS=
 LIB_SOURCES=
 MAKEDEP="-M"
 RM_F="rm -f"
-
-AC_ARG_ENABLE(nasm,
-  [  --enable-nasm           Allow the use of nasm if available],
-  ASM_FOR_ARCH="i386", ASM_FOR_ARCH="")
 
 AC_ARG_ENABLE(ieeehack,
   [  --enable-ieeehack       Enable Takhiros IEEE754 hack (speed improvement for old CPUs)],
@@ -446,12 +622,53 @@ dnl Checks for libraries.
 
 AC_CHECK_HEADERS(termcap.h)
 AC_CHECK_HEADERS(ncurses/termcap.h)
-AC_CHECK_LIB(termcap, initscr, HAVE_TERMCAP="termcap")
-AC_CHECK_LIB(curses, initscr, HAVE_TERMCAP="curses")
-AC_CHECK_LIB(ncurses, initscr, HAVE_TERMCAP="ncurses")
+
+dnl The console code drives the terminal through the termcap interface,
+dnl tgetent/tgetnum/tgetstr, and never calls initscr. Probing for initscr
+dnl therefore accepted libraries that cannot serve the header the console code
+dnl actually includes: where ncurses is packaged as a static library whose
+dnl termcap header declares those entry points as DLL imports, the probe
+dnl succeeded and the frontend then failed to link. Compile the same header
+dnl and calls the console code does, against each candidate in turn, and keep
+dnl the first that satisfies them, so that the intended termcap, curses,
+dnl ncurses preference decides. Falling through all three leaves the terminal
+dnl support disabled, which the console code already handles, rather than
+dnl breaking the build.
+HAVE_TERMCAP=""
+lame_termcap_save_LIBS="${LIBS}"
+for lame_termcap_lib in termcap curses ncurses; do
+  AC_MSG_CHECKING([for the termcap interface in -l${lame_termcap_lib}])
+  LIBS="-l${lame_termcap_lib} ${lame_termcap_save_LIBS}"
+  AC_LINK_IFELSE([AC_LANG_PROGRAM([[
+#if defined(HAVE_NCURSES_TERMCAP_H)
+# include <ncurses/termcap.h>
+#elif defined(HAVE_TERMCAP_H)
+# include <termcap.h>
+#else
+# include <curses.h>
+# if !defined(__bsdi__)
+#  include <term.h>
+# endif
+#endif
+    ]], [[
+      char termcap_buffer[2048];
+      char *area = termcap_buffer;
+      if (tgetent(termcap_buffer, "vt100") == 1) {
+          (void) tgetnum("li");
+          (void) tgetstr("ce", &area);
+      }
+    ]])], [AC_MSG_RESULT(yes)
+           HAVE_TERMCAP="${lame_termcap_lib}"], [AC_MSG_RESULT(no)])
+  if test "x${HAVE_TERMCAP}" != "x"; then
+    break
+  fi
+done
+LIBS="${lame_termcap_save_LIBS}"
 AC_CHECK_HEADERS(langinfo.h, AC_CHECK_FUNCS(nl_langinfo))
 
-AM_ICONV
+dnl AM_ICONV runs further down, once the optional libraries have been located.
+dnl It has to see the same header and library search paths the frontend is
+dnl built with, and here it would run before any of them exist.
 
 dnl math lib
 AC_CHECK_LIB(m, cos, USE_LIBM="-lm")
@@ -468,7 +685,10 @@ CONFIG_MATH_LIB="${USE_LIBM}"
 
 dnl configure use of features
 
-AM_PATH_GTK(1.2.0, HAVE_GTK="yes", HAVE_GTK="no")
+dnl The frame analyzer (mp3x) is a GTK4 program.  An absent GTK4 must stay
+dnl non-fatal - it only disables mp3x, checked below - hence the explicit
+dnl not-found action.
+PKG_CHECK_MODULES([GTK], [gtk4 >= 4.10], [HAVE_GTK="yes"], [HAVE_GTK="no"])
 
 dnl ElectricFence malloc debugging
 AC_MSG_CHECKING(use of ElectricFence malloc debugging)
@@ -561,18 +781,30 @@ AC_MSG_RESULT($CONFIG_ANALYZER)
 
 
 dnl mpg123 decoder
+AC_ARG_ENABLE(mp3x,
+  [  --enable-mp3x           Build GTK4 frame analyzer [default=no]],
+    enable_mp3x="${enableval}", enable_mp3x=no)
+
 PKG_CHECK_MODULES([mpg123], [libmpg123 >= 1.26.0], [HAVE_MPG123="yes"], [HAVE_MPG123="no"])
 
-AC_MSG_CHECKING(use of external mpg123 decoder)
 AC_ARG_ENABLE(decoder,
   [  --disable-decoder          Exclude mpg123 decoder],
   CONFIG_DECODER="${enableval}", CONFIG_DECODER="yes")
 
+if test "x${enable_mp3x}" = "xyes"; then
+	if test "${HAVE_MPG123}" != "yes" || test "${CONFIG_DECODER}" = "no"; then
+		AC_MSG_ERROR([--enable-mp3x requires enabled libmpg123 decoder support (libmpg123 >= 1.26.0)])
+	fi
+	MP3X_MAN=mp3x.1
+else
+	MP3X_MAN=
+fi
+
+AC_MSG_CHECKING(use of external mpg123 decoder)
 LIB_WITH_DECODER=false
 if test "${HAVE_MPG123}" = "yes" && test "${CONFIG_DECODER}" != "no"; then
 	AC_MSG_RESULT([yes])
 	AC_DEFINE(HAVE_MPG123, 1, set to 1 if you have libmpg123)
-	AC_DEFINE(DECODE_ON_THE_FLY, 1, allow to compute a more accurate replaygain value)
 	FRONTEND_LDADD="$mpg123_LIBS $FRONTEND_LDADD"
 	LIBMP3LAME_LDADD="$mpg123_LIBS $LIBMP3LAME_LDADD"
 	INCLUDES="$mpg123_CFLAGS $INCLUDES"
@@ -600,10 +832,7 @@ fi
 
 
 AC_MSG_CHECKING(if mp3x is requested)
-AC_ARG_ENABLE(mp3x,
-  [  --enable-mp3x           Build GTK frame analyzer [default=no]],
-    WITH_MP3X="${enableval}", WITH_MP3X=no)
-if test "x${WITH_MP3X}" = "xyes"; then
+if test "x${enable_mp3x}" = "xyes"; then
 	WITH_MP3X=mp3x${ac_exeext}
 	AC_MSG_RESULT(yes)
 else
@@ -611,15 +840,13 @@ else
 	AC_MSG_RESULT(no)
 fi
 
-if test "${HAVE_GTK}" = "no"; then
-	if test "x${WITH_MP3X}" = "xmp3x"; then
-		AC_MSG_WARN(can't build mp3x, no GTK installed)
-		WITH_MP3X=
-	fi
-	if test "x${CONFIG_ANALYZER}" != "xyes"; then
-		AC_MSG_WARN(can't build mp3x because of disabled analyzer hooks)
-		WITH_MP3X=
-	fi
+if test "x${WITH_MP3X}" != "x" && test "${HAVE_GTK}" = "no"; then
+	AC_MSG_WARN([can't build mp3x, no GTK installed])
+	WITH_MP3X=
+fi
+if test "x${WITH_MP3X}" != "x" && test "x${CONFIG_ANALYZER}" != "xyes"; then
+	AC_MSG_WARN([can't build mp3x because of disabled analyzer hooks])
+	WITH_MP3X=
 fi
 
 AC_MSG_CHECKING(if mp3rtp is requested)
@@ -627,50 +854,103 @@ AC_ARG_ENABLE(mp3rtp,
   [  --enable-mp3rtp         Build mp3rtp [default=no]],
     WITH_MP3RTP="${enableval}", WITH_MP3RTP=no)
 if test "x${WITH_MP3RTP}" = "xyes"; then
-	if test ${SOCKETFUNCTION} = NO; then
-		AC_MSG_ERROR([function socket is mandatory for mp3rtp])
+	if test ${lame_have_sockets} = no; then
+		AC_MSG_ERROR([socket, getaddrinfo and inet_ntop are mandatory for mp3rtp])
 	fi
 	WITH_MP3RTP=mp3rtp${ac_exeext}
+	MP3RTP_MAN=mp3rtp.1
 	AC_MSG_RESULT(yes)
 else
 	WITH_MP3RTP=
+	MP3RTP_MAN=
 	AC_MSG_RESULT(no)
 fi
 
-#Checking for IPV6 support
+dnl MinGW-w64 uses wmain for the Windows Unicode command-line contract.
+dnl Apply -municode only to the frontend programs; library-only builds do
+dnl not need a Windows executable startup object.
+FRONTEND_UNICODE_LDFLAGS=
+case "${host_os}" in
+mingw*)
+	if test -n "${WITH_FRONTEND}${WITH_MP3X}${WITH_MP3RTP}"; then
+		AC_MSG_CHECKING([whether ${CC} supports MinGW Unicode startup])
+		lame_save_LDFLAGS="${LDFLAGS}"
+		LDFLAGS="${LDFLAGS} -municode"
+		AC_LINK_IFELSE(
+			[AC_LANG_SOURCE([[
+#include <wchar.h>
+int wmain(int argc, wchar_t **argv)
+{
+	return argc > 0 && argv != 0 ? 0 : 1;
+}
+			]])],
+			[FRONTEND_UNICODE_LDFLAGS="-municode"],
+			[FRONTEND_UNICODE_LDFLAGS=])
+		LDFLAGS="${lame_save_LDFLAGS}"
+		if test -n "${FRONTEND_UNICODE_LDFLAGS}"; then
+			AC_MSG_RESULT(yes)
+		else
+			AC_MSG_RESULT(no)
+			AC_MSG_ERROR([MinGW frontend programs require compiler support for -municode and wmain])
+		fi
+	fi
+	;;
+esac
+
+dnl Whether the RTP sender offers IPv6 destinations as well as IPv4 ones. The
+dnl same switch exists on every platform - on Windows by editing configMS.h -
+dnl and it selects the same thing everywhere: the address family the resolver is
+dnl asked for. Everything else about the sender, host name resolution included,
+dnl is the same either way.
+dnl
+dnl This asks the compiler whether the types and options exist, not the running
+dnl kernel whether a socket can be opened. The old test did the latter, which
+dnl reports "no" on a machine whose headers are fine but whose network stack has
+dnl IPv6 switched off at boot - and answers nothing at all when cross compiling.
 AC_MSG_CHECKING(for IPv6 support)
 AC_ARG_ENABLE(ipv6, AS_HELP_STRING([--disable-ipv6],
-    [Disable IPV6 support(By default ipv6 (with ipv4) support is enabled)]),
+    [Build mp3rtp for IPv4 destinations only (IPv6 and IPv4 by default)]),
     CONFIG_IPV6=$enableval,
     CONFIG_IPV6=yes)
 if test "x$CONFIG_IPV6" = "xyes" ; then
-    AC_CACHE_VAL(ac_cv_ipv6,
-    AC_TRY_RUN([
-    #include <sys/types.h>
-    #include <sys/socket.h>
-    #include <netinet/in.h>
-    #include <stdlib.h>
-    main()
-    {
-        int fd;
-        struct sockaddr_in6 foo;
-        fd = socket(AF_INET6, SOCK_STREAM, 0);
-        exit(fd >= 0 ? 0 : 1);
-    }],
-    ac_cv_ipv6=yes,
-    ac_cv_ipv6=no,
-    ac_cv_ipv6=yes))
-    AC_MSG_RESULT($ac_cv_ipv6)
-    if test $ac_cv_ipv6 = yes ; then
-        AC_DEFINE(IPV6,1,[check if system supports IPV6])
+    AC_CACHE_VAL(lame_cv_ipv6,
+    AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[
+#ifdef _WIN32
+# include <winsock2.h>
+# include <ws2tcpip.h>
+#else
+# include <sys/types.h>
+# include <sys/socket.h>
+# include <netinet/in.h>
+#endif
+    ]], [[
+    struct sockaddr_in6 sa;
+    int level = IPPROTO_IPV6;
+    int hops = IPV6_MULTICAST_HOPS;
+    int loop = IPV6_MULTICAST_LOOP;
+    sa.sin6_family = AF_INET6;
+    (void) level; (void) hops; (void) loop;
+    ]])],[lame_cv_ipv6=yes],[lame_cv_ipv6=no]))
+    AC_MSG_RESULT($lame_cv_ipv6)
+    if test $lame_cv_ipv6 = yes ; then
+        AC_DEFINE(IPV6,1,[Define to offer IPv6 destinations as well as IPv4 ones])
     fi
 else
-    AC_MSG_RESULT($CONFIG_IPV6)	
+    AC_MSG_RESULT($CONFIG_IPV6)
 fi
 AC_MSG_CHECKING(if dynamic linking of the frontends is requested)
+# Dynamic linking is the default: it lets the frontends pick up the shared
+# library's optimization (see -fno-semantic-interposition below) and be built
+# as position-independent executables together with the hardening flags.
+# --disable-dynamic-frontends links the frontends statically into a
+# self-contained binary.
 AC_ARG_ENABLE(dynamic-frontends,
-  [  --enable-dynamic-frontends Link frontends against shared libraries [default=no]],
-    FRONTEND_LDFLAGS="${FRONTEND_LDFLAGS}", FRONTEND_LDFLAGS="${FRONTEND_LDFLAGS} -static")
+  [AS_HELP_STRING([--disable-dynamic-frontends],
+     [link the frontends statically against libmp3lame (default: dynamic)])],
+  [dynamic_frontends_given=yes], [enable_dynamic_frontends=yes])
+if test "x${enable_dynamic_frontends}" = "xno"; then
+	FRONTEND_LDFLAGS="${FRONTEND_LDFLAGS} -static"
+fi
 case "x${FRONTEND_LDFLAGS}" in
 *-static*)
 	AC_MSG_RESULT(no)
@@ -679,6 +959,49 @@ case "x${FRONTEND_LDFLAGS}" in
 	AC_MSG_RESULT(yes)
 	;;
 esac
+
+
+# --enable-internal exposes the internal/developer tuning options in the
+# frontend (--substep, --sfscale, --athcurve, ...). Those setters are
+# deliberately withheld from the shared library's export list
+# (include/libmp3lame.sym), so anything that calls them must link the static
+# archive; enabling the options therefore forces static frontend linking. The
+# options only make sense on an alpha version (LAME_TYPE_VERSION==0) - asking
+# for them on a beta or release tree is an error, not a silent no-op.
+lame_type_version=`sed -n ['s/.*LAME_TYPE_VERSION[[:space:]][[:space:]]*\([0-9]\).*/\1/p'] "$srcdir/libmp3lame/version.h"`
+AC_ARG_ENABLE([internal],
+  [AS_HELP_STRING([--enable-internal],
+     [expose internal/developer tuning options in the frontend; alpha versions only, forces static frontend linking (default: disabled)])],
+  [enable_internal="${enableval}"], [enable_internal=no])
+AC_MSG_CHECKING(whether to enable internal/developer options)
+AC_MSG_RESULT(${enable_internal})
+internal_static_note=
+if test "x${enable_internal}" = "xyes"; then
+	if test "x${lame_type_version}" != "x0"; then
+		AC_MSG_ERROR([--enable-internal requires an alpha version (LAME_TYPE_VERSION==0); this tree is version type "${lame_type_version}". The internal/developer tuning options are not available in beta or release builds.])
+	fi
+	if test "x${enable_static}" = "xno"; then
+		AC_MSG_ERROR([--enable-internal needs the static libmp3lame archive, but --disable-static was given. The internal setters are not exported from the shared library, so the frontend must link statically. Re-run without --disable-static.])
+	fi
+	# _ALLOW_INTERNAL_OPTIONS is defined per-target (frontend and the set_get
+	# unit test) via the INTERNAL_OPTS automake conditional, NOT globally: a
+	# global define would pull the internal-option code path of parse.c into the
+	# other unit tests that compile parse.c only for its argument helpers, and
+	# they link the shared library where the internal setters are absent.
+	case "x${FRONTEND_LDFLAGS}" in
+	*-static*)
+		: ;; # already static (e.g. --disable-dynamic-frontends)
+	*)
+		FRONTEND_LDFLAGS="${FRONTEND_LDFLAGS} -static"
+		if test "x${dynamic_frontends_given}" = "xyes"; then
+			internal_static_note="static frontend linking forced ON, overriding the requested --enable-dynamic-frontends: the internal setters are not exported from the shared library, so the frontend must link the static archive"
+		else
+			internal_static_note="static frontend linking forced ON (the default is dynamic): the internal setters are not exported from the shared library, so the frontend must link the static archive"
+		fi
+		;;
+	esac
+fi
+AM_CONDITIONAL([INTERNAL_OPTS], [test "x${enable_internal}" = "xyes"])
 
 
 #
@@ -746,109 +1069,80 @@ AC_MSG_RESULT(${TERMCAP_DEFAULT})
 
 dnl ### processor specific options ###
 WITH_VECTOR=no
+lame_cpu_x86=no
+lame_cpu_arm=no
+lame_cpu_arm32=no
+case $host_cpu in
+aarch64|arm64)
+	lame_cpu_arm=yes
+	;;
+arm*)
+	lame_cpu_arm=yes
+	lame_cpu_arm32=yes
+	;;
+esac
 case $host_cpu in
 x86_64|amd64)
-	CPUTYPE="no"
-	if test $ac_cv_header_xmmintrin_h = yes ; then
-		WITH_XMM=yes
-		WITH_VECTOR=yes
-	fi
+	lame_cpu_x86=yes
 
 	AC_DEFINE(USE_FAST_LOG, 1, faster log implementation with less but enough precission)
 	;;
 *86)
-	CPUTYPE="i386"
-	if test $ac_cv_header_xmmintrin_h = yes ; then
-		WITH_XMM=yes
-		WITH_VECTOR=yes
-	fi
+	lame_cpu_x86=yes
 
 	AC_DEFINE(USE_FAST_LOG, 1, faster log implementation with less but enough precission)
 	;;
 powerpc)
-	CPUTYPE="no"
-
 	# The following should not get enabled on a G5. HOWTO check for a G5?
 	AC_DEFINE(USE_FAST_LOG, 1, faster log implementation with less but enough precission)
 	;;
 *)
-	CPUTYPE="no"
 	;;
 esac
 
-# which vector code do we support to build on this machine?
-AM_CONDITIONAL(WITH_XMM, test "x${WITH_XMM}" = "xyes")
+# The vector decision itself is made further down, once CFLAGS is final -
+# see "vector routines" there. AM_CONDITIONAL and AC_MSG_RESULT for it live
+# with the decision rather than here.
 
-# needs to be defined to link in the internal vector lib
-AM_CONDITIONAL(WITH_VECTOR, test "x${WITH_VECTOR}" = "xyes")
-AC_MSG_CHECKING(if I have to build the internal vector lib)
-AC_MSG_RESULT(${WITH_VECTOR})
-
-
-AC_PATH_PROG(NASM, nasm, no)
-case "${NASM}" in
-no)
-	;;
-*)
-	AC_MSG_CHECKING(for assembler routines for this processor type)
-	for recurse_over in ${ASM_FOR_ARCH}
-	do
-		if test "${CPUTYPE}" = "${recurse_over}"; then
-			include_asm_routines="yes"
-		fi
-
-		case $host_os in
-		*darwin*)
-			# currently we have problems because of a wrong
-			# libtool hack in the darwin case (for nasm code)
-			include_asm_routines="no"
-			;;
-		esac
-	done
-	if test "x${include_asm_routines}" = "xyes"; then
-		AC_DEFINE(HAVE_NASM, 1, have nasm)
-		AC_DEFINE(MMX_choose_table, 1, use MMX version of choose_table)
-	else
-		include_asm_routines="no"
-		NASM="no"
-	fi
-	AC_MSG_RESULT(${include_asm_routines})
-	;;
-esac
-AM_CONDITIONAL(HAVE_NASM, test "${NASM}" != "no")
-
-case $host_os in
-	*cygwin*|*mingw32*)
-		CYGWIN=yes
-		NASM_FORMAT="-f win32 -DWIN32"
-		;;
-	*darwin*)
-		NASM_FORMAT="-f macho"
-		;;
-	*os2-emx*)
-		NASM_FORMAT="-f aout -DAOUT"
-		;;
-	*)
-		CYGWIN=no
-		NASM_FORMAT="-f elf"
-		;;
-esac
 
 #
-# 'expopt' is used for "additional optimizations", not for optimizations which
-# are marked as "experimental" in the guide for the compiler.
-# They are "experimental" here in the LAME project (at least
-# "--enable-expopt=full").
+# Optimization flags.
+#
+# Probe the compiler for the optimization flags we want and keep only the ones
+# it accepts.
+#
+# --enable-expopt adds extra, less universally beneficial flags on top of the
+# always-on base set.
 #
 AC_MSG_CHECKING(for additional optimizations)
 AC_ARG_ENABLE(expopt,
-  [  --enable-expopt=full,norm Whether to enable experimental optimizations]
+  [  --enable-expopt=norm    Whether to enable experimental optimizations]
   [                          [default=no]],
     CONFIG_EXPOPT="${enableval}", CONFIG_EXPOPT="no")
+AC_MSG_RESULT(${CONFIG_EXPOPT})
+
+# Security hardening is on by default; --disable-hardening opts out.
+AC_ARG_ENABLE([hardening],
+  [AS_HELP_STRING([--disable-hardening],
+     [do not add compiler/linker security hardening flags (default: enabled)])],
+  [], [enable_hardening=yes])
+
+# Machine-specific tuning is opt-in: it can produce binaries that do not run
+# on other CPUs of the same architecture.
+AC_ARG_ENABLE([native],
+  [AS_HELP_STRING([--enable-native],
+     [tune the build for this exact machine, not portable (default: disabled)])],
+  [], [enable_native=no])
 
 if test "x$HAVE_GCC" = "xyes" -o "x$HAVE_CLANG" = "xyes"; then
-	# gcc defaults. OS specific options go in versious sections below
-	# from the gcc man pages:  "there is no reason to use -pedantic"
+	OPTIMIZATION=
+	HARDENING_CFLAGS=
+	HARDENING_LDFLAGS=
+	HARDENING_FE_CFLAGS=
+	HARDENING_FE_LDFLAGS=
+
+	# Warnings, and a faster compile pipe where the linker supports it.
+	# (Per the gcc manual, "there is no reason to use -pedantic".)
 	if test "x${with_gnu_ld}" = "xyes"; then
 		CFLAGS="-Wall -pipe ${CFLAGS}"
 	else
@@ -856,209 +1150,107 @@ if test "x$HAVE_GCC" = "xyes" -o "x$HAVE_CLANG" = "xyes"; then
 		CFLAGS="-Wall ${CFLAGS}"
 	fi
 
-	# GCC version specific generic options
-	if test "x${HAVE_GCC}" = "xyes"; then
-		case "${GCC_version}" in
-		2.96*)
-        		# for buggy version of gcc shipped with RH7.1, back of on some
-        		# optimizations
-        		OPTIMIZATION="-O -fomit-frame-pointer -ffast-math \
-				-funroll-loops"
-			OPTIMIZATION_FULL="-fmove-all-movables -freduce-all-givs \
-				-fsched-interblock -fbranch-count-reg -fforce-addr \
-				-fforce-mem"
-        		;;
-		3.0*)
-			# -funroll-loops seems to produce buggy code with gcc 3.0.3
-			OPTIMIZATION="-O -fomit-frame-pointer -ffast-math"
-			OPTIMIZATION_FULL="-fmove-all-movables -freduce-all-givs \
-				-fbranch-count-reg -fforce-addr -fforce-mem"
-			;;
-		3.*|4.0.*|4.1.*)
-			# -fomit-frame-pointer seems to be buggy on cygwin
-			case ${host_os} in
-			*cygwin*)
-				OMIT_FRAME_POINTER=
-				;;
-			*)
-				OMIT_FRAME_POINTER=-fomit-frame-pointer
-				;;
-			esac
-	
-			OPTIMIZATION="-O3 ${OMIT_FRAME_POINTER} -ffast-math"
-			OPTIMIZATION_FULL="-fmove-all-movables -freduce-all-givs \
-				-fbranch-count-reg -fforce-addr -fforce-mem"
-			;;
-		[[456789]].*|1[[0-9]].*)
-			OPTIMIZATION="-O3 -fomit-frame-pointer -ffast-math"
-			OPTIMIZATION_FULL="-fbranch-count-reg -fforce-addr"
-			;;
-		*)
-			# default
-			OPTIMIZATION="-O3 ${OMIT_FRAME_POINTER} -ffast-math \
-				-funroll-loops"
-			OPTIMIZATION_FULL="-fbranch-count-reg -fforce-addr"
-			;;
-		esac
-
-		# GCC version independend generic options
-		OPTIMIZATION_NORM="-fschedule-insns2"
-	fi
-
-
-	# generic CPU specific options
-	case ${host_cpu} in
-	sparc)
-		case "${GCC_version}" in
-		3.0*)
-			;;
-		[[3456789]].*|1[[0-9]].*)
-			# doesn't work on 3.0.x, but on 3.[12] and
-			# hopefully on every other release after that too
-			if test -x /usr/bin/isalist; then
-				/usr/bin/isalist | grep sparcv8plus \
-					>/dev/null 2>&1 && \
-					OPTIMIZATION="${OPTIMIZATION} \
-						-mcpu=ultrasparc \
-						-mtune=ultrasparc"
-			fi
-			;;
-		esac
-		;;
-	*86)
-		case "${GCC_version}" in
-		[[3456789]].*|1[[0-9]].*)
-			OPTIMIZATION="${OPTIMIZATION} \
-				-maccumulate-outgoing-args"
-			;;
-		esac
-		;;
-	esac
-
-	expopt_msg_result_printed=no
 	case "${CONFIG_EXPOPT}" in
-	no)
-		# if someone supplies own CFLAGS, we don't add our own
-		if test "x${ac_save_CFLAGS}" != "x"; then
-			OPTIMIZATION=""
-		fi
-		;;
-	norm|yes)
-		OPTIMIZATION="${OPTIMIZATION} ${OPTIMIZATION_NORM}"
-		;;
-	full)
-		OPTIMIZATION="${OPTIMIZATION} ${OPTIMIZATION_NORM} \
-			${OPTIMIZATION_FULL}"
-
-		if test "${HAVE_GCC}" = "yes"; then
-			# some hardware dependend options
-			case "${GCC_version}" in
-			2.9*|3.*|4.0.*|4.1.*)
-				# "new" GCC, use some "new" CPU specific optimizations
-				# use -mtune instead of -m486 or -mcpu= etc, since they are
-				# deprecated by GCC <rbrito>
-				case ${host_cpu} in
-				*486)
-					OPTIMIZATION="${OPTIMIZATION} -mcpu=i486 \
-						-mfancy-math-387"
-					;;
-				*586)
-					OPTIMIZATION="${OPTIMIZATION} -mcpu=pentium \
-						-march=pentium -mfancy-math-387"
-					;;
-				*686)
-					OPTIMIZATION="${OPTIMIZATION} -mcpu=pentiumpro \
-						-march=pentiumpro -mfancy-math-387 \
-						-malign-double"
-					;;
-				*86)
-					OPTIMIZATION="${OPTIMIZATION} -mfancy-math-387"
-					;;
-				alpha*)
-					OPTIMIZATION="${OPTIMIZATION} -mfp-regs"
-					AC_DEFINE(FLOAT, double, double is faster than float on Alpha)
-					# add "-mcpu=21164a -Wa,-m21164a" to optimize
-					# for 21164a (ev56) CPU
-					;;
-				*)
-					OPTIMIZATION="${OPTIMIZATION} -fdelayed-branch"
-					;;
-				esac
-				;;
-			[[456789]].*|1[[0-9]].*)
-				case ${host_cpu} in
-				*486)
-					OPTIMIZATION="${OPTIMIZATION} -march=i486"
-					;;
-				*586)
-					OPTIMIZATION="${OPTIMIZATION} -march=i586 \
-						-mtune=native"
-					;;
-				*686)
-					OPTIMIZATION="${OPTIMIZATION} -march=i686 \
-						-mtune=native"
-					;;
-				arm*-gnueabi)
-					if [ -z "$(echo ${GCC_version} | awk '/4\.0/')" ]; then
-						# Work round buggy softfloat optimization in ARM EABI compilers
-						# -gnueabi in only gcc-4.1 onwards
-						OPTIMIZATION="${OPTIMIZATION} -fno-finite-math-only"
-					fi
-					;;
-				esac
-				;;
-			*)
-				# no special optimization for other versions
-				AC_MSG_RESULT(no)
-				expopt_msg_result_printed=yes
-				AC_MSG_WARN(LAME doesn't know about your version (${GCC_version}) of gcc, please report it to lame-dev@lists.sourceforge.net. Please make sure you try the latest LAME version first!)
-				;;
-			esac
-		fi
+	no|norm|yes)
 		;;
 	*)
-		AC_MSG_ERROR(bad value �${CONFIG_EXPOPT}� for expopt option)
+		AC_MSG_ERROR([bad value ${CONFIG_EXPOPT} for --enable-expopt])
 		;;
 	esac
 
+	# Base optimization, always applied.
+	#   -O3                          aggressive optimization
+	#   -fomit-frame-pointer         free a register (implied by -O on most
+	#                                modern targets, useful on older ones)
+	#   -ffast-math                  relax IEEE semantics - LAME's DSP code
+	#                                is validated with this and relies on
+	#                                the speed. It also asserts that no NaN
+	#                                or infinity occurs, so a test for one
+	#                                may be deleted however it is spelled;
+	#                                code validating a caller's floating
+	#                                point data has to survive that
+	#   -fno-semantic-interposition  let the shared libmp3lame inline its
+	#                                own calls instead of going through the
+	#                                PLT (gcc; harmless no-op elsewhere)
+	#
+	# A CFLAGS given on the configure line is placed AFTER these rather than
+	# instead of them (see the CFLAGS assignment further down), so it adds to
+	# the build and overrides only what it actually names: CFLAGS='-g' yields
+	# debug information at -O3, CFLAGS='-O2 -g' yields both at -O2, and either
+	# keeps the arithmetic settings the DSP code is validated with. Suppressing
+	# this block instead, as it once did, meant a single flag on the command
+	# line silently dropped -ffast-math and changed the encoder's output.
+	# Anything here can still be countermanded by naming its opposite, since
+	# the later flag wins.
+	LAME_CHECK_CFLAG([-O3], [OPTIMIZATION])
+	LAME_CHECK_CFLAG([-fomit-frame-pointer], [OPTIMIZATION])
+	LAME_CHECK_CFLAG([-ffast-math], [OPTIMIZATION])
+	LAME_CHECK_CFLAG([-fno-semantic-interposition], [OPTIMIZATION])
 
-	if test "x${HAVE_CLANG}" = "xyes"; then
-		case "${CLANG_VERSION}" in
-		3.[[89]]*|[[45]].*|1[[0-9]].*)
-			OPTIMIZATION="-Ofast"
-			;;
-		*)
-			OPTIMIZATION="-O3"
+	case "${CONFIG_EXPOPT}" in
+	norm|yes)
+		# extra, experimental optimization
+		LAME_CHECK_CFLAG([-funroll-loops], [OPTIMIZATION])
+		LAME_CHECK_CFLAG([-fschedule-insns2], [OPTIMIZATION])
+		;;
+	esac
+
+	# --enable-native tuning.
+	if test "x${enable_native}" = "xyes"; then
+		LAME_CHECK_CFLAG([-march=native], [OPTIMIZATION])
+		LAME_CHECK_CFLAG([-mtune=native], [OPTIMIZATION])
+	fi
+
+	# Security hardening (default on).  Every flag is probed, so any that
+	# the toolchain does not support is simply skipped.
+	if test "x${enable_hardening}" != "xno"; then
+		# Compile-time hardening, applied to the whole build:
+		#   _FORTIFY_SOURCE          runtime checks for common libc buffer
+		#                            overflows (needs optimization, which
+		#                            the probe supplies)
+		#   -fstack-protector-strong stack-smashing canaries
+		#   -fstack-clash-protection guard against stack-clash attacks
+		#   -fcf-protection=full     control-flow integrity (x86 CET)
+		LAME_CHECK_CFLAG([-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=2], [HARDENING_CFLAGS])
+		LAME_CHECK_CFLAG([-fstack-protector-strong], [HARDENING_CFLAGS])
+		LAME_CHECK_CFLAG([-fstack-clash-protection], [HARDENING_CFLAGS])
+		LAME_CHECK_CFLAG([-fcf-protection=full], [HARDENING_CFLAGS])
+
+		# Link-time hardening:
+		#   -z relro / -z now        full RELRO (relocations read-only,
+		#                            resolved at load time)
+		#   -z noexecstack           non-executable stack
+		LAME_CHECK_LDFLAG([-Wl,-z,relro], [HARDENING_LDFLAGS])
+		LAME_CHECK_LDFLAG([-Wl,-z,now], [HARDENING_LDFLAGS])
+		LAME_CHECK_LDFLAG([-Wl,-z,noexecstack], [HARDENING_LDFLAGS])
+
+		# Build the frontend programs as position-independent executables,
+		# but only when they will link against the shared library.  PIE
+		# needs position-independent objects, and the libmp3lame archive
+		# is not built PIC - so both --disable-dynamic-frontends (which
+		# links that archive on purpose) and --disable-shared (which
+		# leaves nothing else to link) have to skip it.  The shared
+		# library itself is already built -fPIC by libtool and needs
+		# nothing here.
+		lame_fe_pie=yes
+		case "x${FRONTEND_LDFLAGS}" in
+		*-static*)
+			lame_fe_pie=no
 			;;
 		esac
-
-		# generic CPU specific options
-		case ${host_cpu} in
-		*486)
-			OPTIMIZATION="${OPTIMIZATION} -march=i486"
-			;;
-		*586)
-			OPTIMIZATION="${OPTIMIZATION} -march=i586 \
-				-mtune=native"
-			;;
-		*686)
-			OPTIMIZATION="${OPTIMIZATION} -march=i686 \
-				-mtune=native"
-			;;
-		esac
-
-		# if someone supplies own CFLAGS, we don't add our own
-		if test "x${ac_save_CFLAGS}" != "x"; then
-			OPTIMIZATION=""
+		if test "x${enable_shared}" = "xno"; then
+			lame_fe_pie=no
 		fi
-	fi
+		if test "x${lame_fe_pie}" = "xyes"; then
+			LAME_CHECK_CFLAG([-fPIE], [HARDENING_FE_CFLAGS])
+			LAME_CHECK_LDFLAG([-fPIE -pie], [HARDENING_FE_LDFLAGS])
+		fi
 
-
-	if test "${expopt_msg_result_printed}" = "no" ; then
-		AC_MSG_RESULT(${CONFIG_EXPOPT})
+		CFLAGS="${CFLAGS} ${HARDENING_CFLAGS}"
+		LDFLAGS="${LDFLAGS} ${HARDENING_LDFLAGS}"
+		FRONTEND_CFLAGS="${FRONTEND_CFLAGS} ${HARDENING_FE_CFLAGS}"
+		FRONTEND_LDFLAGS="${FRONTEND_LDFLAGS} ${HARDENING_FE_LDFLAGS}"
 	fi
-else
-	AC_MSG_RESULT(no)
 fi
 
 
@@ -1227,15 +1419,6 @@ if test "$UNAME" = "OS/2"; then
    # please  give feedback!
    #FILE_EXTENSION=".exe"
 
-# Uncomment & inspect the GTK lines to use MP3x GTK frame analyzer.
-# Properly installed XFree86/devlibs & GTK+ is a prerequisite.
-# The following works for me using Xfree86/OS2 3.3.5 and GTK+ 1.2.3:
-#   AC_DEFINE(HAVE_GTK, 1, have GTK)
-#   AC_DEFINE(__ST_MT_ERRNO__, 1)
-#   INCLUDES="-IC:/XFree86/include/gtk12 -IC:/XFree86/include/glib12 \
-#             -IC:/XFree86/include $INCLUDES"
-#   FRONTEND_LDFLAGS="-LC:/XFree86/lib -lgtk12 -lgdk12 -lgmodule -lglib12 \
-#             -lXext -lX11 -lshm -lbsd -lsocket -lm $FRONTEND_LDFLAGS"
 #   FRONTEND_CFLAGS="-Zmtd -Zsysv-signals -Zbin-files $FRONTEND_CFLAGS"
 fi
 
@@ -1265,6 +1448,231 @@ fi
 
 
 CFLAGS="${OPTIMIZATION} ${CFLAGS}"
+
+dnl ### vector routines ###
+dnl
+dnl Probed here, not with the other feature checks, because the answer depends
+dnl on the optimization flags chosen above and those are only settled now. The
+dnl combination that forces it: GCC on 32-bit x86 with -ffast-math rejects the
+dnl per-function target attribute the routines rely on, so a probe run with
+dnl bare CFLAGS says the routines are available and the build then fails to
+dnl compile them. That is how 32-bit x86 lost these routines in 3.100, and a
+dnl probe that does not use the real flags would reintroduce it.
+dnl
+dnl Where the attribute cannot be used, the routines can still be built by
+dnl giving that one translation unit an SSE2 baseline of its own. It contains
+dnl nothing but the vector code, and its callers test the CPU at run time, so
+dnl a binary built this way still runs on machines without SSE2.
+VECTOR_SSE2_FLAGS=
+if test "x${lame_cpu_x86}" = xyes; then
+	AC_MSG_CHECKING(working SSE2 intrinsics)
+	LAME_SSE2_PROBE([lame_sse2_intrinsics])
+	AC_MSG_RESULT(${lame_sse2_intrinsics})
+	if test "x${lame_sse2_intrinsics}" = xno; then
+		AC_MSG_CHECKING(working SSE2 intrinsics with a per-file SSE2 baseline)
+		lame_save_CFLAGS=$CFLAGS
+		CFLAGS="$CFLAGS -msse2"
+		LAME_SSE2_PROBE([lame_sse2_baseline])
+		CFLAGS=$lame_save_CFLAGS
+		AC_MSG_RESULT(${lame_sse2_baseline})
+		if test "x${lame_sse2_baseline}" = xyes; then
+			lame_sse2_intrinsics=yes
+			VECTOR_SSE2_FLAGS="-msse2"
+		fi
+	fi
+	if test "x${lame_sse2_intrinsics}" = xyes; then
+		AC_DEFINE([HAVE_SSE2_INTRINSICS], [1], [Define if SSE2 intrinsics work.])
+		WITH_XMM=yes
+		WITH_VECTOR=yes
+	fi
+fi
+
+dnl The tiers are cumulative, so a wider one is only offered where the one
+dnl below it was accepted, and it is probed the same way for the same reason.
+VECTOR_AVX2_FLAGS=
+if test "x${WITH_XMM}" = xyes; then
+	AC_MSG_CHECKING(working AVX2 intrinsics)
+	LAME_AVX2_PROBE([lame_avx2_intrinsics])
+	AC_MSG_RESULT(${lame_avx2_intrinsics})
+	if test "x${lame_avx2_intrinsics}" = xno; then
+		AC_MSG_CHECKING(working AVX2 intrinsics with a per-file AVX2 baseline)
+		lame_save_CFLAGS=$CFLAGS
+		CFLAGS="$CFLAGS -mavx2"
+		LAME_AVX2_PROBE([lame_avx2_baseline])
+		CFLAGS=$lame_save_CFLAGS
+		AC_MSG_RESULT(${lame_avx2_baseline})
+		if test "x${lame_avx2_baseline}" = xyes; then
+			lame_avx2_intrinsics=yes
+			VECTOR_AVX2_FLAGS="-mavx2"
+		fi
+	fi
+	if test "x${lame_avx2_intrinsics}" = xyes; then
+		AC_DEFINE([HAVE_AVX2_INTRINSICS], [1], [Define if AVX2 intrinsics work.])
+		WITH_AVX2=yes
+	fi
+fi
+
+dnl There is deliberately no --enable-avx512, for the same reason there is none
+dnl for SSE2 or AVX2: what the compiler can build is built, and the CPU decides
+dnl at run time, so one binary runs correctly everywhere and no build is
+dnl half-enabled.  The top rung carries only the constant-bitrate kernels; the
+dnl variable-bitrate one was measured and rejected - see @ref vector_dispatch.
+VECTOR_AVX512_FLAGS=
+if test "x${WITH_XMM}" = xyes; then
+	AC_MSG_CHECKING(working AVX-512 intrinsics)
+	LAME_AVX512_PROBE([lame_avx512_intrinsics])
+	AC_MSG_RESULT(${lame_avx512_intrinsics})
+	if test "x${lame_avx512_intrinsics}" = xno; then
+		AC_MSG_CHECKING(working AVX-512 intrinsics with a per-file AVX-512 baseline)
+		lame_save_CFLAGS=$CFLAGS
+		CFLAGS="$CFLAGS -mavx512f -mavx512vl -mavx512bw -mavx512dq"
+		LAME_AVX512_PROBE([lame_avx512_baseline])
+		CFLAGS=$lame_save_CFLAGS
+		AC_MSG_RESULT(${lame_avx512_baseline})
+		if test "x${lame_avx512_baseline}" = xyes; then
+			lame_avx512_intrinsics=yes
+			VECTOR_AVX512_FLAGS="-mavx512f -mavx512vl -mavx512bw -mavx512dq"
+		fi
+	fi
+	if test "x${lame_avx512_intrinsics}" = xyes; then
+		AC_DEFINE([HAVE_AVX512_INTRINSICS], [1], [Define if AVX-512 intrinsics work.])
+		WITH_AVX512=yes
+	fi
+fi
+
+dnl The ARM rung.  Two differences from the x86 ones above, both from the same
+dnl fact - Advanced SIMD is architectural on AArch64 and optional on ARMv7:
+dnl
+dnl   - there is no per-function opt-in to test for.  On AArch64 there is
+dnl     nothing to opt into, and on ARMv7 the switch is a floating-point ABI
+dnl     choice that applies to a whole translation unit.  So the probe asks
+dnl     the plain question and the fallback gives the file its own baseline,
+dnl     which is the second half of what the x86 probes do anyway.
+dnl   - it is not gated on a lower rung, because it is the only one.
+dnl
+dnl Probed here rather than with the other feature checks for the reason given
+dnl above: the answer depends on the optimization flags, and those are only
+dnl settled at this point.
+VECTOR_NEON_FLAGS=
+if test "x${lame_cpu_arm}" = xyes; then
+	AC_MSG_CHECKING(working NEON intrinsics)
+	LAME_NEON_PROBE([lame_neon_intrinsics])
+	AC_MSG_RESULT(${lame_neon_intrinsics})
+	dnl -mfpu= is a 32-bit ARM switch; on AArch64 clang rejects it outright
+	dnl ("unsupported option '-mfpu=' for target aarch64-..."), so trying it
+	dnl there produces two failures that look like a missing instruction set.
+	if test "x${lame_neon_intrinsics}" = xno && test "x${lame_cpu_arm32}" = xyes; then
+		for lame_neon_try in "-mfpu=neon" "-mfpu=neon -mfloat-abi=softfp"; do
+			AC_MSG_CHECKING(working NEON intrinsics with ${lame_neon_try})
+			lame_save_CFLAGS=$CFLAGS
+			CFLAGS="$CFLAGS ${lame_neon_try}"
+			LAME_NEON_PROBE([lame_neon_baseline])
+			CFLAGS=$lame_save_CFLAGS
+			AC_MSG_RESULT(${lame_neon_baseline})
+			if test "x${lame_neon_baseline}" = xyes; then
+				lame_neon_intrinsics=yes
+				VECTOR_NEON_FLAGS="${lame_neon_try}"
+				break
+			fi
+		done
+	fi
+	if test "x${lame_neon_intrinsics}" = xyes; then
+		AC_DEFINE([HAVE_NEON_INTRINSICS], [1], [Define if ARM NEON intrinsics work.])
+		WITH_NEON=yes
+		WITH_VECTOR=yes
+	fi
+fi
+AC_SUBST(VECTOR_SSE2_FLAGS)
+AC_SUBST(VECTOR_AVX2_FLAGS)
+AC_SUBST(VECTOR_AVX512_FLAGS)
+AC_SUBST(VECTOR_NEON_FLAGS)
+
+# which vector code do we support to build on this machine?
+AM_CONDITIONAL(WITH_XMM, test "x${WITH_XMM}" = "xyes")
+AM_CONDITIONAL(WITH_AVX2, test "x${WITH_AVX2}" = "xyes")
+AM_CONDITIONAL(WITH_AVX512, test "x${WITH_AVX512}" = "xyes")
+AM_CONDITIONAL(WITH_NEON, test "x${WITH_NEON}" = "xyes")
+
+# needs to be defined to link in the internal vector lib
+AM_CONDITIONAL(WITH_VECTOR, test "x${WITH_VECTOR}" = "xyes")
+AC_MSG_CHECKING(if I have to build the internal vector lib)
+AC_MSG_RESULT(${WITH_VECTOR})
+
+dnl In maintainer mode, build under stricter warnings and make them fatal so
+dnl regressions are caught before release.  This runs after all feature checks
+dnl so -Werror cannot break autoconf's test compilations, and LAME_CHECK_CFLAG
+dnl drops any flag the compiler does not accept (so no compiler gate is needed).
+dnl End-user builds are unaffected: maintainer mode is off by default.
+if test "x$USE_MAINTAINER_MODE" = xyes; then
+	LAME_CHECK_CFLAG([-Wextra], [CFLAGS])
+	LAME_CHECK_CFLAG([-Wshadow], [CFLAGS])
+	LAME_CHECK_CFLAG([-Werror], [CFLAGS])
+fi
+
+dnl iconv, deliberately last.
+dnl
+dnl Every frontend translation unit is compiled with the include paths
+dnl pkg-config reported for GTK, the decoder and libsndfile - frontend's
+dnl Makefile.am applies them to the whole directory, not just to the analyzer.
+dnl Where those paths lead to a GNU libiconv installed beside the C library's
+dnl iconv, its <iconv.h> renames iconv_open to libiconv_open, and the frontend
+dnl then needs that library.  AM_ICONV must therefore be asked the question the
+dnl frontend actually asks, which means running it after those paths are known
+dnl and with them in effect, not before they exist.
+dnl
+dnl The search directories are taken from what pkg-config reported, never
+dnl assumed: an installation prefix is configurable and is not always the
+dnl conventional one, so the -L options that located GTK and the decoder are
+dnl also the ones that locate the iconv beside them.  Only -I and -L options
+dnl are carried over.  The link options are not: they are written for libtool,
+dnl which links the frontend, and include flags such as -R that a bare compiler
+dnl rejects outright - which would turn a working iconv into a configure error.
+dnl
+dnl Where no such paths exist the loops below contribute nothing and the check
+dnl behaves exactly as it always did.  That is the self-limiting property worth
+dnl keeping: nothing can drag in a foreign <iconv.h> without also telling us
+dnl where its library lives.
+lame_iconv_incs=
+for lame_iconv_opt in ${GTK_CFLAGS} ${mpg123_CFLAGS} ${SNDFILE_CFLAGS}; do
+	case ${lame_iconv_opt} in
+	-I*)
+		case " ${lame_iconv_incs} " in
+		*" ${lame_iconv_opt} "*) ;;
+		*) lame_iconv_incs="${lame_iconv_incs} ${lame_iconv_opt}" ;;
+		esac
+		;;
+	esac
+done
+lame_iconv_libdirs=
+for lame_iconv_opt in ${GTK_LIBS} ${mpg123_LIBS} ${SNDFILE_LIBS}; do
+	case ${lame_iconv_opt} in
+	-L*)
+		case " ${lame_iconv_libdirs} " in
+		*" ${lame_iconv_opt} "*) ;;
+		*) lame_iconv_libdirs="${lame_iconv_libdirs} ${lame_iconv_opt}" ;;
+		esac
+		;;
+	esac
+done
+
+lame_iconv_save_CPPFLAGS="${CPPFLAGS}"
+lame_iconv_save_LDFLAGS="${LDFLAGS}"
+CPPFLAGS="${CPPFLAGS}${lame_iconv_incs}"
+LDFLAGS="${LDFLAGS}${lame_iconv_libdirs}"
+AM_ICONV
+CPPFLAGS="${lame_iconv_save_CPPFLAGS}"
+LDFLAGS="${lame_iconv_save_LDFLAGS}"
+
+if test "x${am_func_iconv}" = "xyes"; then
+	if test "x${am_cv_lib_iconv}" = "xyes"; then
+		iconv_state="yes (separate library)"
+	else
+		iconv_state="yes (C library)"
+	fi
+else
+	iconv_state="no - tags are not transliterated"
+fi
+
 LDADD="${LDADD}"
 FRONTEND_CFLAGS="${INCICONV} ${FRONTEND_CFLAGS}"
 FRONTEND_LDADD="${FRONTEND_LDADD} ${LTLIBICONV} ${CONFIG_MATH_LIB}"
@@ -1273,6 +1681,7 @@ FRONTEND_LDADD="${FRONTEND_LDADD} ${LTLIBICONV} ${CONFIG_MATH_LIB}"
 AC_SUBST(INCLUDES)
 
 AC_SUBST(FRONTEND_LDFLAGS)
+AC_SUBST(FRONTEND_UNICODE_LDFLAGS)
 AC_SUBST(FRONTEND_CFLAGS)
 AC_SUBST(FRONTEND_LDADD)
 AC_SUBST(LIBMP3LAME_LDADD)
@@ -1282,9 +1691,6 @@ AC_SUBST(LDADD)
 AC_SUBST(LIB_MAJOR_VERSION)
 AC_SUBST(LIB_MINOR_VERSION)
 
-AC_SUBST(NASM)
-AC_SUBST(NASM_FORMAT)
-
 AC_SUBST(MAKEDEP)
 AC_SUBST(RM_F)
 
@@ -1293,15 +1699,38 @@ AC_SUBST(LIBTOOL_DEPS)
 AC_SUBST(WITH_FRONTEND)
 AC_SUBST(WITH_MP3X)
 AC_SUBST(WITH_MP3RTP)
+AC_SUBST(MP3RTP_MAN)
+AC_SUBST(MP3X_MAN)
 
-AC_SUBST(CPUTYPE)
 AC_SUBST(CPUCCODE)
 
 AC_SUBST(CONFIG_DEFS)
 
+dnl ### unit tests (CMocka) ###
+dnl Off by default: a plain build is completely unaffected. When explicitly
+dnl requested, require CMocka via pkg-config and hard-fail if it is missing,
+dnl rather than silently configuring a test target that builds nothing.
+AC_MSG_CHECKING(whether to build unit tests)
+AC_ARG_ENABLE(unit-tests,
+  [AS_HELP_STRING([--enable-unit-tests],
+    [build the CMocka-based unit tests, run with "make check" [default=no]])],
+  [enable_unit_tests="${enableval}"], [enable_unit_tests=no])
+AC_MSG_RESULT(${enable_unit_tests})
+if test "x${enable_unit_tests}" = "xyes"; then
+	PKG_CHECK_MODULES([CMOCKA], [cmocka], [],
+	  [AC_MSG_ERROR([--enable-unit-tests was given, but the CMocka unit-test library was not found by pkg-config. Install CMocka (e.g. libcmocka-dev / sysutils/cmocka / mingw-w64-cmocka) or configure without --enable-unit-tests.])])
+fi
+AM_CONDITIONAL([ENABLE_UNIT_TESTS], [test "x${enable_unit_tests}" = "xyes"])
+dnl The RTP sender's unit test compiles frontend/rtp.c in and opens loopback
+dnl sockets, so it exists only where those calls do - the same answer that
+dnl decides whether mp3rtp can be built at all.
+AM_CONDITIONAL([HAVE_SOCKETS], [test "x${lame_have_sockets}" = "xyes"])
+
+
 AC_CONFIG_FILES([Makefile \
+		 test/Makefile \
+		 test/unit/Makefile \
 		 libmp3lame/Makefile \
-		 libmp3lame/i386/Makefile \
 		 libmp3lame/lame.pc \
 		 libmp3lame/vector/Makefile \
 		 frontend/Makefile \
@@ -1322,3 +1751,98 @@ AC_CONFIG_FILES([Makefile \
 		 vc_solution/Makefile])
 
 AC_OUTPUT
+
+
+# ---------------------------------------------------------------------------
+# Configuration summary. Anything that was forced to a non-default value, or
+# that overrode a user-supplied option, is reported with the reason so the
+# result is never surprising.
+# ---------------------------------------------------------------------------
+case "${lame_type_version}" in
+  0) lame_version_type_name=alpha ;;
+  1) lame_version_type_name=beta ;;
+  2) lame_version_type_name=release ;;
+  *) lame_version_type_name="unknown (${lame_type_version})" ;;
+esac
+case "x${FRONTEND_LDFLAGS}" in
+  *-static*) frontend_link_kind=static ;;
+  *)         frontend_link_kind=dynamic ;;
+esac
+# libsndfile has three outcomes, not two: not asked for, in use, or asked for
+# and not found - in which case the file io silently falls back to lame's own
+# routines, which is easy to miss among the rest of the configure output.
+if test "${CONFIG_FILEIO}" = "sndfile"; then
+  sndfile_state=yes
+elif test "x${HAVE_SNDFILE}" = "xno"; then
+  sndfile_state="requested, not found (using lame)"
+else
+  sndfile_state="not requested"
+fi
+if test "x${HAVE_TERMCAP}" = "x"; then
+  termcap_state=none
+else
+  termcap_state="${HAVE_TERMCAP}"
+fi
+if test "${HAVE_MPG123}" = "yes" && test "${CONFIG_DECODER}" != "no"; then
+  decoder_state=yes
+else
+  decoder_state=no
+fi
+if test -n "${WITH_FRONTEND}"; then prog_lame=yes; else prog_lame=no; fi
+if test -n "${WITH_MP3X}"; then prog_mp3x=yes; else prog_mp3x=no; fi
+if test -n "${WITH_MP3RTP}"; then prog_mp3rtp=yes; else prog_mp3rtp=no; fi
+# The vector routines are named by the instruction sets they are BUILT for.
+# Whether they are used is decided per CPU at run time, and "lame --verbose"
+# reports what the running machine actually got.
+lame_vector_sets=
+if test "x${WITH_XMM}" = "xyes"; then
+  lame_vector_sets="SSE2"
+fi
+if test "x${WITH_AVX2}" = "xyes"; then
+  lame_vector_sets="${lame_vector_sets} AVX2"
+fi
+if test "x${WITH_AVX512}" = "xyes"; then
+  lame_vector_sets="${lame_vector_sets} AVX-512"
+fi
+dnl Assigned rather than appended, like SSE2 above and for the same reason:
+dnl it is the first rung of its architecture, and a host is x86 or ARM, never
+dnl both.
+if test "x${WITH_NEON}" = "xyes"; then
+  lame_vector_sets="NEON"
+fi
+if test -z "${lame_vector_sets}"; then
+  lame_vector_sets=none
+fi
+echo ""
+echo "  LAME ${PACKAGE_VERSION} configuration summary"
+echo "  -------------------------------------------"
+echo "    version type .......... ${lame_version_type_name}"
+echo "    frontend linking ...... ${frontend_link_kind}"
+echo "    internal options ...... ${enable_internal:-no}"
+echo "    unit tests ............ ${enable_unit_tests:-no}"
+echo ""
+echo "    optional libraries"
+echo "      libmpg123 ........... ${HAVE_MPG123:-no}"
+echo "      libsndfile .......... ${sndfile_state}"
+echo "      terminal library .... ${termcap_state}"
+echo "      GTK4 (>= 4.10) ...... ${HAVE_GTK:-no}"
+echo "      iconv ............... ${iconv_state}"
+echo ""
+echo "    programs"
+echo "      lame ................ ${prog_lame}"
+echo "      mp3x ................ ${prog_mp3x}"
+echo "      mp3rtp .............. ${prog_mp3rtp}"
+echo ""
+echo "    features"
+echo "      decoder ............. ${decoder_state}"
+echo "      file io ............. ${CONFIG_FILEIO}"
+echo "      analyzer hooks ...... ${CONFIG_ANALYZER:-no}"
+echo "      vector routines ..... ${lame_vector_sets}"
+echo "      hardening ........... ${enable_hardening:-no}"
+echo "      native tuning ....... ${enable_native:-no}"
+echo "      debug ............... ${CONFIG_DEBUG:-no}"
+if test -n "${internal_static_note}"; then
+  echo ""
+  echo "    NOTE: ${internal_static_note}."
+fi
+echo ""

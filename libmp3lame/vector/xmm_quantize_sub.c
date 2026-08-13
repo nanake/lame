@@ -32,7 +32,7 @@
 
 
 
-#ifdef HAVE_XMMINTRIN_H
+#ifdef HAVE_SSE2_INTRINSICS
 
 #include <xmmintrin.h>
 
@@ -49,18 +49,6 @@ static const FLOAT costab[TRI_SIZE * 2] = {
     9.996988186962042e-01, 2.454122852291229e-02,
     9.999811752826011e-01, 6.135884649154475e-03
 };
-
-
-/* make sure functions with SSE instructions maintain their own properly aligned stack */
-#if defined (__GNUC__) && ((__GNUC__ > 4) || ((__GNUC__ == 4) && (__GNUC_MINOR__ >= 2)))
-#define REALIGN __attribute__((force_align_arg_pointer))
-#define TARGET(x) __attribute__((target(x)))
-#else
-#define REALIGN
-#define TARGET(x)
-#endif
-
-#define SSE_FUNCTION REALIGN TARGET("sse2")
 
 
 SSE_FUNCTION void
@@ -95,16 +83,16 @@ init_xrpow_core_sse(gr_info * const cod_info, FLOAT xrpow[576], int max_nz, FLOA
     }
     vec_tmp._m128 = _mm_set_ps1(0);
     switch (rest) {
-        case 3: vec_tmp._float[2] = cod_info->xr[upper4+2];
-        case 2: vec_tmp._float[1] = cod_info->xr[upper4+1];
+        case 3: vec_tmp._float[2] = cod_info->xr[upper4+2]; /* fall through */
+        case 2: vec_tmp._float[1] = cod_info->xr[upper4+1]; /* fall through */
         case 1: vec_tmp._float[0] = cod_info->xr[upper4+0];
             vec_tmp._m128 = _mm_and_ps(vec_tmp._m128, vec_fabs_mask); /* fabs */
             vec_sum._m128 = _mm_add_ps(vec_sum._m128, vec_tmp._m128);
             vec_tmp._m128 = _mm_sqrt_ps(_mm_mul_ps(vec_tmp._m128, _mm_sqrt_ps(vec_tmp._m128)));
             vec_xrpow_max._m128 = _mm_max_ps(vec_xrpow_max._m128, vec_tmp._m128); /* retrieve max */
             switch (rest) {
-                case 3: xrpow[upper4+2] = vec_tmp._float[2];
-                case 2: xrpow[upper4+1] = vec_tmp._float[1];
+                case 3: xrpow[upper4+2] = vec_tmp._float[2]; /* fall through */
+                case 2: xrpow[upper4+1] = vec_tmp._float[1]; /* fall through */
                 case 1: xrpow[upper4+0] = vec_tmp._float[0];
                 default:
                     break;
@@ -241,5 +229,5 @@ fht_SSE2(FLOAT * fz, int n)
     } while (k4 < n);
 }
 
-#endif	/* HAVE_XMMINTRIN_H */
+#endif	/* HAVE_SSE2_INTRINSICS */
 

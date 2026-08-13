@@ -34,6 +34,38 @@
 #include "quantize_pvt.h"
 #include "tables.h"
 
+#if defined( HAVE_SSE2_INTRINSICS ) || defined( HAVE_NEON_INTRINSICS )
+#include "vector/lame_intrin.h"
+
+/* Regions shorter than this are quicker scalar: the vector routines take
+ * eight values per pass, and their setup and final reduction do not pay for
+ * themselves below roughly four passes.  Measured over a real encode, a
+ * third of the regions are shorter than this, but they hold only about five
+ * percent of the values - so this test is here to avoid a regression on the
+ * short ones, not to win anything on them.
+ *
+ * Shared by both architectures deliberately: the pass width is eight values
+ * on either, the ARM routine having been written to the same shape for that
+ * reason.
+ */
+#define TABLE_SEARCH_VECTOR_MIN 32
+#endif
+
+#if defined( HAVE_SSE2_INTRINSICS )
+/** @internal
+ * The x86 vector routines compare sixteen bits at a time, so a region maximum
+ * comes back exact only while it fits there.  That is enough because the
+ * table search rejects anything above IXMAX_VAL, and everything above the
+ * saturation point is above IXMAX_VAL too - which stops being true if
+ * IXMAX_VAL is ever raised past it.  See @ref vector_dispatch for the wider
+ * rationale (why 16-bit SSE2 beats the 32-bit SSE4.1 path here).
+ *
+ * The ARM routine works in 32-bit lanes and never narrows, so this assertion
+ * is about the x86 tier alone and stays with it.
+ */
+enum { static_assert_ixmax_val_fits_in_16_bits = 1 / (IXMAX_VAL < 32767 ? 1 : 0) };
+#endif
+
 
 static const struct {
     const int region0_count;
@@ -130,7 +162,7 @@ quantize_lines_xrpow_01(unsigned int l, FLOAT istep, const FLOAT * xr, int *ix)
 
 
 
-#ifdef TAKEHIRO_IEEE754_HACK
+#if TAKEHIRO_IEEE754_HACK
 
 typedef union {
     float   f;
@@ -271,6 +303,53 @@ quantize_lines_xrpow(unsigned int l, FLOAT istep, const FLOAT * xr, int *ix)
 #endif
 
 
+/* Runs shorter than this are quicker scalar.  Unlike the table search this
+ * loop has almost no fixed cost to amortise - one broadcast of istep - so the
+ * threshold sits at the width of a single pass rather than at several.  The
+ * wider tier pays for entering and leaving the wide registers and so asks for
+ * more.  Measured over a real CBR encode, runs below eight values are a fifth
+ * of the calls but under one percent of the values, and below sixteen a third
+ * of the calls and under two percent: these tests are here to avoid a
+ * regression on short runs, not to win anything on them.
+ */
+#define QUANTIZE_LINES_VECTOR_MIN      8
+#define QUANTIZE_LINES_VECTOR_MIN_AVX2 16
+#define QUANTIZE_LINES_VECTOR_MIN_AVX512 32
+
+/* The vector forms compute the default formulation - truncation toward zero
+ * against adj43[].  TAKEHIRO_IEEE754_HACK is a different formulation with its
+ * own rounding and its own table, reaching the same answer by another route;
+ * it is off by default and may be retired, so it is left entirely alone and a
+ * hack build keeps its own scalar path.
+ */
+static void
+quantize_lines_xrpow_v(unsigned int l, FLOAT istep, const FLOAT * xr, int *ix,
+                       vector_impl_t impl)
+{
+#if !TAKEHIRO_IEEE754_HACK
+#if defined( HAVE_AVX512_INTRINSICS )
+    if (impl >= VECTOR_IMPL_AVX512 && l >= QUANTIZE_LINES_VECTOR_MIN_AVX512) {
+        quantize_lines_xrpow_avx512(l, istep, xr, ix, adj43);
+        return;
+    }
+#endif
+#if defined( HAVE_AVX2_INTRINSICS )
+    if (impl >= VECTOR_IMPL_AVX2 && l >= QUANTIZE_LINES_VECTOR_MIN_AVX2) {
+        quantize_lines_xrpow_avx2(l, istep, xr, ix, adj43);
+        return;
+    }
+#endif
+#if defined( HAVE_SSE2_INTRINSICS )
+    if (impl >= VECTOR_IMPL_SSE2 && l >= QUANTIZE_LINES_VECTOR_MIN) {
+        quantize_lines_xrpow_sse2(l, istep, xr, ix, adj43);
+        return;
+    }
+#endif
+#endif
+    (void) impl;
+    quantize_lines_xrpow(l, istep, xr, ix);
+}
+
 
 /*********************************************************************
  * Quantization function
@@ -280,7 +359,7 @@ quantize_lines_xrpow(unsigned int l, FLOAT istep, const FLOAT * xr, int *ix)
 
 static void
 quantize_xrpow(const FLOAT * xp, int *pi, FLOAT istep, gr_info const *const cod_info,
-               calc_noise_data const *prev_noise)
+               calc_noise_data const *prev_noise, vector_impl_t impl)
 {
     /* quantize on xr^(3/4) instead of xr */
     int     sfb;
@@ -324,7 +403,7 @@ quantize_xrpow(const FLOAT * xp, int *pi, FLOAT istep, gr_info const *const cod_
             /* do not recompute this part,
                but compute accumulated lines */
             if (accumulate) {
-                quantize_lines_xrpow(accumulate, istep, acc_xp, acc_iData);
+                quantize_lines_xrpow_v(accumulate, istep, acc_xp, acc_iData, impl);
                 accumulate = 0;
             }
             if (accumulate01) {
@@ -363,7 +442,7 @@ quantize_xrpow(const FLOAT * xp, int *pi, FLOAT istep, gr_info const *const cod_
                 prev_noise->step[sfb] > 0 && step >= prev_noise->step[sfb]) {
 
                 if (accumulate) {
-                    quantize_lines_xrpow(accumulate, istep, acc_xp, acc_iData);
+                    quantize_lines_xrpow_v(accumulate, istep, acc_xp, acc_iData, impl);
                     accumulate = 0;
                     acc_iData = iData;
                     acc_xp = xp;
@@ -389,7 +468,7 @@ quantize_xrpow(const FLOAT * xp, int *pi, FLOAT istep, gr_info const *const cod_
                     accumulate01 = 0;
                 }
                 if (accumulate) {
-                    quantize_lines_xrpow(accumulate, istep, acc_xp, acc_iData);
+                    quantize_lines_xrpow_v(accumulate, istep, acc_xp, acc_iData, impl);
                     accumulate = 0;
                 }
 
@@ -403,7 +482,7 @@ quantize_xrpow(const FLOAT * xp, int *pi, FLOAT istep, gr_info const *const cod_
         }
     }
     if (accumulate) {   /*last data part */
-        quantize_lines_xrpow(accumulate, istep, acc_xp, acc_iData);
+        quantize_lines_xrpow_v(accumulate, istep, acc_xp, acc_iData, impl);
         accumulate = 0;
     }
     if (accumulate01) { /*last data part */
@@ -440,6 +519,29 @@ ix_max(const int *ix, const int *end)
 }
 
 
+/* The tiers are tried highest first, and each is only offered a region long
+ * enough to repay it.  Everything below falls through to the scalar loop,
+ * which is also what an architecture without any of this gets.
+ */
+static int
+ix_max_v(const int *ix, const int *const end, vector_impl_t impl)
+{
+#if defined( HAVE_SSE2_INTRINSICS )
+    if (end - ix >= TABLE_SEARCH_VECTOR_MIN) {
+# if defined( HAVE_AVX2_INTRINSICS )
+        if (impl >= VECTOR_IMPL_AVX2)
+            return ix_max_avx2(ix, end);
+# endif
+        if (impl >= VECTOR_IMPL_SSE2)
+            return ix_max_sse2(ix, end);
+    }
+#else
+    (void) impl;
+#endif
+    return ix_max(ix, end);
+}
+
+
 
 
 
@@ -447,12 +549,32 @@ ix_max(const int *ix, const int *end)
 
 
 static int
-count_bit_ESC(const int *ix, const int *const end, int t1, const int t2, unsigned int *const s)
+count_bit_ESC(const int *ix, const int *const end, int t1, const int t2,
+              unsigned int *const s, vector_impl_t impl)
 {
     /* ESC-table is used */
     unsigned int const linbits = ht[t1].xlen * 65536u + ht[t2].xlen;
     unsigned int sum = 0, sum2;
 
+#if defined( HAVE_SSE2_INTRINSICS )
+    if (impl >= VECTOR_IMPL_SSE2 && end - ix >= TABLE_SEARCH_VECTOR_MIN) {
+        unsigned int nclamped;
+
+        sum = count_bit_esc_sse2(ix, end, largetbl, &nclamped);
+        sum += nclamped * linbits;
+    }
+    else
+#elif defined( HAVE_NEON_INTRINSICS )
+    if (impl >= VECTOR_IMPL_NEON && end - ix >= TABLE_SEARCH_VECTOR_MIN) {
+        unsigned int nclamped;
+
+        sum = count_bit_esc_neon(ix, end, largetbl, &nclamped);
+        sum += nclamped * linbits;
+    }
+    else
+#else
+    (void) impl;
+#endif
     do {
         unsigned int x = *ix++;
         unsigned int y = *ix++;
@@ -484,12 +606,13 @@ count_bit_ESC(const int *ix, const int *const end, int t1, const int t2, unsigne
 
 
 static int
-count_bit_noESC(const int *ix, const int *end, int mx, unsigned int *s)
+count_bit_noESC(const int *ix, const int *end, int mx, unsigned int *s, vector_impl_t impl)
 {
     /* No ESC-words */
     unsigned int sum1 = 0;
     const uint8_t *const hlen1 = ht[1].hlen;
     (void) mx;
+    (void) impl;
 
     do {
         unsigned int const x0 = *ix++;
@@ -508,13 +631,14 @@ static const int huf_tbl_noESC[] = {
 
 
 static int
-count_bit_noESC_from2(const int *ix, const int *end, int max, unsigned int *s)
+count_bit_noESC_from2(const int *ix, const int *end, int max, unsigned int *s, vector_impl_t impl)
 {
     int t1 = huf_tbl_noESC[max - 1];
     /* No ESC-words */
     const unsigned int xlen = ht[t1].xlen;
     uint32_t const* table = (t1 == 2) ? &table23[0] : &table56[0];
     unsigned int sum = 0, sum2;
+    (void) impl;
 
     do {
         unsigned int const x0 = *ix++;
@@ -536,7 +660,7 @@ count_bit_noESC_from2(const int *ix, const int *end, int max, unsigned int *s)
 
 
 inline static int
-count_bit_noESC_from3(const int *ix, const int *end, int max, unsigned int * s)
+count_bit_noESC_from3(const int *ix, const int *end, int max, unsigned int * s, vector_impl_t impl)
 {
     int t1 = huf_tbl_noESC[max - 1];
     /* No ESC-words */
@@ -549,6 +673,19 @@ count_bit_noESC_from3(const int *ix, const int *end, int max, unsigned int * s)
     const uint8_t *const hlen3 = ht[t1 + 2].hlen;
     int     t;
 
+#if defined( HAVE_SSE2_INTRINSICS )
+    if (impl >= VECTOR_IMPL_SSE2 && end - ix >= TABLE_SEARCH_VECTOR_MIN) {
+        unsigned int sums[3];
+
+        count_bit_noESC_from3_sse2(ix, end, (int) xlen, hlen1, hlen2, hlen3, sums);
+        sum1 = sums[0];
+        sum2 = sums[1];
+        sum3 = sums[2];
+    }
+    else
+#else
+    (void) impl;
+#endif
     do {
         unsigned int x0 = *ix++;
         unsigned int x1 = *ix++;
@@ -585,17 +722,23 @@ count_bit_noESC_from3(const int *ix, const int *end, int max, unsigned int * s)
   of the Huffman tables as defined in the IS (Table B.7), and will not work
   with any arbitrary tables.
 */
-static int count_bit_null(const int* ix, const int* end, int max, unsigned int* s)
+static int count_bit_null(const int* ix, const int* end, int max, unsigned int* s, vector_impl_t impl)
 {
     (void) ix;
     (void) end;
     (void) max;
     (void) s;
+    (void) impl;
     return 0;
 }
 
-typedef int (*count_fnc)(const int* ix, const int* end, int max, unsigned int* s);
-  
+/* The counting routines take the implementation to run rather than being
+ * selected by it, so that the map from a region's maximum to its routine
+ * stays the single table below however many tiers exist.
+ */
+typedef int (*count_fnc)(const int* ix, const int* end, int max, unsigned int* s,
+                         vector_impl_t impl);
+
 static const count_fnc count_fncs[] = 
 { &count_bit_null
 , &count_bit_noESC
@@ -616,15 +759,15 @@ static const count_fnc count_fncs[] =
 };
 
 static int
-choose_table_nonMMX(const int *ix, const int *const end, int *const _s)
+choose_table_x(const int *ix, const int *const end, int *const _s, vector_impl_t impl)
 {
     unsigned int* s = (unsigned int*)_s;
     unsigned int  max;
     int     choice, choice2;
-    max = ix_max(ix, end);
+    max = ix_max_v(ix, end, impl);
 
     if (max <= 15) {
-      return count_fncs[max](ix, end, max, s);
+      return count_fncs[max](ix, end, max, s, impl);
     }
     /* try tables with linbits */
     if (max > IXMAX_VAL) {
@@ -643,8 +786,42 @@ choose_table_nonMMX(const int *ix, const int *const end, int *const _s)
             break;
         }
     }
-    return count_bit_ESC(ix, end, choice, choice2, s);
+    return count_bit_ESC(ix, end, choice, choice2, s, impl);
 }
+
+
+/* One entry point per implementation, so the choice is made once when the
+ * encoder starts rather than at every region.
+ */
+static int
+choose_table_c(const int *ix, const int *const end, int *const _s)
+{
+    return choose_table_x(ix, end, _s, VECTOR_IMPL_NONE);
+}
+
+#if defined( HAVE_SSE2_INTRINSICS )
+static int
+choose_table_sse2(const int *ix, const int *const end, int *const _s)
+{
+    return choose_table_x(ix, end, _s, VECTOR_IMPL_SSE2);
+}
+#endif
+
+#if defined( HAVE_AVX2_INTRINSICS )
+static int
+choose_table_avx2(const int *ix, const int *const end, int *const _s)
+{
+    return choose_table_x(ix, end, _s, VECTOR_IMPL_AVX2);
+}
+#endif
+
+#if defined( HAVE_NEON_INTRINSICS )
+static int
+choose_table_neon(const int *ix, const int *const end, int *const _s)
+{
+    return choose_table_x(ix, end, _s, VECTOR_IMPL_NEON);
+}
+#endif
 
 
 
@@ -776,7 +953,7 @@ count_bits(lame_internal_flags const *const gfc,
     if (gi->xrpow_max > w)
         return LARGE_BITS;
 
-    quantize_xrpow(xr, ix, IPOW20(gi->global_gain), gi, prev_noise);
+    quantize_xrpow(xr, ix, IPOW20(gi->global_gain), gi, prev_noise, vector_implementation(gfc));
 
     if (gfc->sv_qnt.substep_shaping & 2) {
         int     sfb, j = 0;
@@ -1327,21 +1504,26 @@ scale_bitcount(const lame_internal_flags * gfc, gr_info * cod_info)
 }
 
 
-#ifdef MMX_choose_table
-extern int choose_table_MMX(const int *ix, const int *const end, int *const s);
-#endif
-
 void
 huffman_init(lame_internal_flags * const gfc)
 {
     int     i;
 
-    gfc->choose_table = choose_table_nonMMX;
-
-#ifdef MMX_choose_table
-    if (gfc->CPU_features.MMX) {
-        gfc->choose_table = choose_table_MMX;
-    }
+    /* Ascending, so the widest implementation the machine offers is the one
+       left standing, and a tier that has no routines of its own still gets
+       everything the tiers below it provide. */
+    gfc->choose_table = choose_table_c;
+#if defined( HAVE_SSE2_INTRINSICS )
+    if (vector_implementation(gfc) >= VECTOR_IMPL_SSE2)
+        gfc->choose_table = choose_table_sse2;
+#endif
+#if defined( HAVE_AVX2_INTRINSICS )
+    if (vector_implementation(gfc) >= VECTOR_IMPL_AVX2)
+        gfc->choose_table = choose_table_avx2;
+#endif
+#if defined( HAVE_NEON_INTRINSICS )
+    if (vector_implementation(gfc) >= VECTOR_IMPL_NEON)
+        gfc->choose_table = choose_table_neon;
 #endif
 
     for (i = 2; i <= 576; i += 2) {

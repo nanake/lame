@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup Label="UserMacros">
+    <!-- GTK 4 for the mp3x analyzer; set HaveGtk to true and extract a GTK 4
+         install prefix into vc_solution\gtk4\x64, or point Gtk4Path elsewhere.
+         The layout expected is the one gvsbuild
+         (https://github.com/wingtk/gvsbuild) produces - include\ and lib\
+         directly under the prefix, DLLs in bin\ - and its releases page
+         publishes that as a ready-made archive. mp3x is x64 only, because
+         that is the only architecture GTK 4 for MSVC is published for.
+
+         The paths below supply their own separator, so that Gtk4Path can be
+         quoted against spaces: a path quoted with a trailing backslash would
+         escape the closing quote. That is not hypothetical - it is exactly how
+         a /p:Gtk4Path="...\" on an MSBuild command line silently loses the
+         value and the build then cannot find gtk/gtk.h. -->
+    <HaveGtk>false</HaveGtk>
+    <Gtk4Path>.\gtk4\$(Platform)</Gtk4Path>
+  </PropertyGroup>
+  <ItemGroup>
+    <BuildMacro Include="HaveGtk">
+      <Value>$(HaveGtk)</Value>
+    </BuildMacro>
+    <BuildMacro Include="Gtk4Path">
+      <Value>$(Gtk4Path)</Value>
+    </BuildMacro>
+  </ItemGroup>
+  <!-- ExternalIncludePath rather than AdditionalIncludeDirectories: these headers
+       belong to GTK, and compiling them at the warning level this project holds
+       its own code to says nothing about this project. The toolset adds this list
+       to the include search path and marks the same directories external, so the
+       headers are still found while ExternalWarningLevel below decides what they
+       are compiled at. Our own sources keep their level, which is the point.
+
+       It has to be a property and not ClCompile metadata: the C++ targets read
+       $(ExternalIncludePath), and an ExternalIncludeDirectories item on ClCompile
+       is silently ignored - the build then fails to find gtk/gtk.h at all. -->
+  <PropertyGroup>
+    <ExternalIncludePath Condition="$(HaveGtk) == 'true'">$(Gtk4Path)\include\gtk-4.0;$(Gtk4Path)\include\glib-2.0;$(Gtk4Path)\lib\glib-2.0\include;$(Gtk4Path)\include\pango-1.0;$(Gtk4Path)\include\cairo;$(Gtk4Path)\include\gdk-pixbuf-2.0;$(Gtk4Path)\include\graphene-1.0;$(Gtk4Path)\lib\graphene-1.0\include;$(Gtk4Path)\include\harfbuzz;$(ExternalIncludePath)</ExternalIncludePath>
+  </PropertyGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <ExternalWarningLevel Condition="$(HaveGtk) == 'true'">TurnOffAllWarnings</ExternalWarningLevel>
+    </ClCompile>
+    <Link>
+      <AdditionalLibraryDirectories Condition="$(HaveGtk) == 'true'">$(Gtk4Path)\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies Condition="$(HaveGtk) == 'true'">gtk-4.lib;gobject-2.0.lib;glib-2.0.lib;gio-2.0.lib;cairo.lib;pango-1.0.lib;pangocairo-1.0.lib;gdk_pixbuf-2.0.lib;graphene-1.0.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+    <PostBuildEvent>
+      <Command Condition="$(HaveGtk) == 'true'">xcopy /y /d "$(Gtk4Path)\bin\*.dll" "$(OutputPath)"</Command>
+    </PostBuildEvent>
+  </ItemDefinitionGroup>
+</Project>

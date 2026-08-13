@@ -1,0 +1,34 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup Label="UserMacros">
+    <!-- libsndfile configuration; set to true and adjust path, ending with a backslash -->
+    <HaveLibsndfile>false</HaveLibsndfile>
+    <LibsndfilePath>.\libsndfile\$(Platform)\</LibsndfilePath>
+  </PropertyGroup>
+  <ItemGroup>
+    <BuildMacro Include="HaveLibsndfile">
+      <Value>$(HaveLibsndfile)</Value>
+    </BuildMacro>
+    <BuildMacro Include="LibsndfilePath">
+      <Value>$(LibsndfilePath)</Value>
+    </BuildMacro>
+  </ItemGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <PreprocessorDefinitions Condition="$(HaveLibsndfile) == 'true'">LIBSNDFILE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories Condition="$(HaveLibsndfile) == 'true'">$(LibsndfilePath)include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+    <Link>
+      <AdditionalLibraryDirectories Condition="$(HaveLibsndfile) == 'true'">$(LibsndfilePath)lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies Condition="$(HaveLibsndfile) == 'true'">sndfile.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+  <!-- The runtime library goes beside the binaries. Every project sharing this
+       output directory would otherwise copy it there, so the copy skips a file
+       that is already current rather than racing to rewrite it. -->
+  <Target Name="CopyLibsndfileRuntime" AfterTargets="Build"
+          Condition="$(HaveLibsndfile) == 'true' And '$(ConfigurationType)' != 'StaticLibrary'">
+    <Copy SourceFiles="$(LibsndfilePath)bin\sndfile.dll" DestinationFolder="$(OutDir)"
+          SkipUnchangedFiles="true" Retries="3" RetryDelayMilliseconds="200" />
+  </Target>
+</Project>

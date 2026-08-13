@@ -186,7 +186,7 @@ strlenMultiByte(char const* str, size_t w)
 }
 
 static char*
-currentCharacterEncoding()
+currentCharacterEncoding(void)
 {
 #ifdef HAVE_LANGINFO_H
     char* cur_code = nl_langinfo(CODESET);
@@ -396,46 +396,50 @@ static int getIntValue(char const* token, char const* arg, int* ptr)
     char *_EndPtr=0;
     long d = strtol(arg, &_EndPtr, 10);
     if (ptr != 0) {
-        *ptr = d;
+        *ptr = (int)d;
     }
     return evaluateArgument(token, arg, _EndPtr);
 }
 
 #ifdef ID3TAGS_EXTENDED
+/* Set an ID3v2 tag field from UTF-16 data. The data pointer is genuinely
+   UTF-16 here, so the UTF-16 id3tag_* setters are used throughout. */
 static int
-set_id3v2tag(lame_global_flags* gfp, TextEncoding enc, int type, unsigned short const* str)
+set_id3v2tag_utf16(lame_global_flags* gfp, int type, unsigned short const* str)
 {
-    switch (enc)
+    switch (type)
     {
-        case TENC_UTF8:
-            switch (type)
-            {
-                case 'a': return id3tag_set_textinfo_utf8(gfp, "TPE1", str);
-                case 't': return id3tag_set_textinfo_utf8(gfp, "TIT2", str);
-                case 'l': return id3tag_set_textinfo_utf8(gfp, "TALB", str);
-                case 'g': return id3tag_set_textinfo_utf8(gfp, "TCON", str);
-                case 'c': return id3tag_set_comment_ucs2(gfp, 0, 0, str);
-                case 'n': return id3tag_set_textinfo_utf8(gfp, "TRCK", str);
-                case 'y': return id3tag_set_textinfo_utf8(gfp, "TYER", str);
-                case 'v': return id3tag_set_fieldvalue_ucs2(gfp, str);
-            }
-            ;;
-        case TENC_UTF16:
-            switch (type)
-            {
-                case 'a': return id3tag_set_textinfo_utf16(gfp, "TPE1", str);
-                case 't': return id3tag_set_textinfo_utf16(gfp, "TIT2", str);
-                case 'l': return id3tag_set_textinfo_utf16(gfp, "TALB", str);
-                case 'g': return id3tag_set_textinfo_utf16(gfp, "TCON", str);
-                case 'c': return id3tag_set_comment_utf16(gfp, 0, 0, str);
-                case 'n': return id3tag_set_textinfo_utf16(gfp, "TRCK", str);
-                case 'y': return id3tag_set_textinfo_utf16(gfp, "TYER", str);
-                case 'v': return id3tag_set_fieldvalue_utf16(gfp, str);
-            }
-            ;;
-        default:
-            return -3;
+        case 'a': return id3tag_set_textinfo_utf16(gfp, "TPE1", str);
+        case 't': return id3tag_set_textinfo_utf16(gfp, "TIT2", str);
+        case 'l': return id3tag_set_textinfo_utf16(gfp, "TALB", str);
+        case 'g': return id3tag_set_textinfo_utf16(gfp, "TCON", str);
+        case 'c': return id3tag_set_comment_utf16(gfp, 0, 0, str);
+        case 'n': return id3tag_set_textinfo_utf16(gfp, "TRCK", str);
+        case 'y': return id3tag_set_textinfo_utf16(gfp, "TYER", str);
+        case 'v': return id3tag_set_fieldvalue_utf16(gfp, str);
     }
+    return -3;
+}
+
+/* Set an ID3v2 tag field from UTF-8 data. The data pointer is a UTF-8 char
+   string (not UTF-16 as the old, mistyped single handler assumed), so the
+   UTF-8 id3tag_* setters are used - including id3tag_set_fieldvalue_utf8 for
+   'v', which replaces the removed *_ucs2 calls the UTF-8 path used to make. */
+static int
+set_id3v2tag_utf8(lame_global_flags* gfp, int type, char const* str)
+{
+    switch (type)
+    {
+        case 'a': return id3tag_set_textinfo_utf8(gfp, "TPE1", str);
+        case 't': return id3tag_set_textinfo_utf8(gfp, "TIT2", str);
+        case 'l': return id3tag_set_textinfo_utf8(gfp, "TALB", str);
+        case 'g': return id3tag_set_textinfo_utf8(gfp, "TCON", str);
+        case 'c': return id3tag_set_comment_utf8(gfp, 0, 0, str);
+        case 'n': return id3tag_set_textinfo_utf8(gfp, "TRCK", str);
+        case 'y': return id3tag_set_textinfo_utf8(gfp, "TYER", str);
+        case 'v': return id3tag_set_fieldvalue_utf8(gfp, str);
+    }
+    return -3;
 }
 #endif
 
@@ -480,8 +484,8 @@ id3_tag(lame_global_flags* gfp, int type, TextEncoding enc, char* str)
         default:
 #ifdef ID3TAGS_EXTENDED
         case TENC_LATIN1: result = set_id3tag(gfp, type, x);   break;
-        case TENC_UTF16:  result = set_id3v2tag(gfp, enc, type, x); break;
-        case TENC_UTF8:   result = set_id3v2tag(gfp, enc, type, x); break;
+        case TENC_UTF16:  result = set_id3v2tag_utf16(gfp, type, x); break;
+        case TENC_UTF8:   result = set_id3v2tag_utf8(gfp, type, x);  break;
 #else
         case TENC_RAW:    result = set_id3tag(gfp, type, x);   break;
 #endif
@@ -766,6 +770,42 @@ help_developer_switches(FILE * const fp)
            );
 }
 
+/* One vector-routine name, terminator included.  They are short identifiers;
+   a name that did not fit here could not be matched by the library either. */
+#define VECTOR_NAME_MAX     32
+/* The whole list of them, as --longhelp and the error message print it. */
+#define VECTOR_CHOICES_MAX  128
+
+/* The names --vector takes, assembled into buf.  They are read out of the
+   library rather than written out here, so a build without AVX2 - or one for
+   another architecture - never offers a choice it cannot honour.  The help
+   text and the error message get the same list for the same reason. */
+static const char *
+vector_choices(char *buf, size_t size)
+{
+    int     i;
+    int const n = lame_get_num_vector_routines();
+    size_t  used;
+
+    if (size == 0)
+        return "";
+    buf[0] = '\0';
+    strncat(buf, "auto, none", size - 1);
+    used = strnlen(buf, size);
+    for (i = 0; i < n; ++i) {
+        const char *const name = lame_get_vector_routines_name(i);
+        size_t const len = strnlen(name, size);
+
+        if (used + 2 + len + 1 > size)
+            break;
+        strncat(buf, ", ", size - used - 1);
+        used += 2;
+        strncat(buf, name, size - used - 1);
+        used += len;
+    }
+    return buf;
+}
+
 int
 long_help(const lame_global_flags * gfp, FILE * const fp, const char *ProgramName, int lessmode)
 {                       /* print long syntax help */
@@ -785,7 +825,7 @@ long_help(const lame_global_flags * gfp, FILE * const fp, const char *ProgramNam
             "    --ignorelength  ignore file length in WAV header\n"
             "    --gain <arg>    apply Gain adjustment in decibels, range -20.0 to +12.0\n"
            );
-#if (defined HAVE_MPGLIB || defined AMIGA_MPEGA)
+#ifdef HAVE_MPG123
     fprintf(fp,
             "    --mp1input      input file is a MPEG Layer I   file\n"
             "    --mp2input      input file is a MPEG Layer II  file\n"
@@ -831,11 +871,11 @@ long_help(const lame_global_flags * gfp, FILE * const fp, const char *ProgramNam
             "                    \"--preset help\" gives more info on these\n"
             "    --comp  <arg>   choose bitrate to achieve a compression ratio of <arg>\n");
     fprintf(fp, "    --replaygain-fast   compute RG fast but slightly inaccurately (default)\n"
-#ifdef DECODE_ON_THE_FLY
+#ifdef HAVE_MPG123
             "    --replaygain-accurate   compute RG more accurately and find the peak sample\n"
 #endif
             "    --noreplaygain  disable ReplayGain analysis\n"
-#ifdef DECODE_ON_THE_FLY
+#ifdef HAVE_MPG123
             "    --clipdetect    enable --replaygain-accurate and print a message whether\n"
             "                    clipping occurs and how far the waveform is from full scale\n"
 #endif
@@ -944,13 +984,18 @@ long_help(const lame_global_flags * gfp, FILE * const fp, const char *ProgramNam
             "\nMisc:\n    --license       print License information\n\n"
         );
 
-#if defined(HAVE_NASM)
     wait_for(fp, lessmode);
-    fprintf(fp,
-            "  Platform specific:\n"
-            "    --noasm <instructions> disable assembly optimizations for mmx/3dnow/sse\n");
+    {
+        char    choices[VECTOR_CHOICES_MAX];
+
+        fprintf(fp,
+                "  Platform specific:\n"
+                "    --vector <name>     which vector routines to run: %s\n"
+                "                        default is auto, the widest set this CPU has\n"
+                "    --noasm <type>      deprecated, use --vector\n",
+                vector_choices(choices, sizeof choices));
+    }
     wait_for(fp, lessmode);
-#endif
 
     display_bitrates(fp);
 
@@ -1079,7 +1124,7 @@ presets_set(lame_t gfp, int fast, int cbr, const char *preset_name, const char *
         && (cbr < 1)) {
         lame_version_print(stdout);
         presets_longinfo_dm(stdout);
-        return -1;
+        return -2;      /* asked for and got: stop, but not an error */
     }
 
     /*aliases for compatibility with old presets */
@@ -1583,6 +1628,47 @@ static int dev_only_without_arg(char const* str, char const* token, int* argIgno
     return 0;
 }
 
+
+/* --vector <name>.  The library matches the name strictly, so whatever the
+   user typed is lower-cased first.
+
+   A rejected name ends the run rather than falling back: the option exists to
+   pin an encode to one set of routines, and an encode that quietly used a
+   different set would answer a question nobody asked. */
+static int
+set_vector_routines(lame_global_flags * gfp, const char *name)
+{
+    char    lower[VECTOR_NAME_MAX];
+    size_t  i;
+    int     rc;
+
+    for (i = 0; i + 1 < sizeof lower && name[i] != '\0'; ++i)
+        lower[i] = (char) tolower((unsigned char) name[i]);
+    lower[i] = '\0';
+
+    rc = lame_set_vector_routines(gfp, lower);
+    if (rc == 0)
+        return 0;
+
+    switch (rc) {
+    case -3:
+        error_printf("Error: this build has no '%s' vector routines.\n", lower);
+        break;
+    case -4:
+        error_printf("Error: this processor cannot run the '%s' vector routines.\n", lower);
+        break;
+    default:
+        error_printf("Error: '%s' is not a set of vector routines.\n", lower);
+        break;
+    }
+    {
+        char    choices[VECTOR_CHOICES_MAX];
+
+        error_printf("       this build offers: %s\n", vector_choices(choices, sizeof choices));
+    }
+    return -1;
+}
+
 /* Ugly, NOT final version */
 
 #define T_IF(str)          if ( 0 == local_strcasecmp (token,str) ) {
@@ -1598,6 +1684,35 @@ static int dev_only_without_arg(char const* str, char const* token, int* argIgno
                            } else if (dev_only_with_arg(str,token,nextArg,&argIgnored,&argUsed)) {
 
 
+/**
+ * Copy a positional input/output filename argument into a fixed PATH_MAX+1
+ * byte buffer, always null-terminating the result.
+ *
+ * A source of PATH_MAX bytes or longer is rejected rather than copied, so the
+ * destination is never left unterminated for a later unbounded string scan.
+ *
+ * @param src  NUL-terminated source filename.
+ * @param dst  destination buffer of at least PATH_MAX+1 bytes; on success it
+ *             holds a null-terminated copy of @p src, on failure it is left
+ *             unchanged.
+ * @return 0 on success, or -1 if @p src is PATH_MAX bytes or longer (an error
+ *         naming the offending file is printed).
+ */
+static int
+set_path_arg(char const *const src, char *const dst)
+{
+    int const arg_n = (int)strnlen(src, PATH_MAX);
+    if (arg_n >= PATH_MAX) {
+        error_printf("input/output file name too long (limit %d): %s\n",
+                     PATH_MAX, src);
+        return -1;
+    }
+    strncpy(dst, src, PATH_MAX);
+    dst[PATH_MAX] = '\0';
+    return 0;
+}
+
+
 static int
 parse_args_(lame_global_flags * gfp, int argc, char **argv,
            char *const inPath, char *const outPath, char **nogap_inPath, int *num_nogap)
@@ -1611,6 +1726,8 @@ parse_args_(lame_global_flags * gfp, int argc, char **argv,
     const char *ProgramName = argv[0];
     int     count_nogap = 0;
     int     noreplaygain = 0; /* is RG explicitly disabled by the user */
+    int     vector_selected = 0; /* --vector was given; it wins over --noasm */
+    int     noasm_none = 0;  /* --noasm sse was given; nothing may raise it */
     int     id3tag_mode = ID3TAG_MODE_DEFAULT;
     int     ignore_tag_errors = 0;  /* Ignore errors in values passed for tags */
 #ifdef ID3TAGS_EXTENDED
@@ -1619,7 +1736,7 @@ parse_args_(lame_global_flags * gfp, int argc, char **argv,
     enum TextEncoding id3_tenc = TENC_LATIN1;
 #endif
 
-#ifdef HAVE_LANGINFO_H
+#if defined(HAVE_ICONV) && defined(HAVE_LANGINFO_H)
     setlocale(LC_CTYPE, "");
 #endif
     inPath[0] = '\0';
@@ -1709,6 +1826,7 @@ parse_args_(lame_global_flags * gfp, int argc, char **argv,
                 T_ELIF("big-endian")
                     global_raw_pcm.in_endian = ByteOrderBigEndian;
 
+#ifdef HAVE_MPG123
                 T_ELIF("mp1input")
                     global_reader.input_format = sf_mp1;
 
@@ -1717,10 +1835,7 @@ parse_args_(lame_global_flags * gfp, int argc, char **argv,
 
                 T_ELIF("mp3input")
                     global_reader.input_format = sf_mp3;
-
-                T_ELIF("ogginput")
-                    error_printf("sorry, vorbis support in LAME is deprecated.\n");
-                return -1;
+#endif
 
                 T_ELIF("decode")
                     (void) lame_set_decode_only(gfp, 1);
@@ -1779,14 +1894,35 @@ parse_args_(lame_global_flags * gfp, int argc, char **argv,
                         (void) lame_set_scale(gfp, (float) gain);
                     }
 
+                T_ELIF("vector")
+                    argUsed = 1;
+                    if (set_vector_routines(gfp, nextArg) != 0)
+                        return -1;
+                    vector_selected = 1;
+
                 T_ELIF("noasm")
                     argUsed = 1;
-                if (!strcmp(nextArg, "mmx"))
-                    (void) lame_set_asm_optimizations(gfp, MMX, 0);
-                if (!strcmp(nextArg, "3dnow"))
-                    (void) lame_set_asm_optimizations(gfp, AMD_3DNOW, 0);
-                if (!strcmp(nextArg, "sse"))
-                    (void) lame_set_asm_optimizations(gfp, SSE, 0);
+                    if (local_strcasecmp(nextArg, "sse") == 0) {
+                        error_printf("WARNING: --noasm sse is deprecated,"
+                                     " use --vector none instead\n");
+                        if (!vector_selected) {
+                            (void) lame_set_vector_routines(gfp, "none");
+                            noasm_none = 1;
+                        }
+                    }
+                    else if (local_strcasecmp(nextArg, "avx2") == 0) {
+                        error_printf("WARNING: --noasm avx2 is deprecated,"
+                                     " use --vector sse2 instead\n");
+                        /* The option could be repeated to turn off more than
+                           one tier, so a second mapping may only lower the
+                           selection: "sse" already asked for none. */
+                        if (!vector_selected && !noasm_none)
+                            (void) lame_set_vector_routines(gfp, "sse2");
+                    }
+                    else {
+                        error_printf("WARNING: --noasm %s is deprecated and selects nothing;"
+                                     " see --vector\n", nextArg);
+                    }
 
                 T_ELIF("freeformat")
                     lame_set_free_format(gfp, 1);
@@ -1794,7 +1930,7 @@ parse_args_(lame_global_flags * gfp, int argc, char **argv,
                 T_ELIF("replaygain-fast")
                     lame_set_findReplayGain(gfp, 1);
 
-#ifdef DECODE_ON_THE_FLY
+#ifdef HAVE_MPG123
                 T_ELIF("replaygain-accurate")
                     lame_set_decode_on_the_fly(gfp, 1);
                 lame_set_findReplayGain(gfp, 1);
@@ -1805,7 +1941,7 @@ parse_args_(lame_global_flags * gfp, int argc, char **argv,
                 lame_set_findReplayGain(gfp, 0);
 
 
-#ifdef DECODE_ON_THE_FLY
+#ifdef HAVE_MPG123
                 T_ELIF("clipdetect")
                     global_ui_config.print_clipping_info = 1;
                     lame_set_decode_on_the_fly(gfp, 1);
@@ -2094,8 +2230,11 @@ parse_args_(lame_global_flags * gfp, int argc, char **argv,
                         nextArg = i + argUsed < argc ? argv[i + argUsed] : "";
                     }
 
-                    if (presets_set(gfp, fast, cbr, nextArg, ProgramName) < 0)
-                        return -1;
+                    {
+                        int const ret = presets_set(gfp, fast, cbr, nextArg, ProgramName);
+                        if (ret < 0)
+                            return ret;
+                    }
                 }
 
                 T_ELIF("disptime")
@@ -2107,7 +2246,7 @@ parse_args_(lame_global_flags * gfp, int argc, char **argv,
                     nogap_tags = 1;
 
                 T_ELIF("nogapout")
-                    int const arg_n = strnlen(nextArg, PATH_MAX);
+                    int const arg_n = (int)strnlen(nextArg, PATH_MAX);
                     if (arg_n >= PATH_MAX) {
                         error_printf("%s: %s argument length (%d) exceeds limit (%d)\n", ProgramName, token, arg_n, PATH_MAX);
                         return -1;
@@ -2117,7 +2256,7 @@ parse_args_(lame_global_flags * gfp, int argc, char **argv,
                     argUsed = 1;
 
                 T_ELIF("out-dir")
-                    int const arg_n = strnlen(nextArg, PATH_MAX);
+                    int const arg_n = (int)strnlen(nextArg, PATH_MAX);
                     if (arg_n >= PATH_MAX) {
                         error_printf("%s: %s argument length (%d) exceeds limit (%d)\n", ProgramName, token, arg_n, PATH_MAX);
                         return -1;
@@ -2509,7 +2648,7 @@ parse_args_(lame_global_flags * gfp, int argc, char **argv,
 
                     case '?':
                         long_help(gfp, stdout, ProgramName, 0 /* LESSMODE=NO */ );
-                        return -1;
+                        return -2;
 
                     default:
                         error_printf("%s: unrecognized option -%c\n", ProgramName, c);
@@ -2529,7 +2668,9 @@ parse_args_(lame_global_flags * gfp, int argc, char **argv,
         else {
             if (nogap) {
                 if ((num_nogap != NULL) && (count_nogap < *num_nogap)) {
-                    strncpy(nogap_inPath[count_nogap++], argv[i], PATH_MAX + 1);
+                    if (set_path_arg(argv[i], nogap_inPath[count_nogap]) < 0)
+                        return -1;
+                    ++count_nogap;
                     input_file = 1;
                 }
                 else {
@@ -2547,12 +2688,15 @@ parse_args_(lame_global_flags * gfp, int argc, char **argv,
                 /* normal options:   inputfile  [outputfile], and
                    either one can be a '-' for stdin/stdout */
                 if (inPath[0] == '\0') {
-                    strncpy(inPath, argv[i], PATH_MAX + 1);
+                    if (set_path_arg(argv[i], inPath) < 0)
+                        return -1;
                     input_file = 1;
                 }
                 else {
-                    if (outPath[0] == '\0')
-                        strncpy(outPath, argv[i], PATH_MAX + 1);
+                    if (outPath[0] == '\0') {
+                        if (set_path_arg(argv[i], outPath) < 0)
+                            return -1;
+                    }
                     else {
                         error_printf("%s: excess arg %s\n", ProgramName, argv[i]);
                         return -1;
@@ -2618,7 +2762,7 @@ parse_args_(lame_global_flags * gfp, int argc, char **argv,
     if (global_reader.input_format == sf_unknown)
         global_reader.input_format = filename_to_type(inPath);
 
-#if !(defined HAVE_MPGLIB || defined AMIGA_MPEGA || HAVE_MPG123)
+#if !defined(HAVE_MPG123)
     if (is_mpeg_file_format(global_reader.input_format)) {
         error_printf("Error: libmp3lame not compiled with mpg123 *decoding* support \n");
         return -1;
@@ -2636,7 +2780,9 @@ parse_args_(lame_global_flags * gfp, int argc, char **argv,
     if (lame_get_free_format(gfp)) {
         if (lame_get_brate(gfp) < 8 || lame_get_brate(gfp) > 640) {
             error_printf("For free format, specify a bitrate between 8 and 640 kbps\n");
-            error_printf("with the -b <bitrate> option\n");
+            error_printf("with the -b <bitrate> option. The lowest one that can\n");
+            error_printf("be used depends on the sample rate and the number of\n");
+            error_printf("channels; the encoder reports it if the choice is too low.\n");
             return -1;
         }
     }
@@ -2690,6 +2836,7 @@ static int
 merge_argv(int argc, char** argv, int str_argc, char** str_argv, int N)
 {
     int     i;
+    int     merged;
     if (argc > 0) {
         str_argv[0] = argv[0];
         if (str_argc < 1) str_argc = 1;
@@ -2700,7 +2847,14 @@ merge_argv(int argc, char** argv, int str_argc, char** str_argv, int N)
             str_argv[j] = argv[i];
         }
     }
-    return argc + str_argc - 1;
+    merged = argc + str_argc - 1;
+    /* The write loop skips any slot >= N, so never report more entries than
+       the array actually holds.  parse_args() sizes str_argv to fit, but clamp
+       here as well so this helper can never hand back a count that runs past
+       its own buffer. */
+    if (merged > N)
+        merged = N;
+    return merged;
 }
 
 #ifdef DEBUG
@@ -2717,15 +2871,29 @@ dump_argv(int argc, char** argv)
 
 int parse_args(lame_t gfp, int argc, char **argv, char *const inPath, char *const outPath, char **nogap_inPath, int *num_nogap)
 {
-    char   *str_argv[512], *str;
+    char  **str_argv, *str;
     int     str_argc, ret;
+    size_t  n;
+
     str = lame_getenv("LAMEOPT");
-    str_argc = string_to_argv(str, str_argv, dimension_of(str_argv));
-    str_argc = merge_argv(argc, argv, str_argc, str_argv, dimension_of(str_argv));
+    /* Size the merged argument vector to actually fit: at worst every byte of
+       LAMEOPT begins a new token, the real argv contributes argc entries, plus
+       one for argv[0].  argc and the environment are both bounded by the OS
+       ARG_MAX, so n stays well within range. */
+    n = (size_t) argc + (str != 0 ? strlen(str) : 0) + 1;
+    str_argv = malloc(n * sizeof(*str_argv));
+    if (str_argv == 0) {
+        error_printf("out of memory while parsing the command line\n");
+        free(str);
+        return -1;
+    }
+    str_argc = string_to_argv(str, str_argv, (int) n);
+    str_argc = merge_argv(argc, argv, str_argc, str_argv, (int) n);
 #ifdef DEBUG
     dump_argv(str_argc, str_argv);
 #endif
     ret = parse_args_(gfp, str_argc, str_argv, inPath, outPath, nogap_inPath, num_nogap);
+    free(str_argv);
     free(str);
     return ret;
 }

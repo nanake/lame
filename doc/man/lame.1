@@ -207,9 +207,14 @@ will always produce a mono .mp3 file from both mono and stereo input.
 .B \-\-freeformat
 Produces a free format bitstream.
 With this option,
-you can use
 .B \-b
-with any bitrate higher than 8 kbps.
+takes any bitrate from 8 to 640 kbps.
+The lowest one that can actually be used is higher than 8 kbps for some
+settings, because every frame has to have room for audio beside its own side
+information, and how much that leaves depends on the output sample rate and the
+number of channels.
+Where the requested bitrate is too low, encoding stops before it starts and the
+lowest usable one is reported.
 
 However,
 even if an mp3 decoder is required to support free bitrates at
@@ -422,17 +427,57 @@ Have a look at the PRESETS section below.
 .B \-\-preset help
 gives more infos about the the used options in these presets.
 .TP
+.B \-\-vector " name"
+Choose which set of vector routines the encode runs.
+.B auto
+(the default) uses the widest set the processor offers,
+.B none
+runs the plain C code, and a name such as
+.B sse2 ,
+.B avx2
+or
+.B avx512
+pins the encode to that set even where the processor has a wider one.
+Not every set covers every routine:
+.B avx512
+carries the constant-bitrate routines only, so a variable-bitrate encode
+asking for it runs the widest set that does cover them.
+.B \-\-vector none
+also leaves the processor unasked about its capabilities, nothing depending on
+the answer any more; on a machine where that query is itself what fails, this
+is what lets the encoder start.
+Which names a binary accepts depends on how it was built and on the processor
+it runs on;
+.B lame \-\-longhelp
+lists them, and
+.B lame \-\-verbose
+reports the set an encode ended up using.
+A name the binary cannot honour is an error rather than a fallback, so a
+measurement never silently reports on a different set than the one asked for.
+This is how a vector set and the plain C path are compared against each other,
+which is what a test setup or a speed measurement wants.
+The paths can differ in the last bits of the output; measured audio
+quality does not change, only speed.
+.TP
 .B \-\-noasm " type"
-Disable specific assembly optimizations (
-.B mmx
-/
-.B 3dnow
-/
+Deprecated, use
+.B \-\-vector
+instead. Still accepted, with a message:
 .B sse
-).
-Quality will not increase, only speed will be reduced.
-If you have problems running Lame on a Cyrix/Via processor,
-disabling mmx optimizations might solve your problem.
+means
+.B \-\-vector none
+and
+.B avx2
+means
+.B \-\-vector sse2 ,
+while
+.B mmx
+and
+.B 3dnow
+select nothing, there being no code of either kind to disable. If both options
+are given,
+.B \-\-vector
+wins.
 
 .PP
 Verbosity:
@@ -494,6 +539,8 @@ Same as -q 7, but enables noise shaping and increases subblock gain
 .B -q 7 to -q 9:
 .br
 Same as -f. Very fast, OK quality. Psychoacoustics are used for pre-echo and mid/side stereo, but no noise-shaping is done.
+
+For CBR and ABR, amplified noise shaping is disabled at the moment: it degraded the result instead of improving it. As it was the only difference between -q 3 and -q 4, and between -q 1 and -q 2, each of those pairs selects the same encoding for these two modes. --vbr-old is not affected.
 
 For the default VBR mode since LAME 3.98, the following table applies :
 

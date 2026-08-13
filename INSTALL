@@ -87,6 +87,22 @@ Other usefull configure options:
                               the compiler, may or may not produce
                               faster code
 
+  --enable-native             Tune the build for the exact machine it is
+                              compiled on.  May be faster, but the binary
+                              is not guaranteed to run on other CPUs of
+                              the same architecture.
+
+  --disable-hardening         Do not add the compiler/linker security
+                              hardening flags enabled by default (stack and
+                              control-flow protection, fortified library
+                              calls, read-only relocations, ...).
+
+  --disable-dynamic-frontends The front end tools (lame, ...) are linked
+                              dynamically against libmp3lame by default, so
+                              they can be built as position-independent
+                              executables.  Use this to link them statically
+                              into self-contained binaries instead.
+
   --prefix = PATH             default is /usr/local
                               (LAME currently installs:
                                 /usr/local/bin/lame
@@ -124,15 +140,11 @@ Some more advanced ways to influence the build procedure
   Or some combination of the above.
 
   Note:
-    If configure detects the presents of "nasm" some additional speed
-    improvements get compiled in (additional assembler code to detect
-    and use multimedia extensions of the used processor).
-
-
-=======================================================================
-Building the software on *NIX platforms without configure:
-=======================================================================
-% make -f Makefile.unix
+    On x86 processors LAME builds vectorized (SSE2) versions of a few hot
+    routines into every binary and uses them when the processor running it
+    supports them, so no assembler and no special configure option are
+    needed.  "lame --verbose" reports what the machine it runs on got, and
+    "--noasm sse" turns the vectorized code off.
 
 
 =======================================================================
@@ -143,8 +155,9 @@ There are MSVC project files, and a Makefile.MSVC included with the
 project.  For production use, be sure to compile a "Release" target, 
 with the "maximum speed" compile option.   
 
-It is possible to compile the GTK frame analyzer under windows, see
-README.WINGTK
+The GTK frame analyzer mp3x is built from the Visual Studio solution in
+vc_solution, which needs GTK 4; see vc_solution/README.vs.txt. Makefile.MSVC
+does not build it.
 
 Various build options can be set in configMS.h
 
@@ -166,8 +179,7 @@ Building the software on Windows with free compilers:
 LAME can be compiled with various Windows ports (all free) of GCC (DJGPP, 
 Mingw32).  See README.DJGPP.  
 
-For Mingw32, you should now be able to use the Unix Makefile that
-comes with LAME.  Try: "make -f Makefile.unix UNAME=MSDOS"
+For Mingw32, use the configure script as on any other platform.
 You may need to remove these lines from brhist.c:
 
 #ifdef _WIN32

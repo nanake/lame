@@ -171,12 +171,20 @@ struct lame_global_struct {
     lame_internal_flags *internal_flags;
 
 
+    /* The deprecated selection, kept for the families that still gate
+       something.  MMX and 3DNow! have no state here: nothing in this library
+       consults them, so storing a flag would only be able to mislead a caller
+       into thinking it had turned something off. */
     struct {
-        int     mmx;
-        int     amd3dnow;
-        int     sse;
-
+        unsigned int sse:1;
+        unsigned int avx2:1;
     } asm_optimizations;
+
+    /* Which vector routines this instance was asked to run: a vector_impl_t
+       value, or VECTOR_IMPL_AUTO for "whatever the machine offers", which is
+       the default and reproduces the behaviour that predates the request.
+       Validated where it is set, so lame_init_params() can take it as given. */
+    int     vector_routines_request;
 };
 
 int     is_lame_global_flags_valid(const lame_global_flags * gfp);

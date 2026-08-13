@@ -2,15 +2,23 @@
 
 include $(top_srcdir)/Makefile.am.global
 
-SUBDIRS = i386 vector
+SUBDIRS = vector
 
 lib_LTLIBRARIES = libmp3lame.la
 
-if HAVE_NASM
-cpu_ldadd = $(top_builddir)/libmp3lame/@CPUTYPE@/liblameasmroutines.la
-endif
 if WITH_VECTOR
+if WITH_XMM
 vector_ldadd = $(top_builddir)/libmp3lame/vector/liblamevectorroutines.la
+if WITH_AVX2
+vector_ldadd += $(top_builddir)/libmp3lame/vector/liblamevectoravx2.la
+endif
+if WITH_AVX512
+vector_ldadd += $(top_builddir)/libmp3lame/vector/liblamevectoravx512.la
+endif
+endif
+if WITH_NEON
+vector_ldadd = $(top_builddir)/libmp3lame/vector/liblamevectorneon.la
+endif
 endif
 
 if LIB_WITH_DECODER
@@ -19,7 +27,7 @@ else
 decoder_ldadd =
 endif
 
-libmp3lame_la_LIBADD =	$(cpu_ldadd) $(vector_ldadd) $(decoder_ldadd) \
+libmp3lame_la_LIBADD =	$(vector_ldadd) $(decoder_ldadd) \
 			@LIBMP3LAME_LDADD@ $(CONFIG_MATH_LIB)
 libmp3lame_la_LDFLAGS = -version-info @LIB_MAJOR_VERSION@:@LIB_MINOR_VERSION@ \
 			-export-symbols $(top_srcdir)/include/libmp3lame.sym \
@@ -68,7 +76,6 @@ noinst_HEADERS= \
 	l3side.h \
 	lame-analysis.h \
 	lame_global_flags.h \
-	lameerror.h \
 	machine.h \
 	newmdct.h \
 	psymodel.h \

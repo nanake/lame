@@ -19,6 +19,10 @@
 * Boston, MA  02111-1307, USA.
 */
 
+#ifdef HAVE_CONFIG_H
+# include <config.h>
+#endif
+
 #include <windows.h>
 #include <Windef.h>
 #include "BladeMP3EncDLL.h"
@@ -272,7 +276,7 @@ __declspec(dllexport) BE_ERR	beInitStream(PBE_CONFIG pbeConfig, PDWORD dwSamples
     else
     {
         // Copy the parameters
-        memcpy(&lameConfig,pbeConfig,pbeConfig->format.LHV1.dwStructSize);
+        memcpy(&lameConfig,pbeConfig,Min(pbeConfig->format.LHV1.dwStructSize,sizeof(lameConfig)));
     }
 
     // --------------- Set arguments to LAME encoder -------------------------
@@ -640,11 +644,7 @@ __declspec(dllexport) VOID		beVersion(PBE_VERSION pbeVersion)
     pbeVersion->byAlphaLevel   = (BYTE)lv.alpha;
     pbeVersion->byBetaLevel    = (BYTE)lv.beta;
 
-#ifdef MMX_choose_table
-    pbeVersion->byMMXEnabled=1;
-#else
-    pbeVersion->byMMXEnabled=0;
-#endif
+    pbeVersion->byMMXEnabled=0; /* no MMX-specific code remains */
 
     memset( pbeVersion->btReserved, 0, sizeof( pbeVersion->btReserved ) );
 

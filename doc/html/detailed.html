@@ -257,8 +257,12 @@
             <td>Disable writing wav header when using --decode</td>
         </tr>
         <tr>
+            <td><a href="#vector">--vector</a> name</td>
+            <td>Which set of vector routines the encode runs</td>
+        </tr>
+        <tr>
             <td><a href="#noasm">--noasm</a> type</td>
-            <td>Disable assembly optimizations for mmx/3dnow/sse</td>
+            <td>Deprecated, use --vector</td>
         </tr>
         <tr>
             <th colspan="2">Noise shaping &amp; psycho acoustic algorithms</th>
@@ -1223,14 +1227,62 @@
         to use this switch.
     </p>
     <p class="settingtitle">
-        <a name="noasm"><span class="hilight">--noasm value</span></a> Disables the specified assembler 
-        instructions
+        <a name="vector"><span class="hilight">--vector name</span></a> Which set of vector
+        routines the encode runs
     </p>
     <p>
-        When the encoder is compiled with assembler optimizations, this setting allows
-        to disable them at runtime (They are only enabled if the CPU supports them).
-        The purpose of this setting is to detect problems in those optimizations, and/or
-        check the speed difference.
+        The vectorized versions of a few hot routines are built into every x86
+        binary and used whenever the processor running it supports them, in
+        tiers: an SSE2 tier used on any processor of the last two decades, an
+        AVX2 tier used on top of it where available, and an AVX-512 tier above
+        that. This setting says which of
+        them an encode uses. <span class="hilight">auto</span>, the default, takes
+        the widest set the processor offers; <span class="hilight">none</span> runs
+        the plain C code; and naming a set - <span class="hilight">sse2</span>,
+        <span class="hilight">avx2</span>, <span class="hilight">avx512</span> -
+        pins the encode to it even on a
+        processor that has a wider one. That is how a set and the plain C path are
+        compared against each other, for a speed measurement or to rule the vector
+        code out when tracking down a problem.
+    </p>
+    <p>
+        The tiers do not all cover the same routines.
+        <span class="hilight">avx512</span> carries the constant-bitrate routines
+        only: the one variable-bitrate routine that could have used it was written
+        and measured, and it was slower there than the narrower code, so it is not
+        built. A variable-bitrate encode asking for
+        <span class="hilight">avx512</span> therefore runs the widest set that does
+        cover its routines, which is what
+        <span class="hilight">--verbose</span> will report.
+    </p>
+    <p>
+        <span class="hilight">--vector none</span> also leaves the processor
+        unasked about its capabilities, nothing depending on the answer any more.
+        On a machine where that query is itself what fails - a few old processors
+        get it wrong badly enough to take the program down with them - this is
+        what lets the encoder start at all.
+    </p>
+    <p>
+        Which names a binary accepts depends on how it was built and on the
+        processor it runs on. <span class="hilight">lame --longhelp</span> lists them,
+        and <span class="hilight">lame --verbose</span> reports the set an encode
+        ended up using. A name the binary cannot honour is an error, not a
+        fallback, so a measurement never quietly reports on a different set than
+        the one asked for. The paths can differ in the last bits of the output;
+        measured audio quality does not change.
+    </p>
+    <p class="settingtitle">
+        <a name="noasm"><span class="hilight">--noasm type</span></a> Deprecated, use
+        <span class="hilight">--vector</span>
+    </p>
+    <p>
+        Still accepted, with a message naming the replacement.
+        <span class="hilight">sse</span> means <span class="hilight">--vector
+        none</span> and <span class="hilight">avx2</span> means
+        <span class="hilight">--vector sse2</span>, while
+        <span class="hilight">mmx</span> and <span class="hilight">3dnow</span>
+        select nothing, there being no code of either kind to disable. Where both
+        options are given, <span class="hilight">--vector</span> wins.
     </p>
     <p class="settingtitle">
         <a name="nogap"><span class="hilight">--nogap file1 file2 [...]</span></a> Encodes multiple continuous
@@ -1471,6 +1523,13 @@
             <td style="border-bottom:0px;">Same as -f. Very fast, OK quality. Psychoacoustics are used for pre-echo and mid/side stereo, but no noise-shaping is done.</td>
         </tr>
     </table>
+    <p>
+        For CBR and ABR, amplified noise shaping is disabled at the moment: it
+        degraded the result instead of improving it. As it was the only
+        difference between -q 3 and -q 4, and between -q 1 and -q 2, each of
+        those pairs selects the same encoding for these two modes. --vbr-old is
+        not affected.
+    </p>
     <p>
         For the default VBR mode since LAME 3.98, the following table applies
     </p>

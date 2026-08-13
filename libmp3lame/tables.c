@@ -422,7 +422,7 @@ const struct huffcodetab ht[HTN] = {
     {8, 0, t11HB, t11l},
     {8, 0, t12HB, t12l},
     {16, 0, t13HB, t13l},
-    {0, 0, NULL, t16_5l}, /* Apparently not used */
+    {0, 0, NULL, t16_5l}, /* no codewords of its own; see resolve_huffman_table() */
     {16, 0, t15HB, t15l},
 
     {1, 1, t16HB, t16l},
@@ -447,6 +447,28 @@ const struct huffcodetab ht[HTN] = {
     {0, 0, t33HB, t33l},
 };
 
+
+/*! Maps a chosen table onto the one whose codewords encode it. */
+/*!
+  Table 14 has no codewords of its own - the standard defines none, and the
+  entry above carries a code-length table but a null codeword table. It is
+  nevertheless a real outcome of the table search, which compares candidates by
+  their code lengths, so it has to be turned into something writable before
+  either the side information or the code words are produced: 16 is what the
+  standard says a decoder shall read here.
+
+  Everything that acts on a chosen table asks this, so no part of the bitstream
+  writer depends on another part having converted the value first.
+
+  \param table_select a table number as chosen by the table search.
+  \return the number of the table to encode with, which is the same one for
+          every value that has codewords.
+*/
+unsigned int
+resolve_huffman_table(unsigned int table_select)
+{
+    return table_select == 14u ? 16u : table_select;
+}
 
 
 
@@ -535,6 +557,23 @@ const int samplerate_table[3][4] = {
     {11025, 12000, 8000, -1}, /* MPEG 2.5 */
 };
 
+/*! The bitrate an MP3 frame header's bitrate index stands for. */
+/*!
+  \ingroup api_statistics
+  Reads the standard's bitrate table, so a caller looking at frame headers -
+  its own or another encoder's - can turn the 4-bit field into kbps without
+  carrying a copy of the table.
+
+  This is the raw header index, not a slot of the statistics arrays: index 0 is
+  free format and the 14 slots of \c lame_bitrate_hist() are indices 1 to 14.
+  For the bitrates of the current encode, \c lame_bitrate_kbps() answers
+  directly.
+
+  \param mpeg_version  0 for MPEG-2, 1 for MPEG-1, 2 for MPEG-2.5.
+  \param table_index   a bitrate index, 0 to 15.
+  \return the bitrate in kbps; 0 for free format; -1 for an index the version
+          does not define, and for an argument outside those ranges.
+*/
 int
 lame_get_bitrate(int mpeg_version, int table_index)
 {
@@ -546,6 +585,18 @@ lame_get_bitrate(int mpeg_version, int table_index)
     return -1;
 }
 
+/*! The sample rate an MP3 frame header's sampling-frequency index stands for. */
+/*!
+  \ingroup api_statistics
+  The companion of \c lame_get_bitrate() for the other rate in the frame
+  header: it reads the standard's sampling-frequency table, so a caller
+  inspecting frame headers does not have to carry one.
+
+  \param mpeg_version  0 for MPEG-2, 1 for MPEG-1, 2 for MPEG-2.5.
+  \param table_index   a sampling-frequency index, 0 to 3.
+  \return the sample rate in Hz; -1 for index 3, which the standard reserves,
+          and for an argument outside those ranges.
+*/
 int
 lame_get_samplerate(int mpeg_version, int table_index)
 {

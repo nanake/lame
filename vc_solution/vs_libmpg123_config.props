@@ -1,0 +1,45 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup Label="UserMacros">
+    <!-- mpg123 configuration; set to true and adjust the path. The paths
+         below supply their own separator, so that Mpg123Path can be quoted
+         against spaces: a path quoted with a trailing backslash would
+         escape the closing quote. -->
+    <HaveMpg123>false</HaveMpg123>
+    <Mpg123Path>.\mpg123\$(Platform)</Mpg123Path>
+  </PropertyGroup>
+  <ItemGroup>
+    <BuildMacro Include="HaveMpg123">
+      <Value>$(HaveMpg123)</Value>
+    </BuildMacro>
+    <BuildMacro Include="Mpg123Path">
+      <Value>$(Mpg123Path)</Value>
+    </BuildMacro>
+  </ItemGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <PreprocessorDefinitions Condition="'$(HaveMpg123)' == 'true'">HAVE_MPG123;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories Condition="'$(HaveMpg123)' == 'true'">$(Mpg123Path);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+    <Link>
+      <AdditionalLibraryDirectories Condition="'$(HaveMpg123)' == 'true'">$(IntDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies Condition="'$(HaveMpg123)' == 'true'">libmpg123-0.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+    <PreLinkEvent>
+      <!-- The distribution ships a .def and no import library, so one is built
+           here. Into this project's own $(IntDir): this sheet is shared by every
+           project that uses the decoder, and they are built in parallel, so a
+           single shared output would be written by all of them at once. -->
+      <Command Condition="'$(HaveMpg123)' == 'true' And '$(ConfigurationType)' != 'StaticLibrary' And '$(Platform)' == 'Win32'">lib.exe /nologo /def:"$(Mpg123Path)\libmpg123-0.def" /MACHINE:X86 /out:"$(IntDir)libmpg123-0.lib"</Command>
+      <Command Condition="'$(HaveMpg123)' == 'true' And '$(ConfigurationType)' != 'StaticLibrary' And '$(Platform)' == 'x64'">lib.exe /nologo /def:"$(Mpg123Path)\libmpg123-0.def" /MACHINE:X64 /out:"$(IntDir)libmpg123-0.lib"</Command>
+    </PreLinkEvent>
+  </ItemDefinitionGroup>
+  <!-- The runtime library goes beside the binaries. Every project sharing this
+       output directory would otherwise copy it there, so the copy skips a file
+       that is already current rather than racing to rewrite it. -->
+  <Target Name="CopyMpg123Runtime" AfterTargets="Build"
+          Condition="'$(HaveMpg123)' == 'true' And '$(ConfigurationType)' != 'StaticLibrary'">
+    <Copy SourceFiles="$(Mpg123Path)\libmpg123-0.dll" DestinationFolder="$(OutDir)"
+          SkipUnchangedFiles="true" Retries="3" RetryDelayMilliseconds="200" />
+  </Target>
+</Project>

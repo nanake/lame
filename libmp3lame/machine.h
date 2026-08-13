@@ -49,6 +49,15 @@ char   *strchr(), *strrchr();
 #endif
 #include <limits.h>
 
+/* Mark a function parameter that is intentionally unused (e.g. in a stub
+   implementation or a compile-time-selected code path). Expands to nothing
+   where the compiler has no such attribute, including MSVC. */
+#if defined(__GNUC__) || defined(__clang__)
+# define LAME_UNUSED __attribute__((unused))
+#else
+# define LAME_UNUSED
+#endif
+
 #include <ctype.h>
 
 #ifdef HAVE_ERRNO_H
@@ -110,6 +119,10 @@ char   *strchr(), *strrchr();
 #if    defined(_MSC_VER)
 # pragma warning( disable : 4244 )
 /*# pragma warning( disable : 4305 ) */
+/* 4100: unreferenced formal parameter. Intentional in stub/compatibility
+   entry points; the GCC/Clang -Wunused-parameter build is where a genuinely
+   unused parameter is caught (see LAME_UNUSED). */
+# pragma warning( disable : 4100 )
 #endif
 
 /*
@@ -157,7 +170,14 @@ typedef FLOAT sample_t;
 
 #define dimension_of(array) (sizeof(array)/sizeof(array[0]))
 #define beyond(array) (array+dimension_of(array))
-#define compiletime_assert(expression) enum{static_assert_##FILE##_##LINE = 1/((expression)?1:0)}
+/* ##-pasting does not expand its operands, so pasting __LINE__ directly would
+ * yield the literal token "__LINE__" instead of the current line number,
+ * making every use in a translation unit collide on the same enum tag. The
+ * extra indirection through compiletime_assert_paste() forces __LINE__ to be
+ * expanded to its numeric value before compiletime_assert_paste2() pastes it. */
+#define compiletime_assert_paste2(a,b) a##b
+#define compiletime_assert_paste(a,b) compiletime_assert_paste2(a,b)
+#define compiletime_assert(expression) enum{compiletime_assert_paste(static_assert_line_,__LINE__) = 1/((expression)?1:0)}
 #define lame_calloc(TYPE, COUNT) ((TYPE*)calloc(COUNT, sizeof(TYPE)))
 #define multiple_of(CHUNK, COUNT) (\
   ( (COUNT) < 1 || (CHUNK) < 1 || (COUNT) % (CHUNK) == 0 ) \
