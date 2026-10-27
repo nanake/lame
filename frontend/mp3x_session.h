@@ -3,9 +3,9 @@
  *  \brief mp3x analyzer session - internal interface.
  *  \internal
  *
- *  The toolkit-independent per-file session lifecycle for the GTK4 mp3x frame
- *  analyzer. One Mp3xSession exists for each open input file; the application
- *  as a whole can be empty (no session) or hold a single session at a time.
+ *  Opening and closing one input file in the GTK4 mp3x frame analyzer, without
+ *  any GUI toolkit code. There is one Mp3xSession for each open input file. The
+ *  application has either no session or one session.
  *
  *  \code
  *  Mp3xPrevalidateResult pre;
@@ -19,14 +19,14 @@
  *  mp3x_session_free(s);
  *  \endcode
  *
- *  The session owns a fresh \c lame_t for the file it represents. Open and
- *  Close define its state transitions; the GTK frontend routes File > Open,
- *  Open Recent, File > Close and File > Quit through those functions.
+ *  The session owns a new \c lame_t for its file. Open and close change its
+ *  state. The GTK frontend calls these functions for File > Open, Open Recent,
+ *  File > Close and File > Quit.
  *
- *  Nothing here includes GTK/GDK. The session engine is toolkit-independent so
- *  the GTK layer in mp3x_ui.c can drive it without coupling.
+ *  This file does not include GTK or GDK, so the GTK code in mp3x_ui.c can use
+ *  the session without depending on it.
  *
- *  \see \ref mp3x_internals for the ownership rules that make a stale async
+ *  \see \ref mp3x_internals for the ownership rules that make a late async
  *  callback safe.
  */
 
@@ -47,29 +47,6 @@ extern "C" {
 #endif
 
 
-/**
- *  A snapshot of the five process-wide frontend configuration structs.
- *
- *  parse.c exposes \c global_reader, \c global_writer, \c global_ui_config,
- *  \c global_decoder and \c global_raw_pcm, plus get_audio.c's
- *  \c get_audio_global_data. They are mutated by \c parse_args and by
- *  \c init_infile. mp3x_session treats them as the per-file session state they
- *  actually are: every session open restores a captured startup baseline before
- *  any new configuration is applied, so options from a prior file - or
- *  raw-input CLI flags given for the initial file - cannot leak into a later
- *  GUI-opened file.
- *
- *  Every member of these five structs is plain value data with no pointers, and
- *  \c mp3data_struct inside \c DecoderConfig holds only integers, so struct-copy
- *  is a safe capture and restore mechanism.
- */
-typedef struct {
-    ReaderConfig    reader;
-    WriterConfig    writer;
-    UiConfig        ui_config;
-    DecoderConfig   decoder;
-    RawPCMConfig    raw_pcm;
-} FrontendGlobalsBaseline;
 
 
 /* --------------------------------------------------------------------------
@@ -82,8 +59,7 @@ typedef struct {
  * The session owns: the lame_t (encoder/analyzer handle), heap copies of
  * the path and display name, and all per-file transport state (running,
  * input/drain completion, frames_done, idle-source ID). It does NOT own GTK
- * widgets, the open input FILE (that belongs to get_audio.c's global), or any decoder
- * handles (those belong to mp3x_core and get_audio.c).
+ * widgets or any decoder handles (those belong to mp3x_core and the reader).
  *
  * Display view preferences (channel, ms, difference, sfblines, kbflag,
  * subblock) are driver-lifetime - they survive file swaps when valid - and
@@ -97,6 +73,7 @@ typedef struct Mp3xSession {
 
     /* Input */
     lame_t           gf;             /* owned; created in _open, closed in _close */
+    audio_reader    *reader;         /* owned; the open input, NULL when not open */
     gchar           *in_path;        /* heap-owned UTF-8 filesystem path; NULL
                                         when session is not open */
     gchar           *display_name;   /* heap-owned display name (basename or
@@ -219,18 +196,15 @@ void           mp3x_session_free(Mp3xSession *s);
  * configuration is applied.
  * -------------------------------------------------------------------------- */
 
-/* Apply documented defaults to all five frontend globals, mirroring what
-   parse_args would set unconditionally at lines 1659-1666 plus the raw-PCM
-   defaults init_infile assumes when -r is NOT given. Does NOT call
-   parse_args; safe to invoke at any time. */
+/* Set frontend_config to frontend_config_defaults, the settings parse_args
+   starts from. Does NOT call parse_args; safe to invoke at any time. */
 void           mp3x_apply_documented_defaults(void);
 
-/* Snapshot the current state of all five frontend globals into the
-   baseline. Struct-copy; all fields verified to be plain value data. */
-void           mp3x_globals_capture(FrontendGlobalsBaseline *b);
+/* Copy frontend_config into the baseline. */
+void           mp3x_globals_capture(FrontendConfig *b);
 
-/* Restore all five frontend globals from the baseline. Struct-copy. */
-void           mp3x_globals_restore(const FrontendGlobalsBaseline *b);
+/* Copy the baseline back into frontend_config. */
+void           mp3x_globals_restore(const FrontendConfig *b);
 
 
 /* --------------------------------------------------------------------------
@@ -246,17 +220,6 @@ gboolean       mp3x_prevalidate(GFile *gfile,
 
 /* Free every owned field and reset the result to all-NULL. Safe repeatedly. */
 void           mp3x_prevalidate_result_clear(Mp3xPrevalidateResult *result);
-
-
-/* --------------------------------------------------------------------------
- * File-extension classification
- *
- * Returns sf_wave, sf_aiff, sf_mp123 for known extensions, sf_unknown
-   otherwise. Case-insensitive; broader than parse.c's filename_to_type
-   (which only matches the last 4 characters and so would miss .wave/.aiff/
-   .aifc). The format decision still belongs to init_infile's
-   header parsers - this is just the hint that picks which opener runs. */
-sound_file_format mp3x_classify_extension(const char *path);
 
 
 /* --------------------------------------------------------------------------

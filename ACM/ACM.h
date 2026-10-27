@@ -1,6 +1,6 @@
 /**
  *
- * Lame ACM wrapper, encode/decode MP3 based RIFF/AVI files in MS Windows
+ * Lame ACM wrapper, encode MP3 based RIFF/AVI files in MS Windows
  *
  *  Copyright (c) 2002 Steve Lhomme <steve.lhomme at free.fr>
  *
@@ -25,8 +25,8 @@
 	\version \$Id$
 */
 
-#if !defined(_ACM_H__INCLUDED_)
-#define _ACM_H__INCLUDED_
+#if !defined(LAME_ACM_ACM_H)
+#define LAME_ACM_ACM_H
 
 #if _MSC_VER >= 1000
 #pragma once
@@ -41,11 +41,10 @@
 #include <msacmdrv.h>
 
 
+#include <lame.h>
+
 #include "ADbg/ADbg.h"
-
-class AEncodeProperties;
-
-typedef enum vbr_mode_e vbr_mode;
+#include "AEncodeProperties.h"
 
 class bitrate_item {
 	public:
@@ -53,7 +52,9 @@ class bitrate_item {
 		unsigned int bitrate;
 		unsigned int channels;
 		vbr_mode     mode;
-	
+		/** \brief The VBR quality level of a VBR format, 0 to 9; 0 for the others. */
+		unsigned int quality;
+
 		bool operator<(const bitrate_item & bitrate) const;
 };
 
@@ -67,26 +68,49 @@ public:
 
 	static const char * GetVersionString(void) {return VersionString;}
 
+	/** \brief The families of formats, for BuildFormatList(); any of them
+	    together. */
+	enum { FAMILY_CBR = 1, FAMILY_ABR = 2, FAMILY_VBR = 4, FAMILY_ALL = 7 };
+	static void BuildFormatList(const FormatListSettings & the_Settings, unsigned int the_Families,
+	                            std::vector<bitrate_item> & the_List);
+	/** \brief The size of the buffer that GetVersionString() returns, terminator included. */
+	static const unsigned int VERSION_STRING_CHARS = 120;
+
 protected:
-//	inline DWORD Configure( HWND hParentWindow, LPDRVCONFIGINFO pConfig );
 	inline DWORD About( HWND hParentWindow );
 
-	inline DWORD OnDriverDetails(const HDRVR hdrvr, LPACMDRIVERDETAILS a_DriverDetail);
+	inline DWORD OnDriverDetails(LPACMDRIVERDETAILS a_DriverDetail);
 	inline DWORD OnFormatTagDetails(LPACMFORMATTAGDETAILS a_FormatTagDetails, const LPARAM a_Query);
 	inline DWORD OnFormatDetails(LPACMFORMATDETAILS a_FormatDetails, const LPARAM a_Query);
 	inline DWORD OnFormatSuggest(LPACMDRVFORMATSUGGEST a_FormatSuggest);
+	DWORD SuggestEncode(LPACMDRVFORMATSUGGEST a_FormatSuggest, const DWORD fdwSuggest) const;
+	void LogFormat(const char * a_What, const WAVEFORMATEX * a_Format) const;
 	inline DWORD OnStreamOpen(LPACMDRVSTREAMINSTANCE a_StreamInstance);
 	inline DWORD OnStreamClose(LPACMDRVSTREAMINSTANCE a_StreamInstance);
 	inline DWORD OnStreamSize(LPACMDRVSTREAMINSTANCE a_StreamInstance, LPACMDRVSTREAMSIZE the_StreamSize);
-	inline DWORD OnStreamPrepareHeader(LPACMDRVSTREAMINSTANCE a_StreamInstance, LPACMSTREAMHEADER a_StreamHeader);
-	inline DWORD OnStreamUnPrepareHeader(LPACMDRVSTREAMINSTANCE a_StreamInstance, LPACMSTREAMHEADER a_StreamHeader);
+	inline DWORD OnStreamPrepareHeader(LPACMSTREAMHEADER a_StreamHeader);
+	inline DWORD OnStreamUnPrepareHeader(LPACMSTREAMHEADER a_StreamHeader);
 	inline DWORD OnStreamConvert(LPACMDRVSTREAMINSTANCE a_StreamInstance, LPACMDRVSTREAMHEADER a_StreamHeader);
 
-	void GetMP3FormatForIndex(const DWORD the_Index, WAVEFORMATEX & the_Format, unsigned short the_String[ACMFORMATDETAILS_FORMAT_CHARS]) const;
-	void GetPCMFormatForIndex(const DWORD the_Index, WAVEFORMATEX & the_Format, unsigned short the_String[ACMFORMATDETAILS_FORMAT_CHARS]) const;
+	void GetMP3FormatForIndex(const DWORD the_Index, WAVEFORMATEX & the_Format, WCHAR the_String[ACMFORMATDETAILS_FORMAT_CHARS]) const;
+	void GetPCMFormatForIndex(const DWORD the_Index, WAVEFORMATEX & the_Format, WCHAR the_String[ACMFORMATDETAILS_FORMAT_CHARS]) const;
+	void FillMP3Format(WAVEFORMATEX & the_Format, const unsigned int the_Frequency, const unsigned int the_Bitrate, const unsigned int the_Channels, const vbr_mode the_Mode, const unsigned int the_Quality = 0) const;
+	void DescribeMP3Format(const WAVEFORMATEX & the_Format, WCHAR the_String[ACMFORMATDETAILS_FORMAT_CHARS]) const;
+	static bool IsABRFormatFlags(const DWORD the_Flags);
+	static bool IsVBRFormatFlags(const DWORD the_Flags);
+	static unsigned int VBRQualityOfFormatFlags(const DWORD the_Flags);
+	static void AddVbrFormats(const FormatListSettings & the_Settings, const unsigned int * freqs, unsigned int nfreqs,
+	                          unsigned int channels, std::vector<bitrate_item> & the_List);
 	DWORD GetNumberEncodingFormats() const;
-	bool IsSmartOutput(const int frequency, const int bitrate, const int channels) const;
+	static bool IsSmartOutput(const FormatListSettings & the_Settings, const int frequency, const int bitrate,
+	                          const int channels);
 	void BuildBitrateTable();
+	static void AddFormats(const FormatListSettings & the_Settings, const unsigned int * freqs, unsigned int nfreqs,
+	                       const unsigned int * bitrates, unsigned int nbitrates, unsigned int channels,
+	                       vbr_mode mode, std::vector<bitrate_item> & the_List);
+	static std::vector<unsigned int> AbrBitrates(const FormatListSettings & the_Settings, unsigned int lowest);
+	static std::vector<unsigned int> CbrBitrates(const FormatListSettings & the_Settings, const unsigned int * bitrates,
+	                                             unsigned int nbitrates);
 
 	HMODULE my_hModule;
 	HICON   my_hIcon;
@@ -94,8 +118,8 @@ protected:
 	AEncodeProperties my_EncodingProperties;
 	std::vector<bitrate_item> bitrate_table;
 
-	static char VersionString[120];
+	static char VersionString[VERSION_STRING_CHARS];
 };
 
-#endif // !defined(_ACM_H__INCLUDED_)
+#endif // !defined(LAME_ACM_ACM_H)
 

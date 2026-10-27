@@ -46,12 +46,7 @@
 #include "timestatus.h"
 #include "brhist.h"
 #include "console.h"
-
-/* num_samples uses 2^32-1 as its "unknown" sentinel (lame.h documents it as
-   the default); libmp3lame's util.h defines the same name, so guard it */
-#ifndef MAX_U_32_NUM
-#define MAX_U_32_NUM 0xFFFFFFFF
-#endif
+#include "machine.h"
 
 #ifdef WITH_DMALLOC
 #include <dmalloc.h>
@@ -70,7 +65,30 @@ static struct EncoderProgress {
     double  last_time;
     int     last_frame_num;
     int     time_status_init;
+    int     frame_width;     /* digits reserved for the frame counter */
 } global_encoder_progress;
+
+
+/**
+ * @internal
+ * @brief How many digits the frame counter needs for this file.
+ *
+ * The heading uses the same width, so each column stays under its heading.
+ *
+ * @param totalframes  the number of frames that the file will have.
+ * @return the number of digits to reserve, at least 6.
+ */
+static int
+ts_frame_width(int totalframes)
+{
+    int     width = 1;
+
+    while (totalframes >= 10) {
+        totalframes /= 10;
+        ++width;
+    }
+    return width < 6 ? 6 : width;
+}
 
 
 /*
@@ -158,11 +176,18 @@ timestatus(const lame_global_flags * const gfp)
     proc_time->last_time = tmx;
 
     if (global_encoder_progress.time_status_init == 0) {
+        /* Fixed once, and used for the heading and for every row after it: a
+           width that changed part way through would misalign against a heading
+           already printed. */
+        global_encoder_progress.frame_width = ts_frame_width(totalframes);
         console_printf("\r"
-                       "    Frame          |  CPU time/estim | REAL time/estim | play/CPU |    ETA \n"
-                       "     0/       ( 0%%)|    0:00/     :  |    0:00/     :  |         "
+                       "    Frame%*s|  CPU time/estim | REAL time/estim | play/CPU |    ETA \n"
+                       "%*i/%-*s ( 0%%)|    0:00/     :  |    0:00/     :  |         "
                        SPEED_CHAR "|     :  \r"
-                       /* , Console_IO.str_clreoln, Console_IO.str_clreoln */ );
+                       /* , Console_IO.str_clreoln, Console_IO.str_clreoln */ ,
+                       2 * global_encoder_progress.frame_width - 2, "",
+                       global_encoder_progress.frame_width, 0,
+                       global_encoder_progress.frame_width, "");
         global_encoder_progress.time_status_init = 1;
         return;
     }
@@ -177,7 +202,9 @@ timestatus(const lame_global_flags * const gfp)
         percent = 100;
     }
 
-    console_printf("\r%6i/%-6i", frameNum, totalframes);
+    console_printf("\r%*i/%-*i",
+                   global_encoder_progress.frame_width, frameNum,
+                   global_encoder_progress.frame_width, totalframes);
     console_printf(percent < 100 ? " (%2d%%)|" : "(%3.3d%%)|", percent);
     ts_time_decompose(proc_time->elapsed_time, '/');
     ts_time_decompose(proc_time->estimated_time, '|');
@@ -199,14 +226,17 @@ timestatus_finish(void)
 static void
 brhist_init_package(lame_global_flags const* gf)
 {
-    if (global_ui_config.brhist) {
-        if (brhist_init(gf, lame_get_VBR_min_bitrate_kbps(gf), lame_get_VBR_max_bitrate_kbps(gf))) {
-            /* fail to initialize */
-            global_ui_config.brhist = 0;
-        }
+    int     min_kbps = lame_get_VBR_min_bitrate_kbps(gf);
+    int     max_kbps = lame_get_VBR_max_bitrate_kbps(gf);
+
+    if (lame_get_VBR(gf) == vbr_off) {
+        /* CBR, free format included: every frame has the one bitrate */
+        min_kbps = lame_get_brate(gf);
+        max_kbps = min_kbps;
     }
-    else {
-        brhist_init(gf, 128, 128); /* Dirty hack */
+    if (brhist_init(gf, min_kbps, max_kbps)) {
+        /* fail to initialize */
+        frontend_config.ui_config.brhist = 0;
     }
 }
 
@@ -221,7 +251,7 @@ encoder_progress_begin( lame_global_flags const* gf
     global_encoder_progress.time_status_init = 0;
     global_encoder_progress.last_time = 0;
     global_encoder_progress.last_frame_num = 0;
-    if (global_ui_config.silent < 9) {
+    if (frontend_config.ui_config.silent < 9) {
         size_t pw = console_getwidth()-14;
         char* i_file = 0;
         char* o_file = 0;
@@ -248,7 +278,7 @@ encoder_progress_begin( lame_global_flags const* gf
             };
             switch (lame_get_VBR(gf)) {
             case vbr_rh:
-                console_printf("%s MPEG-%u%s Layer III VBR(q=%g) qval=%i\n",
+                console_printf("%s MPEG-%d%s Layer III VBR(q=%g) qval=%i\n",
                                mode_names[lame_get_force_ms(gf)][lame_get_mode(gf)],
                                2 - lame_get_version(gf),
                                lame_get_out_samplerate(gf) < 16000 ? ".5" : "",
@@ -257,14 +287,14 @@ encoder_progress_begin( lame_global_flags const* gf
                 break;
             case vbr_mt:
             case vbr_mtrh:
-                console_printf("%s MPEG-%u%s Layer III VBR(q=%g)\n",
+                console_printf("%s MPEG-%d%s Layer III VBR(q=%g)\n",
                                mode_names[lame_get_force_ms(gf)][lame_get_mode(gf)],
                                2 - lame_get_version(gf),
                                lame_get_out_samplerate(gf) < 16000 ? ".5" : "",
                                lame_get_VBR_quality(gf));
                 break;
             case vbr_abr:
-                console_printf("%s MPEG-%u%s Layer III (%gx) average %d kbps qval=%i\n",
+                console_printf("%s MPEG-%d%s Layer III (%gx) average %d kbps qval=%i\n",
                                mode_names[lame_get_force_ms(gf)][lame_get_mode(gf)],
                                2 - lame_get_version(gf),
                                lame_get_out_samplerate(gf) < 16000 ? ".5" : "",
@@ -273,7 +303,7 @@ encoder_progress_begin( lame_global_flags const* gf
                                lame_get_quality(gf));
                 break;
             default:
-                console_printf("%s MPEG-%u%s Layer III (%gx) %3d kbps qval=%i\n",
+                console_printf("%s MPEG-%d%s Layer III (%gx) %3d kbps qval=%i\n",
                                mode_names[lame_get_force_ms(gf)][lame_get_mode(gf)],
                                2 - lame_get_version(gf),
                                lame_get_out_samplerate(gf) < 16000 ? ".5" : "",
@@ -284,7 +314,7 @@ encoder_progress_begin( lame_global_flags const* gf
             }
         }
 
-        if (global_ui_config.silent <= -10) {
+        if (frontend_config.ui_config.silent <= -10) {
             lame_print_internals(gf);
         }
     }
@@ -293,10 +323,11 @@ encoder_progress_begin( lame_global_flags const* gf
 void
 encoder_progress( lame_global_flags const* gf )
 {
-    if (global_ui_config.silent <= 0) {
+    if (frontend_config.ui_config.silent <= 0) {
         int const frames = lame_get_frameNum(gf);
         int const frames_diff = frames - global_encoder_progress.last_frame_num;
-        if (global_ui_config.update_interval <= 0) {     /*  most likely --disptime x not used */
+        /*  most likely --disptime x not used */
+        if (frontend_config.ui_config.update_interval <= 0) {
             if (frames_diff < 100 && frames_diff != 0) {  /*  true, most of the time */
                 return;
             }
@@ -306,17 +337,17 @@ encoder_progress( lame_global_flags const* gf )
             if (frames != 0 && frames != 9) {
                 double const act = GetRealTime();
                 double const dif = act - global_encoder_progress.last_time;
-                if (dif >= 0 && dif < global_ui_config.update_interval) {
+                if (dif >= 0 && dif < frontend_config.ui_config.update_interval) {
                     return;
                 }
             }
             global_encoder_progress.last_time = GetRealTime(); /* from now! disp_time seconds */
         }
-        if (global_ui_config.brhist) {
+        if (frontend_config.ui_config.brhist) {
             brhist_jump_back();
         }
         timestatus(gf);
-        if (global_ui_config.brhist) {
+        if (frontend_config.ui_config.brhist) {
             brhist_disp(gf);
         }
         console_flush();
@@ -326,12 +357,12 @@ encoder_progress( lame_global_flags const* gf )
 void
 encoder_progress_end( lame_global_flags const* gf )
 {
-    if (global_ui_config.silent <= 0) {
-        if (global_ui_config.brhist) {
+    if (frontend_config.ui_config.silent <= 0) {
+        if (frontend_config.ui_config.brhist) {
             brhist_jump_back();
         }
         timestatus(gf);
-        if (global_ui_config.brhist) {
+        if (frontend_config.ui_config.brhist) {
             brhist_disp(gf);
         }
         timestatus_finish();
@@ -381,7 +412,7 @@ decoder_progress_init(unsigned long n, int framesize)
     dp->samples = 0;
     /* also recognize the documented unknown sentinel; the (0ul-1ul) test
        alone matches it only where long is 32-bit */
-    if (n != MAX_U_32_NUM && n != (0ul-1ul)) {
+    if (n != NUM_SAMPLES_UNKNOWN && n != (0ul-1ul)) {
         unsigned long frames_total;
         if (framesize == 576 || framesize == 1152) {
             frames_total = calcNumBlocks(n, framesize);
@@ -445,8 +476,7 @@ decoder_progress(DecoderProgress dp, const mp3data_struct * mp3data, int iread)
 }
 
 void
-decoder_progress_finish(DecoderProgress dp)
+decoder_progress_finish(LAME_UNUSED DecoderProgress dp)
 {
-    (void) dp;
     console_printf("\n");
 }

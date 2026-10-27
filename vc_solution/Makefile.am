@@ -4,14 +4,19 @@ include $(top_srcdir)/Makefile.am.global
 
 EXTRA_DIST = \
 	README.vs.txt \
+	vs_clients_config.props \
+	vs_dshow_config.props \
 	vs_gtk_config.props \
 	vs_lame_acm_adbg.vcxproj \
 	vs_lame_acm_adbg.vcxproj.filters \
+	vs_lame_acm_test.vcxproj \
 	vs_lame_acm_tinyxml.vcxproj \
 	vs_lame_acm.vcxproj \
 	vs_lame_acm.vcxproj.filters \
+	vs_lame_blade_test.vcxproj \
 	vs_lame_clients.slnx \
 	vs_lame_config.props \
+	vs_lame_dshow_test.vcxproj \
 	vs_lame_dshow.vcxproj \
 	vs_lame_dshow.vcxproj.filters \
 	vs_lame_enc_dll.vcxproj \
@@ -25,8 +30,9 @@ EXTRA_DIST = \
 	vs_lame_test.vcxproj \
 	vs_lame.slnx \
 	vs_libmp3lame_dll.vcxproj \
+	vs_libmp3lame_files.props \
+	vs_libmp3lame_nodec.vcxproj \
 	vs_libmp3lame.vcxproj \
 	vs_libmp3lame.vcxproj.filters \
 	vs_libmpg123_config.props \
-	vs_libsndfile_config.props \
-	vs_win71sdk_config.props
+	vs_libsndfile_config.props

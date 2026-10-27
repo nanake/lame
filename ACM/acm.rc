@@ -1,13 +1,14 @@
 //Microsoft Developer Studio generated resource script.
 //
 #include "resource.h"
+#include "../libmp3lame/version.h"
 
 #define APSTUDIO_READONLY_SYMBOLS
 /////////////////////////////////////////////////////////////////////////////
 //
 // Generated from the TEXTINCLUDE 2 resource.
 //
-#include "afxres.h"
+#include "winres.h"
 
 /////////////////////////////////////////////////////////////////////////////
 #undef APSTUDIO_READONLY_SYMBOLS
@@ -34,7 +35,7 @@ END
 
 2 TEXTINCLUDE DISCARDABLE 
 BEGIN
-    "#include ""afxres.h""\r\n"
+    "#include ""winres.h""\r\n"
     "\0"
 END
 
@@ -54,8 +55,8 @@ END
 //
 
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION 0,9,1,0
- PRODUCTVERSION 0,9,1,0
+ FILEVERSION LAME_MAJOR_VERSION,LAME_MINOR_VERSION,LAME_TYPE_VERSION,LAME_PATCH_VERSION
+ PRODUCTVERSION LAME_MAJOR_VERSION,LAME_MINOR_VERSION,LAME_TYPE_VERSION,LAME_PATCH_VERSION
  FILEFLAGSMASK 0x3fL
 #ifdef _DEBUG
  FILEFLAGS 0x1L
@@ -73,14 +74,14 @@ BEGIN
             VALUE "Comments", "This is an ACM driver for Win32 using Lame to encode\0"
             VALUE "CompanyName", "https://lame.sourceforge.io/\0"
             VALUE "FileDescription", "Lame MP3 codec engine\0"
-            VALUE "FileVersion", "0.9.2\0"
+            VALUE "FileVersion", LAME_VERSION_STRING "\0"
             VALUE "InternalName", "lameACM\0"
             VALUE "LegalCopyright", "Copyright © 2002 Steve Lhomme, Copyright © 2002-2007 The LAME Project\0"
             VALUE "LegalTrademarks", "LGPL (see gnu.org)\0"
             VALUE "OriginalFilename", "lameACM.acm\0"
             VALUE "PrivateBuild", "\0"
             VALUE "ProductName", "Lame MP3 codec\0"
-            VALUE "ProductVersion", "0.9.2\0"
+            VALUE "ProductVersion", LAME_VERSION_STRING "\0"
             VALUE "SpecialBuild", "\0"
         END
     END
@@ -107,74 +108,103 @@ IDI_ICON                ICON    DISCARDABLE     "lame.ico"
 // Dialog
 //
 
-IDD_CONFIG DIALOGEX 0, 0, 231, 204
-STYLE DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
-CAPTION "Lame MP3 codec : About"
-FONT 8, "MS Sans Serif", 0, 0, 0x1
+IDD_CONFIG DIALOGEX 0, 0, 320, 268
+STYLE DS_SHELLFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "LAME MP3 Codec Settings"
+FONT 8, "MS Shell Dlg", 400, 0, 0x1
 BEGIN
-    DEFPUSHBUTTON   "OK",IDOK,65,183,50,14
-    PUSHBUTTON      "Cancel",IDCANCEL,125,183,50,14
-    GROUPBOX        "Encoding",IDC_STATIC,7,7,142,166
-    GROUPBOX        "Decoding",IDC_STATIC_DECODING,154,7,70,113,WS_DISABLED
-    GROUPBOX        "Bits",IDC_STATIC,16,121,124,42
-    CONTROL         "Copyright",IDC_CHECK_COPYRIGHT,"Button",BS_AUTOCHECKBOX | 
-                    BS_FLAT | WS_GROUP | WS_TABSTOP,23,132,45,10
-    CONTROL         "Checksum",IDC_CHECK_CHECKSUM,"Button",BS_AUTOCHECKBOX | 
-                    BS_FLAT | WS_GROUP | WS_TABSTOP,84,132,49,10
-    CONTROL         "Original",IDC_CHECK_ORIGINAL,"Button",BS_AUTOCHECKBOX | 
-                    BS_FLAT | WS_GROUP | WS_TABSTOP,23,148,39,10
-    CONTROL         "Private",IDC_CHECK_PRIVATE,"Button",BS_AUTOCHECKBOX | 
-                    BS_FLAT | WS_GROUP | WS_TABSTOP,84,148,38,10
-    COMBOBOX        IDC_COMBO_ENC_STEREO,70,21,60,53,CBS_DROPDOWNLIST | 
+    CONTROL         "",IDC_TAB_SETTINGS,"SysTabControl32",WS_TABSTOP,7,7,306,
+                    232
+    CONTROL         "&Constant bitrate (CBR)",IDC_CHECK_ENC_CBR,"Button",
+                    BS_AUTOCHECKBOX | WS_GROUP | WS_TABSTOP,15,27,170,10
+    LTEXT           "&Lowest:",IDC_STATIC_CBR_MIN,27,43,58,8
+    COMBOBOX        IDC_COMBO_CBR_MIN,88,41,60,150,CBS_DROPDOWNLIST |
                     WS_VSCROLL | WS_GROUP | WS_TABSTOP
-    LTEXT           "Stereo mode",IDC_STATIC,23,24,41,8
-    CONTROL         "Smart Encode",IDC_CHECK_ENC_SMART,"Button",
-                    BS_AUTOCHECKBOX | BS_FLAT | WS_GROUP | WS_TABSTOP,49,39,
-                    61,10
-    ICON            IDI_ICON,IDC_STATIC_ENC_ICON,179,129,20,20
-    CTEXT           "v0.0.0 - 0.00",IDC_STATIC_CONFIG_VERSION,168,155,43,17
-    CONTROL         "Average BitRate",IDC_CHECK_ENC_ABR,"Button",
-                    BS_AUTOCHECKBOX | BS_FLAT | WS_GROUP | WS_TABSTOP,49,53,
-                    68,10
-    LTEXT           "Min",IDC_STATIC_AVERAGE_MIN,19,67,12,8
-    LTEXT           "Max",IDC_STATIC_AVERAGE_MAX,17,79,14,8
-    LTEXT           "Step",IDC_STATIC_AVERAGE_STEP,15,91,16,8
-    LTEXT           "test",IDC_STATIC_AVERAGE_SAMPLE,19,105,12,8
-    CONTROL         "Slider2",IDC_SLIDER_AVERAGE_MIN,"msctls_trackbar32",
-                    TBS_AUTOTICKS | TBS_BOTH | TBS_NOTICKS | WS_GROUP | 
-                    WS_TABSTOP,33,67,92,11
-    CONTROL         "Slider3",IDC_SLIDER_AVERAGE_MAX,"msctls_trackbar32",
-                    TBS_AUTOTICKS | TBS_BOTH | TBS_NOTICKS | WS_GROUP | 
-                    WS_TABSTOP,33,79,92,11
-    CONTROL         "Slider1",IDC_SLIDER_AVERAGE_STEP,"msctls_trackbar32",
-                    TBS_AUTOTICKS | TBS_BOTH | TBS_NOTICKS | WS_GROUP | 
-                    WS_TABSTOP,33,91,92,11
-    CONTROL         "Slider4",IDC_SLIDER_AVERAGE_SAMPLE,"msctls_trackbar32",
-                    WS_TABSTOP,33,104,92,12
-    CTEXT           "000",IDC_STATIC_AVERAGE_SAMPLE_VALUE,125,105,15,9,0,
-                    WS_EX_STATICEDGE
-    CTEXT           "000",IDC_STATIC_AVERAGE_STEP_VALUE,125,92,15,9,0,
-                    WS_EX_STATICEDGE
-    CTEXT           "000",IDC_STATIC_AVERAGE_MAX_VALUE,125,80,15,9,0,
-                    WS_EX_STATICEDGE
-    CTEXT           "000",IDC_STATIC_AVERAGE_MIN_VALUE,125,67,15,9,0,
-                    WS_EX_STATICEDGE
+    LTEXT           "&Highest:",IDC_STATIC_CBR_MAX,158,43,58,8
+    COMBOBOX        IDC_COMBO_CBR_MAX,218,41,60,150,CBS_DROPDOWNLIST |
+                    WS_VSCROLL | WS_GROUP | WS_TABSTOP
+    CONTROL         "&Average bitrate (ABR)",IDC_CHECK_ENC_ABR,"Button",
+                    BS_AUTOCHECKBOX | WS_GROUP | WS_TABSTOP,15,61,170,10
+    LTEXT           "Lo&west:",IDC_STATIC_AVERAGE_MIN,27,77,58,8
+    COMBOBOX        IDC_COMBO_ABR_MIN,88,75,60,150,CBS_DROPDOWNLIST |
+                    WS_VSCROLL | WS_GROUP | WS_TABSTOP
+    LTEXT           "Hi&ghest:",IDC_STATIC_AVERAGE_MAX,158,77,58,8
+    COMBOBOX        IDC_COMBO_ABR_MAX,218,75,60,150,CBS_DROPDOWNLIST |
+                    WS_VSCROLL | WS_GROUP | WS_TABSTOP
+    LTEXT           "S&tep:",IDC_STATIC_AVERAGE_STEP,27,93,58,8
+    COMBOBOX        IDC_COMBO_ABR_STEP,88,91,60,150,CBS_DROPDOWNLIST |
+                    WS_VSCROLL | WS_GROUP | WS_TABSTOP
+    LTEXT           "11 bitrates: 160, 152, 144, ..., 80 kbps",
+                    IDC_STATIC_AVERAGE_LIST,158,93,148,16
+    CONTROL         "&Variable bitrate (VBR)",IDC_CHECK_ENC_VBR,"Button",
+                    BS_AUTOCHECKBOX | WS_GROUP | WS_TABSTOP,15,113,170,10
+    LTEXT           "&Best quality:",IDC_STATIC_VBR_BEST,27,129,58,8
+    COMBOBOX        IDC_COMBO_VBR_BEST,88,127,120,150,CBS_DROPDOWNLIST |
+                    WS_VSCROLL | WS_GROUP | WS_TABSTOP
+    LTEXT           "Lowest &quality:",IDC_STATIC_VBR_WORST,27,145,58,8
+    COMBOBOX        IDC_COMBO_VBR_WORST,88,143,120,150,CBS_DROPDOWNLIST |
+                    WS_VSCROLL | WS_GROUP | WS_TABSTOP
+    LTEXT           "&Minimum bitrate:",IDC_STATIC_VBR_MIN,27,161,58,8
+    COMBOBOX        IDC_COMBO_VBR_MIN,88,159,60,150,CBS_DROPDOWNLIST |
+                    WS_VSCROLL | WS_GROUP | WS_TABSTOP
+    LTEXT           "Maxim&um bitrate:",IDC_STATIC_VBR_MAX,158,161,58,8
+    COMBOBOX        IDC_COMBO_VBR_MAX,218,159,60,150,CBS_DROPDOWNLIST |
+                    WS_VSCROLL | WS_GROUP | WS_TABSTOP
+    CONTROL         "Strictl&y enforce the minimum",IDC_CHECK_VBR_ENFORCE_MIN,
+                    "Button",BS_AUTOCHECKBOX | WS_GROUP | WS_TABSTOP,27,177,
+                    200,10
+    CONTROL         "Leave out formats above 15:1 compressio&n",
+                    IDC_CHECK_ENC_SMART,"Button",BS_AUTOCHECKBOX | WS_GROUP |
+                    WS_TABSTOP,15,195,290,10
+    LTEXT           "The list offers 630 formats.",IDC_STATIC_FORMAT_COUNT,15,
+                    213,290,16
+    LTEXT           "&Channel mode:",IDC_STATIC_CHANNEL,15,29,64,8
+    COMBOBOX        IDC_COMBO_ENC_STEREO,82,27,90,60,CBS_DROPDOWNLIST |
+                    WS_VSCROLL | WS_GROUP | WS_TABSTOP
+    CONTROL         "&Force mode",IDC_CHECK_CHANNELFORCE,"Button",
+                    BS_AUTOCHECKBOX | WS_GROUP | WS_TABSTOP,182,28,120,10
+    LTEXT           "&Encoding quality:",IDC_STATIC_QUALITY,15,48,64,8
+    CONTROL         "SliderQuality",IDC_SLIDER_QUALITY,"msctls_trackbar32",
+                    TBS_AUTOTICKS | TBS_BOTH | WS_GROUP | WS_TABSTOP,82,45,
+                    120,15
+    LTEXT           "3 (default)",IDC_STATIC_QUALITY_TEXT,206,48,100,8
+    GROUPBOX        "Frame options",IDC_GROUP_FRAME,15,68,290,58
+    CONTROL         "Copy&right",IDC_CHECK_COPYRIGHT,"Button",
+                    BS_AUTOCHECKBOX | WS_GROUP | WS_TABSTOP,23,80,120,10
+    CONTROL         "Chec&ksum",IDC_CHECK_CHECKSUM,"Button",
+                    BS_AUTOCHECKBOX | WS_GROUP | WS_TABSTOP,150,80,120,10
+    CONTROL         "&Original",IDC_CHECK_ORIGINAL,"Button",
+                    BS_AUTOCHECKBOX | WS_GROUP | WS_TABSTOP,23,94,120,10
+    CONTROL         "&Private",IDC_CHECK_PRIVATE,"Button",
+                    BS_AUTOCHECKBOX | WS_GROUP | WS_TABSTOP,150,94,120,10
+    CONTROL         "&Bit reservoir",IDC_CHECK_RESERVOIR,"Button",
+                    BS_AUTOCHECKBOX | WS_GROUP | WS_TABSTOP,23,108,120,10
+    GROUPBOX        "Advanced",IDC_GROUP_ADVANCED,15,132,290,58
+    CONTROL         "Keep &all frequencies",IDC_CHECK_KEEP_ALL,"Button",
+                    BS_AUTOCHECKBOX | WS_GROUP | WS_TABSTOP,23,144,270,10
+    CONTROL         "Strict &ISO compliance",IDC_CHECK_STRICT_ISO,"Button",
+                    BS_AUTOCHECKBOX | WS_GROUP | WS_TABSTOP,23,158,270,10
+    CONTROL         "Forced &mid / side stereo",IDC_CHECK_FORCE_MS,"Button",
+                    BS_AUTOCHECKBOX | WS_GROUP | WS_TABSTOP,23,172,270,10
+    LTEXT           "v0.0.0 - 0.00",IDC_STATIC_CONFIG_VERSION,7,250,190,8
+    DEFPUSHBUTTON   "OK",IDOK,209,247,50,14
+    PUSHBUTTON      "Cancel",IDCANCEL,263,247,50,14
 END
 
-IDD_ABOUT DIALOG DISCARDABLE  0, 0, 187, 77
-STYLE DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
-CAPTION "Lame MP3 codec : About"
-FONT 8, "MS Sans Serif"
+IDD_ABOUT DIALOGEX 0, 0, 291, 174
+STYLE DS_SHELLFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "About LAME MP3 Codec"
+FONT 8, "MS Shell Dlg", 400, 0, 0x1
 BEGIN
-    DEFPUSHBUTTON   "OK",IDOK,130,56,50,14
-    LTEXT           "Steve Lhomme + LAME developers",IDC_STATIC,7,33,112,8
-    LTEXT           "LGPL license",IDC_STATIC,7,20,43,8
-    ICON            IDI_ICON,IDC_STATIC,145,16,20,20
-    LTEXT           "Static",IDC_STATIC_ABOUT_TITLE,7,7,173,8
-    LTEXT           "https://lame.sourceforge.io/",IDC_STATIC_ABOUT_URL,7,47,80,8
-    LTEXT           "icon : Lucas Granito",IDC_STATIC,7,61,64,8
+    ICON            IDI_ICON,IDC_STATIC,7,7,20,20
+    LTEXT           "Static",IDC_STATIC_ABOUT_TITLE,37,7,247,8
+    LTEXT           "Credits",IDC_STATIC_ABOUT_CREDITS,37,19,247,16
+    LTEXT           "URL",IDC_STATIC_ABOUT_URL,37,39,130,8
+    LTEXT           "Icon",IDC_STATIC_ABOUT_ICON,37,51,247,8
+    EDITTEXT        IDC_EDIT_ABOUT_LICENSE,7,66,277,80,ES_MULTILINE |
+                    ES_READONLY | WS_VSCROLL
+    DEFPUSHBUTTON   "OK",IDOK,234,153,50,14
 END
-
 
 /////////////////////////////////////////////////////////////////////////////
 //
@@ -187,17 +217,17 @@ BEGIN
     IDD_CONFIG, DIALOG
     BEGIN
         LEFTMARGIN, 7
-        RIGHTMARGIN, 224
+        RIGHTMARGIN, 313
         TOPMARGIN, 7
-        BOTTOMMARGIN, 197
+        BOTTOMMARGIN, 261
     END
 
     IDD_ABOUT, DIALOG
     BEGIN
         LEFTMARGIN, 7
-        RIGHTMARGIN, 180
+        RIGHTMARGIN, 284
         TOPMARGIN, 7
-        BOTTOMMARGIN, 70
+        BOTTOMMARGIN, 167
     END
 END
 #endif    // APSTUDIO_INVOKED

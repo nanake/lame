@@ -25,6 +25,8 @@
 #include <olectl.h>
 #include <commctrl.h>
 #include "iaudioprops.h"
+#include "../ACM/SettingText.h"
+#include "SystemFontPage.h"
 #include "aboutprp.h"
 #include "mpegac.h"
 #include "resource.h"
@@ -36,29 +38,10 @@
 // -------------------------------------------------------------------------
 
 
-CHAR lpszText[] =   "This library is free software; you can redistribute it \r\n"
-                    "and/or modify it under the terms of the GNU \r\n"
-                    "Library General Public License\r\n"
-                    "as published by the Free Software Foundation;\r\n"
-                    "either version 2 of the License,\r\n"
-                    "or (at your option) any later version.\r\n"
-                    "\r\n"
-                    "This library is distributed in the hope that it will be useful,\r\n" 
-                    "but WITHOUT ANY WARRANTY;\r\n"
-                    "without even the implied warranty of MERCHANTABILITY or \r\n"
-                    "FITNESS FOR A PARTICULAR PURPOSE. See the GNU \r\n"
-                    "Library General Public License for more details.\r\n"
-                    "\r\n"
-                    "You should have received a copy of the GNU\r\n"
-                    "Library General Public License\r\n"
-                    "along with this library; if not, write to the\r\n"
-                    "Free Software Foundation,\r\n"
-                    "Inc., 59 Temple Place - Suite 330,\r\n"
-                    "Boston, MA 02111-1307, USA.\r\n";
 
-//
-// CreateInstance
-//
+/**
+ * Creates the About page. The class factory of the filter calls it.
+ */
 CUnknown * WINAPI CMAEAbout::CreateInstance(LPUNKNOWN lpunk, HRESULT *phr)
 {
     CUnknown *punk = new CMAEAbout(lpunk, phr);
@@ -70,12 +53,11 @@ CUnknown * WINAPI CMAEAbout::CreateInstance(LPUNKNOWN lpunk, HRESULT *phr)
 }
 
 
-//
-// Constructor
-//
-// Creaete a Property page object for the MPEG options
+/**
+ * Creates the About page.
+ */
 CMAEAbout::CMAEAbout(LPUNKNOWN lpunk, HRESULT *phr)
-    : CBasePropertyPage(NAME("About LAME Ain't MP3 Encoder"), lpunk,
+    : CSystemFontPropertyPage(NAME("About LAME Ain't MP3 Encoder"), lpunk,
         IDD_ABOUT,IDS_ABOUT)
     , m_fWindowInactive(TRUE)
 {
@@ -84,22 +66,18 @@ CMAEAbout::CMAEAbout(LPUNKNOWN lpunk, HRESULT *phr)
 //    InitCommonControls();
 }
 
-//
-// OnConnect
-//
-// Give us the filter to communicate with
-
+/**
+ * Does nothing. The About page does not use the filter.
+ */
 HRESULT CMAEAbout::OnConnect(IUnknown *pUnknown)
 {
     return NOERROR;
 }
 
 
-//
-// OnDisconnect
-//
-// Release the interface
-
+/**
+ * Does nothing, like OnConnect().
+ */
 HRESULT CMAEAbout::OnDisconnect()
 {
     // Release the interface
@@ -108,35 +86,29 @@ HRESULT CMAEAbout::OnDisconnect()
 }
 
 
-//
-// OnActivate
-//
-// Called on dialog creation
-
+/**
+ * Called when the dialog is created. Shows the license text, the LAME version
+ * and the address of the LAME home page.
+ */
 HRESULT CMAEAbout::OnActivate(void)
 {
     // Add text to the window.
     m_fWindowInactive = FALSE;
-    SendDlgItemMessage(m_hwnd, IDC_LAME_LA, WM_SETTEXT, 0, (LPARAM)lpszText);
+    SendDlgItemMessage(m_hwnd, IDC_LAME_LA, WM_SETTEXT, 0, (LPARAM)LICENSE_NOTICE);
 
 
     CHAR strbuf[250];
-#pragma warning(push)
-#pragma warning(disable: 4995)
-    sprintf(strbuf, "LAME Encoder Version %s", get_lame_version());
+    snprintf(strbuf, sizeof strbuf, "LAME Audio Encoder v%s", get_lame_version());
     SendDlgItemMessage(m_hwnd, IDC_LAME_VER, WM_SETTEXT, 0, (LPARAM)strbuf);
-
-    sprintf(strbuf, "LAME Project Homepage: %s", get_lame_url());
-    SendDlgItemMessage(m_hwnd, IDC_LAME_URL, WM_SETTEXT, 0, (LPARAM)strbuf);
-#pragma warning(pop)
+    SendDlgItemMessage(m_hwnd, IDC_LAME_URL, WM_SETTEXT, 0, (LPARAM)get_lame_url());
+    SendDlgItemMessage(m_hwnd, IDC_LAME_CREDITS, WM_SETTEXT, 0, (LPARAM)ABOUT_CREDITS);
+    SendDlgItemMessage(m_hwnd, IDC_LAME_ICON, WM_SETTEXT, 0, (LPARAM)ABOUT_ICON_CREDIT);
     return NOERROR;
 }
 
-//
-// OnDeactivate
-//
-// Called on dialog destruction
-
+/**
+ * Called when the dialog is destroyed.
+ */
 HRESULT CMAEAbout::OnDeactivate(void)
 {
     m_fWindowInactive = TRUE;
@@ -144,23 +116,19 @@ HRESULT CMAEAbout::OnDeactivate(void)
 }
 
 
-//
-// OnApplyChanges
-//
-// User pressed the Apply button, remember the current settings
-
+/**
+ * Does nothing. The About page has no settings.
+ */
 HRESULT CMAEAbout::OnApplyChanges(void)
 {
     return NOERROR;
 }
 
 
-//
-// OnReceiveMessages
-//
-// Handles the messages for our property window
-
-BOOL CMAEAbout::OnReceiveMessage( HWND hwnd
+/**
+ * Handles the messages of the dialog.
+ */
+INT_PTR CMAEAbout::OnReceiveMessage( HWND hwnd
                                 , UINT uMsg
                                 , WPARAM wParam
                                 , LPARAM lParam)
@@ -176,15 +144,11 @@ BOOL CMAEAbout::OnReceiveMessage( HWND hwnd
     default:
         return FALSE;
     }
-
-    return TRUE;
 }
 
-//
-// SetDirty
-//
-// notifies the property page site of changes
-
+/**
+ * Marks the page as changed, and tells the property page site.
+ */
 void CMAEAbout::SetDirty()
 {
     m_bDirty = TRUE;

@@ -47,6 +47,7 @@
 #endif
 
 #include "lametime.h"
+#include "machine.h"
 
 #if !defined(CLOCKS_PER_SEC)
 # warning Your system does not define CLOCKS_PER_SEC, guessing one...
@@ -129,7 +130,7 @@ GetRealTime(void)
 #endif
 
 int
-lame_set_stream_binary_mode(FILE * const fp)
+lame_set_stream_binary_mode(LAME_UNUSED FILE * const fp)
 {
 #if   defined __EMX__
     _fsetmode(fp, "b");
@@ -139,10 +140,91 @@ lame_set_stream_binary_mode(FILE * const fp)
     setmode(fileno(fp), O_BINARY);
 #elif defined _WIN32
     _setmode(_fileno(fp), _O_BINARY);
-#else
-    (void) fp;          /* doing nothing here, silencing the compiler only. */
 #endif
     return 0;
+}
+
+
+#include <sys/stat.h>
+
+#if defined(HAVE_UTIME_H)
+# include <utime.h>
+#elif defined(HAVE_SYS_UTIME_H)
+# include <sys/utime.h>
+#endif
+
+#if defined(HAVE_UTIME) && (defined(HAVE_UTIME_H) || defined(HAVE_SYS_UTIME_H))
+# define LAME_HAVE_FILE_TIMES 1
+#endif
+
+/**
+ * @internal
+ * @brief Reads the access and modification times of a file.
+ *
+ * Call it before anything opens the file, because reading a file changes its
+ * access time.
+ *
+ * @param path   the file to read the times from.
+ * @param times  receives the times. It is marked invalid if the times cannot
+ *               be read, or if this build cannot set file times.
+ * @return 0 on success, -1 otherwise.
+ */
+int
+lame_read_file_times(LAME_UNUSED char const *path, lame_file_times * times)
+{
+    if (times == 0) {
+        return -1;
+    }
+    times->valid = 0;
+    times->actime = 0;
+    times->modtime = 0;
+#ifdef LAME_HAVE_FILE_TIMES
+    {
+        struct stat source;
+
+        if (path == 0 || stat(path, &source) != 0) {
+            return -1;
+        }
+        times->actime = source.st_atime;
+        times->modtime = source.st_mtime;
+        times->valid = 1;
+        return 0;
+    }
+#else
+    /* this build cannot set them later, so reading them now gains nothing. */
+    return -1;
+#endif
+}
+
+
+/**
+ * @internal
+ * @brief Sets the access and modification times of a file to the values from
+ *        lame_read_file_times().
+ *
+ * @param path   the file to change.
+ * @param times  the times to set. If they are marked invalid, the function
+ *               changes nothing and returns -1.
+ * @return 0 on success. -1 on failure, and also if the platform cannot set
+ *         file times.
+ */
+int
+lame_write_file_times(LAME_UNUSED char const *path, LAME_UNUSED lame_file_times const *times)
+{
+#ifdef LAME_HAVE_FILE_TIMES
+    struct utimbuf when;
+
+    if (path == 0 || times == 0 || times->valid == 0) {
+        return -1;
+    }
+    when.actime = times->actime;
+    when.modtime = times->modtime;
+    return utime(path, &when) == 0 ? 0 : -1;
+#else
+    /* the system has no way to set them; say so rather than report a
+       success nothing performed. */
+    return -1;
+#endif
 }
 
 

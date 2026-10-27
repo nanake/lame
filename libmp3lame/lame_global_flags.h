@@ -1,6 +1,9 @@
 #ifndef LAME_GLOBAL_FLAGS_H
 #define LAME_GLOBAL_FLAGS_H
 
+#include "lame.h"
+#include "machine.h"
+
 #ifndef lame_internal_flags_defined
 #define lame_internal_flags_defined
 struct lame_internal_flags;
@@ -26,6 +29,8 @@ typedef enum short_block_e {
 ***********************************************************************/
 struct lame_global_struct {
     unsigned int class_id;
+    int     lame_allocated_gfp; /* is this struct owned by calling
+                                   program or lame?                     */
 
     /* input description */
     unsigned long num_samples; /* number of samples. default=2^32-1           */
@@ -159,9 +164,6 @@ struct lame_global_struct {
     /* internal variables, do not set...                                    */
     /* provided because they may be of use to calling application           */
   /************************************************************************/
-
-    int     lame_allocated_gfp; /* is this struct owned by calling
-                                   program or lame?                     */
 
 
 

@@ -20,11 +20,11 @@
  * Boston, MA 02111-1307, USA.
  */
 
-class CMpegAudEncPropertyPage : public CBasePropertyPage 
+class CMpegAudEncPropertyPage : public CSystemFontPropertyPage
 {
 
 public:
-    static CUnknown *CreateInstance( LPUNKNOWN punk, HRESULT *phr );
+    static CUnknown * WINAPI CreateInstance( LPUNKNOWN punk, HRESULT *phr );
     CMpegAudEncPropertyPage( LPUNKNOWN punk, HRESULT *phr );
 
     HRESULT OnConnect(IUnknown *pUnknown);
@@ -32,7 +32,7 @@ public:
     HRESULT OnActivate();
     HRESULT OnDeactivate();
     HRESULT OnApplyChanges();
-    BOOL OnReceiveMessage(HWND hwnd,UINT uMsg,WPARAM wParam,LPARAM lParam);
+    INT_PTR OnReceiveMessage(HWND hwnd,UINT uMsg,WPARAM wParam,LPARAM lParam);
 
 private:
     void    InitPropertiesDialog(HWND hwndParent);
@@ -51,10 +51,14 @@ private:
     DWORD   m_dwForceMono;
     DWORD   m_dwCopyright;
     DWORD   m_dwOriginal;
+    DWORD   m_dwAverage;
+    DWORD   m_dwAverageBitrate;
+    DWORD   m_dwPrivate;
+    DWORD   m_dwReservoir;
 
     HWND    m_hwndQuality;               //Slider window handle
 
     int     m_srIdx;
 
-    IAudioEncoderProperties *m_pAEProps;
+    IAudioEncoderProperties2 *m_pAEProps;
 };

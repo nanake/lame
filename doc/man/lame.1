@@ -4,7 +4,6 @@ lame \- create mp3 audio files
 .SH SYNOPSIS
 lame [options] <infile> <outfile>
 .SH DESCRIPTION
-.PP
 LAME is a program which can be used to create compressed audio files.
 (Lame ain't an MP3 encoder).
 These audio files can be played back by popular MP3 players such as
@@ -31,6 +30,10 @@ Might not be available on your release.
 .B \-x
 Swap bytes in the input file (or output file when using
 .B \-\-decode).
+A LAME built with libsndfile swaps the bytes of raw input
+.RB ( \-r )
+only; for a file with a header, such as WAV or AIFF, it ignores
+.BR \-x .
 .br
 For sorting out little endian/big endian type problems.
 If your encodings sounds like static,
@@ -82,6 +85,17 @@ Instructs LAME that the samples from the input are in big-endian form.
 
 Required only for raw PCM input files.
 .TP
+.B \-\-ignorelength
+Ignore the length given in the WAVE header and read the input until it ends.
+
+A WAVE header states how much audio follows it. A file still being written, or
+one arriving over a pipe, may carry a length that is wrong or zero, and encoding
+then stops early.
+.TP
+.B \-\-swap-channel
+Swap the left and right channels.
+The input must have two channels.
+.TP
 .B \-\-mp1input
 Assume the input file is a MPEG Layer I (ie MP1) file.
 .br
@@ -111,6 +125,9 @@ gapless encoding for a set of contiguous files
 .TP
 .BI \-\-nogapout " dir"
 output dir for gapless encoding (must precede \-\-nogap)
+.TP
+.B \-\-nogaptags
+Allow the use of VBR tags in gapless encoding.
 .TP
 .BI \-\-out-dir " dir"
 If no explicit output file is specified, a file will be written at given path.
@@ -239,7 +256,7 @@ up to 640 kbps
 Uses LAME for decoding to a wav file.
 The input file can be any input type supported by encoding,
 including layer II files.
-LAME uses a fork of mpglib known as HIP for decoding.
+LAME decodes with libmpg123.
 
 If
 .B \-t
@@ -249,9 +266,14 @@ You can use
 .B \-x
 to swap bytes order.
 
-This option is not usable if the MP3 decoder was
-.B explicitly
-disabled in the build of LAME.
+A LAME built without libmpg123 cannot decode an MPEG input,
+and stops with an error.
+.TP
+.BI \-\-decode\-mp3delay " n"
+When decoding, assume the encoder delay was
+.I n
+samples rather than the value the file's own tag gives. For files whose tag is
+missing or wrong.
 .TP
 .BI \-t
 Disable writing of the INFO Tag on encoding.
@@ -302,107 +324,83 @@ since most MP3 decoders will truncate data which decodes to values
 greater than 32768.
 .PD
 .TP
+.BI \-\-gain " n"
+Apply a gain adjustment of
+.I n
+decibels, in the range \-20.0 to +12.0. Another way of spelling
+.B \-\-scale ,
+in the units a listener thinks in.
+.TP
 .B \-\-replaygain\-fast
-Compute ReplayGain fast but slightly inaccurately.
+Measure ReplayGain on the input samples, after the volume scaling and
+resampling asked for on the command line.
+This is the default; see
+.B REPLAYGAIN
+below for what is measured and where it is stored.
 
-This computes "Radio" ReplayGain on the input data stream after
-user\(hyspecified volume\(hyscaling and/or resampling.
-
-The ReplayGain analysis does
-.I not
-affect the content of a compressed data stream itself,
-it is a value stored in the header of a sound file.
-Information on the purpose of ReplayGain and the algorithms used is
-available from
-.B http://www.replaygain.org/.
-
-Only the "RadioGain" Replaygain value is computed,
-it is stored in the LAME tag.
-The analysis is performed with the reference
-volume equal to 89dB.
-Note: the reference volume has been changed from 83dB on transition from
-version 3.95 to 3.95.1.
-
-This switch is enabled by default.
+Tests have shown that the difference between the ReplayGain values computed
+on the input data and on the decoded data is usually not greater than 0.5dB,
+although the minimum volume difference the human ear can perceive is
+about 1.0dB.
 
 See also:
 .B \-\-replaygain\-accurate, \-\-noreplaygain
 .TP
 .B \-\-replaygain\-accurate
-Compute ReplayGain more accurately and find the peak sample.
+Measure ReplayGain on the decoded data instead, decoding the encoded
+stream on the fly, and find the peak sample, which is stored beside the
+gain.
+See
+.B REPLAYGAIN
+below.
 
-This computes "Radio" ReplayGain on the decoded data stream,
-finds the peak sample by decoding on the fly the encoded data stream and stores it in the file. 
- 
-The ReplayGain analysis does
-.I not
-affect the content of a compressed data stream itself,
-it is a value stored in the header of a sound file.
-Information on the purpose of ReplayGain and the algorithms used is
-available from
-.B http://www.replaygain.org/.
-
- 
-By default, LAME performs ReplayGain analysis on the input data
-(after the user\(hyspecified volume scaling).
-This behavior might give slightly inaccurate results
-because the data on the output of a lossy compression/decompression sequence
-differs from the initial input data.
-When
-.B \-\-replaygain-accurate
-is specified the mp3 stream gets decoded on the fly and the analysis is
-performed on the decoded data stream.
-Although theoretically this method gives more accurate results,
-it has several disadvantages:
-.RS 8
-.IP "*" 4
-tests have shown that the difference between the ReplayGain values computed
-on the input data and decoded data is usually not greater than 0.5dB,
-although the minimum volume difference the human ear can perceive is
-about 1.0dB
-.IP "*" 4
-decoding on the fly significantly slows down the encoding process
-.RE
-.RS 7
-
-The apparent advantage is that:
-.RE
-.RS 8
-.IP "*" 4
-with
-.B \-\-replaygain-accurate
-the real peak sample is determined and stored in the file.
 The knowledge of the peak sample can be useful to decoders (players)
 to prevent a negative effect called 'clipping' that introduces distortion
 into the sound.
-.RE
-.RS 7
- 
-Only the "RadioGain" ReplayGain value is computed,
-it is stored in the LAME tag.
-The analysis is performed with the reference
-volume equal to 89dB.
-Note: the reference volume has been changed from 83dB on transition from
-version 3.95 to 3.95.1.
- 
+Decoding on the fly significantly slows down the encoding process,
+for a gain value that is usually within 0.5dB of the default one.
+
 This option is not usable if the MP3 decoder was
 .B explicitly
 disabled in the build of LAME.
 (Note: if LAME is compiled without the MP3 decoder,
 ReplayGain analysis is performed on the input data after user-specified
 volume scaling).
- 
+
 See also:
-.B \-\-replaygain-fast, \-\-noreplaygain \-\-clipdetect
-.RE
+.B \-\-replaygain\-fast, \-\-noreplaygain, \-\-clipdetect
 .TP
 .B \-\-noreplaygain
 Disable ReplayGain analysis.
 
 By default ReplayGain analysis is enabled. This switch disables it.
+See
+.B REPLAYGAIN
+below.
 
 See also:
-.B \-\-replaygain-fast, \-\-replaygain-accurate
+.B \-\-replaygain\-fast, \-\-replaygain\-accurate
+.TP
+.B \-\-replaygain\-id3v2
+Write the ReplayGain figures to the ID3v2 tag as well as to LAME's own tag,
+as the user-defined text frames
+.B REPLAYGAIN_TRACK_GAIN
+and
+.B REPLAYGAIN_TRACK_PEAK .
+The peak is written only where it was measured, which
+means together with
+.B \-\-replaygain\-accurate
+or
+.B \-\-clipdetect .
+The gain is written to two decimals and is accurate to one, that being what
+LAME's own tag holds.
+
+The frames are left out, with a message saying so, when the output is a pipe,
+when the input is an MP3 whose tag is passed through unchanged, and when
+ReplayGain analysis has been switched off.
+
+See also:
+.B \-\-replaygain\-fast, \-\-replaygain\-accurate, \-\-noreplaygain
 .TP
 .B \-\-clipdetect
 Clipping detection.
@@ -478,6 +476,21 @@ select nothing, there being no code of either kind to disable. If both options
 are given,
 .B \-\-vector
 wins.
+.TP
+.B \-\-flush
+Flush the output stream as soon as each piece of it has been written, rather
+than leaving it to the operating system. Useful for a stream; with a file it
+costs performance, since the writing is then done in smaller pieces.
+.TP
+.BI \-\-priority " n"
+Set the priority of the encoding process:
+.I n
+= 0 or 1 for low, 2 for normal, 3 or 4 for high. Available on Windows and OS/2.
+.TP
+.B \-\-preserve\-modtime
+Give the output file the date and time of the input file, rather than the time
+the run finished. Has no effect when the input or the output is a pipe, there
+being no file to read the times from or to give them to.
 
 .PP
 Verbosity:
@@ -501,11 +514,24 @@ Histogram display might not be available on your release.
 Do not print anything on the screen.
 .PD
 .TP
+.B \-\-brief
+Print less on the screen than the default does, and more than
+.B \-\-silent .
+.TP
 .B \-\-verbose
 Print a lot of information on the screen.
 .TP
 .B \-\-help
 Display a list of available options.
+.TP
+.B \-\-longhelp
+Display the whole list, including the options
+.B \-\-help
+leaves out, a page at a time.
+.TP
+.B \-\-version, \-\-license
+Print the version and the licence, and exit. The two spellings are the same
+option.
 
 .PP
 Noise shaping & psycho acoustic algorithms:
@@ -652,6 +678,14 @@ and it is now considered to be on par with the original
 It has the added advantage of being very fast (over twice as fast as
 .B \-\-vbr-old
 ). This is the default since 3.98.
+.TP
+.B \-\-vbr-mtrh
+The VBR algorithm that was the default in LAME 3.98, kept under its own name.
+.TP
+.B \-\-r3mix
+Another spelling of
+.B \-V 3 .
+Kept for the scripts that use it.
 .TP
 .BI -V " n"
 0 <=
@@ -853,6 +887,19 @@ LAME will enforce the 7680 bit limitation on total frame size.
 This results in many wasted bits for high bitrate encodings but will
 ensure strict ISO compatibility.
 This compatibility might be important for hardware players.
+.TP
+.BI \-\-buffer-constraint " constraint"
+How much of the bit reservoir a frame may draw on:
+.B default ,
+.B strict
+or
+.B maximum .
+.B strict
+is what
+.B \-\-strictly-enforce-ISO
+applies;
+.B maximum
+allows the largest frame the format can express.
 
 .PP
 Filter options:
@@ -911,6 +958,10 @@ audio/song genre (name or number in list)
 .BI \-\-tv " id=value"
 Text or URL frame specified by id and value (v2.3 tag). User defined frame. Syntax: \-\-tv "TXXX=description=content"
 .TP
+.BI \-\-ti " file"
+Attach a picture as the album art (a JPEG, PNG or GIF file, at most 128 KB,
+version 2.3 tag).
+.TP
 .B \-\-add-id3v2
 force addition of version 2 tag
 .TP
@@ -967,6 +1018,41 @@ i.e. if they are more than 30 characters.
 In this case,
 both v1 and v2 tags will be added,
 to ensure reading of tags by MP3 players which are unable to read ID3 v2 tags.
+
+.SH REPLAYGAIN
+ReplayGain proposes a per\(hytrack gain that plays every track at one
+perceived loudness.
+LAME measures it while encoding, as the ReplayGain specification
+describes:
+the signal passes an equal\(hyloudness filter,
+its RMS level is taken over 50 ms blocks,
+and the level 95\ % of the blocks fall below is compared with the
+reference volume of 89dB.
+Note: the reference volume has been changed from 83dB on transition from
+version 3.95 to 3.95.1.
+Only the track gain ("Radio" gain in the specification's terms) is
+computed.
+
+The value does not change the encoded audio:
+it is written into LAME's own tag in the first frame, and with
+.B \%\-\-replaygain\-id3v2
+also into the ID3v2 tag, where players read it.
+
+By default the measurement is taken on the input samples, after the
+volume scaling and resampling asked for on the command line, which is
+.BR \%\-\-replaygain\-fast ;
+.B \%\-\-replaygain\-accurate
+measures the decoded data instead and also finds the peak sample,
+.B \%\-\-noreplaygain
+turns the measurement off, and
+.B \%\-\-clipdetect
+reports whether the encoded audio would clip.
+
+The specification is at
+.br
+.na
+.B \%https://wiki.hydrogenaud.io/\:index.php?\:title=ReplayGain_1.0_specification
+.ad
 
 .SH ENCODING MODES
 LAME is able to encode your music using one of its 3 encoding modes:
@@ -1065,7 +1151,6 @@ streaming an MP3 over the Internet may be important.
 
 
 .SH EXAMPLES
-.LP
 Fixed bit rate jstereo 128kbs encoding:
 .IP
 .B lame \-b
@@ -1128,7 +1213,6 @@ preset:
 .I sample.wav sample.mp3
 
 .SH BUGS
-.PP
 Probably there are some.
 .SH SEE ALSO
 .BR mpg123 (1) ,

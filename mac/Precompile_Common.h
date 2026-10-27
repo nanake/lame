@@ -26,20 +26,8 @@
 #define uint16_t UInt16
 #define uint32_t UInt32
 #define uint64_t unsigned long long
-#define ieee854_float80_t long double
 #define ieee754_float64_t double
 #define ieee754_float32_t float
-
-#define SIZEOF_DOUBLE 8
-#define SIZEOF_FLOAT 4
-#define SIZEOF_INT 4
-#define SIZEOF_LONG 4
-#define SIZEOF_LONG_LONG 8
-#define SIZEOF_SHORT 2
-#define SIZEOF_UNSIGNED_INT 4
-#define SIZEOF_UNSIGNED_LONG 4
-#define SIZEOF_UNSIGNED_LONG_LONG 8
-#define SIZEOF_UNSIGNED_SHORT 2
 
 #define HAVE_GETTIMEOFDAY 1
 #define HAVE_SOCKET 1
@@ -55,7 +43,6 @@
 #define VERSION "3.91"
 
 #define PROTOTYPES 1
-#define HAVE_IEEE854_FLOAT80 1
 
 #define LIMIT_STACK_USAGE	1
 

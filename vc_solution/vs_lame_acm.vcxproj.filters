@@ -28,7 +28,10 @@
     <ClCompile Include="..\ACM\AEncodeProperties.cpp">
       <Filter>Source</Filter>
     </ClCompile>
-    <ClCompile Include="..\ACM\DecodeStream.cpp">
+    <ClCompile Include="..\ACM\DialogFont.cpp">
+      <Filter>Source</Filter>
+    </ClCompile>
+    <ClCompile Include="..\ACM\SettingText.cpp">
       <Filter>Source</Filter>
     </ClCompile>
     <ClCompile Include="..\ACM\main.cpp">
@@ -56,7 +59,10 @@
     <ClInclude Include="..\ACM\AEncodeProperties.h">
       <Filter>Include</Filter>
     </ClInclude>
-    <ClInclude Include="..\ACM\DecodeStream.h">
+    <ClInclude Include="..\ACM\DialogFont.h">
+      <Filter>Include</Filter>
+    </ClInclude>
+    <ClInclude Include="..\ACM\SettingText.h">
       <Filter>Include</Filter>
     </ClInclude>
   </ItemGroup>

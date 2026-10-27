@@ -84,13 +84,22 @@
  */
 
 
+/**
+ * @internal
+ * @brief Returns the largest sample magnitude of a frame, on the scale that
+ *        @c levelmessage() uses.
+ *
+ * @param Buffer  the frame, per channel.
+ * @param n       the number of samples per channel.
+ * @return the magnitude, at most 32768.
+ */
 static unsigned int
-maxvalue(int Buffer[2][1152])
+maxvalue(int Buffer[2][FRAME_BUFFER_SAMPLES], int n)
 {
     int     max = 0;
     int     i;
 
-    for (i = 0; i < 1152; i++) {
+    for (i = 0; i < n; i++) {
         if (abs(Buffer[0][i]) > max)
             max = abs(Buffer[0][i]);
         if (abs(Buffer[1][i]) > max)
@@ -99,21 +108,48 @@ maxvalue(int Buffer[2][1152])
     return max >> 16;
 }
 
+/**
+ * @internal
+ * @brief Returns the largest sample magnitude of a frame of floating point
+ *        samples, on the scale that @c levelmessage() uses.
+ *
+ * @param Buffer  the frame, per channel. 1.0 is full scale.
+ * @param n       the number of samples per channel.
+ * @return the magnitude. 32768 at or above full scale.
+ */
+static unsigned int
+maxvalue_float(float Buffer[2][FRAME_BUFFER_SAMPLES], int n)
+{
+    float   max = 0;
+    int     i;
+
+    for (i = 0; i < n; i++) {
+        float const l = Buffer[0][i] < 0 ? -Buffer[0][i] : Buffer[0][i];
+        float const r = Buffer[1][i] < 0 ? -Buffer[1][i] : Buffer[1][i];
+        if (l > max)
+            max = l;
+        if (r > max)
+            max = r;
+    }
+    return max >= 1.0f ? 32768u : (unsigned int) (max * 32768.0f);
+}
+
 static void
 levelmessage(unsigned int maxv, int* maxx, int* tmpx)
 {
     char    buff[] = "|  .  |  .  |  .  |  .  |  .  |  .  |  .  |  .  |  .  |  .  |  \r";
+    int const last_column = (int) sizeof(buff) - 3; /* the last one before "\r" */
     int     tmp = *tmpx, max = *maxx;
 
     buff[tmp] = '+';
     tmp = (maxv * 61 + 16384) / (32767 + 16384 / 61);
-    if (tmp > sizeof(buff) - 2)
-        tmp = sizeof(buff) - 2;
+    if (tmp > last_column)
+        tmp = last_column;
     if (max < tmp)
         max = tmp;
     buff[max] = 'x';
     buff[tmp] = '#';
-    console_printf(buff);
+    console_printf("%s", buff);
     console_flush();
     *maxx = max;
     *tmpx = tmp;
@@ -135,13 +171,17 @@ lame_main(lame_t gf, int argc, char **argv)
     unsigned char mp3buffer[LAME_MAXMP3BUFFER];
     char    inPath[PATH_MAX + 1];
     char    outPath[PATH_MAX + 1];
-    int     Buffer[2][1152];
+    char    outDir[PATH_MAX + 1];
+    int     Buffer[2][FRAME_BUFFER_SAMPLES];
+    float   BufferF[2][FRAME_BUFFER_SAMPLES];
+    int     floats;
 
     int     maxx = 0, tmpx = 0;
     int     ret;
     int     wavsamples;
     int     mp3bytes;
     FILE   *outf;
+    audio_reader *reader;
     unsigned int port = 5004;
     unsigned int ttl = 2;
     char    dummy;
@@ -185,9 +225,7 @@ lame_main(lame_t gf, int argc, char **argv)
         return 1;
     }
 
-    lame_set_errorf(gf, &frontend_errorf);
-    lame_set_debugf(gf, &frontend_debugf);
-    lame_set_msgf(gf, &frontend_msgf);
+    frontend_attach_reporting(gf);
 
     /* Remove the argumets that are rtp related, and then 
      * parse the command line arguments, setting various flags in the
@@ -209,8 +247,12 @@ lame_main(lame_t gf, int argc, char **argv)
         for (i = 2+arg; i < argc; ++i) { /* leaving out argument number 1, parsed above */
             argv_mod[i-arg-1] = argv[i];
         }
-        parse_args(gf, argc_mod, argv_mod, inPath, outPath, NULL, NULL);
+        ret = parse_args(gf, argc_mod, argv_mod, inPath, outPath, outDir, NULL, NULL);
         free(argv_mod);
+        if (ret < 0) {
+            rtp_deinitialization();
+            return ret == -2 ? 0 : 1;
+        }
     }
 
     /* open the output file.  Filename parsed into gf.inPath */
@@ -232,7 +274,7 @@ lame_main(lame_t gf, int argc, char **argv)
      * if you want to do your own file input, skip this call and set
      * these values yourself.  
      */
-    if (init_infile(gf, inPath) < 0) {
+    if ((reader = init_infile(gf, inPath)) == NULL) {
         rtp_deinitialization();
         fclose(outf);
         error_printf("Can't init infile '%s'\n", inPath);
@@ -243,34 +285,62 @@ lame_main(lame_t gf, int argc, char **argv)
     /* Now that all the options are set, lame needs to analyze them and
      * set some more options 
      */
-    ret = lame_init_params(gf);
+    ret = frontend_init_params(gf);
     if (ret < 0) {
-        if (ret == -1)
-            display_bitrates(stderr);
         rtp_deinitialization();
         fclose(outf);
-        close_infile();
+        close_infile(reader);
         error_printf("fatal error during initialization\n");
         return -1;
     }
 
     lame_print_config(gf); /* print useful information about options being used */
 
-    if (global_ui_config.update_interval < 0.)
-        global_ui_config.update_interval = 2.;
+    if (frontend_config.ui_config.update_interval < 0.)
+        frontend_config.ui_config.update_interval = 2.;
 
     /* encode until we hit EOF */
-    while ((wavsamples = get_audio(gf, Buffer)) > 0) { /* read in 'wavsamples' samples */
-        levelmessage(maxvalue(Buffer), &maxx, &tmpx);
-        mp3bytes = lame_encode_buffer_int(gf, /* encode the frame */
-                                          Buffer[0], Buffer[1], wavsamples,
-                                          mp3buffer, sizeof(mp3buffer));
+    floats = input_is_float(reader);
+    while ((wavsamples = floats ? get_audio_float(reader, gf, BufferF)
+                                : get_audio(reader, gf, Buffer)) > 0) {
+        if (floats) {
+            levelmessage(maxvalue_float(BufferF, wavsamples), &maxx, &tmpx);
+            mp3bytes = lame_encode_buffer_ieee_float(gf, BufferF[0], BufferF[1], wavsamples,
+                                                     mp3buffer, sizeof(mp3buffer));
+        }
+        else {
+            levelmessage(maxvalue(Buffer, wavsamples), &maxx, &tmpx);
+            mp3bytes = lame_encode_buffer_int(gf, Buffer[0], Buffer[1], wavsamples,
+                                              mp3buffer, sizeof(mp3buffer));
+        }
+        if (mp3bytes < 0) {
+            error_printf("Error: %s (error %d)\n", frontend_encode_error_text(mp3bytes), mp3bytes);
+            rtp_deinitialization();
+            fclose(outf);
+            close_infile(reader);
+            return -1;
+        }
         rtp_output(mp3buffer, mp3bytes); /* write MP3 output to RTP port */
         fwrite(mp3buffer, 1, mp3bytes, outf); /* write the MP3 output to file */
+    }
+    if (wavsamples < 0) {
+        if (frontend_config.ui_config.silent < 10)
+            error_printf("Error reading input file\n");
+        rtp_deinitialization();
+        fclose(outf);
+        close_infile(reader);
+        return 1;
     }
 
     mp3bytes = lame_encode_flush(gf, /* may return one or more mp3 frame */
                                  mp3buffer, sizeof(mp3buffer));
+    if (mp3bytes < 0) {
+        error_printf("Error: %s (error %d)\n", frontend_encode_error_text(mp3bytes), mp3bytes);
+        rtp_deinitialization();
+        fclose(outf);
+        close_infile(reader);
+        return -1;
+    }
     rtp_output(mp3buffer, mp3bytes); /* write MP3 output to RTP port */
     fwrite(mp3buffer, 1, mp3bytes, outf); /* write the MP3 output to file */
 
@@ -278,7 +348,7 @@ lame_main(lame_t gf, int argc, char **argv)
 
     rtp_deinitialization();
     fclose(outf);
-    close_infile();     /* close the sound input file */
+    close_infile(reader); /* close the sound input file */
     return 0;
 }
 

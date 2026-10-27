@@ -13,13 +13,27 @@
 # include <windows.h>
 #endif
 
+#include "lame.h"
+
+/* Mark a function that takes a printf format: a variadic one as printf itself
+   is, a va_list one with no argument index. Expands to nothing where the
+   compiler has no such attribute, including MSVC. */
+#if defined(__GNUC__) || defined(__clang__)
+# define CONSOLE_PRINTF(fmt_index, first_arg) __attribute__((format(printf, fmt_index, first_arg)))
+#else
+# define CONSOLE_PRINTF(fmt_index, first_arg)
+#endif
+
 #if defined(__cplusplus)
 extern "C" {
 #endif
 
+/** @brief The size in bytes of one terminal control string, including the
+    terminating NUL. */
+#define CONSOLE_CAP_SIZE 16
+
 typedef struct console_io_struct {
     unsigned long ClassID;
-    unsigned long ClassProt;
     FILE   *Console_fp;      /* filepointer to stream reporting information */
     FILE   *Error_fp;        /* filepointer to stream fatal error reporting information */
     FILE   *Report_fp;       /* filepointer to stream reports (normally a text file or /dev/null) */
@@ -27,11 +41,8 @@ typedef struct console_io_struct {
     HANDLE  Console_Handle;
 #endif
     int     disp_width;
-    int     disp_height;
-    char    str_up[10];
-    char    str_clreoln[10];
-    char    str_emph[10];
-    char    str_norm[10];
+    char    str_up[CONSOLE_CAP_SIZE];
+    char    str_clreoln[CONSOLE_CAP_SIZE];
     char    Console_buff[2048];
     int     Console_file_type;
 } Console_IO_t;
@@ -40,14 +51,15 @@ extern Console_IO_t Console_IO;
 extern int frontend_open_console(void);
 extern void frontend_close_console(void);
 
-extern void frontend_msgf(const char *format, va_list ap);
-extern void frontend_debugf(const char *format, va_list ap);
-extern void frontend_errorf(const char *format, va_list ap);
-extern void frontend_print_null(const char *format, va_list ap);
+extern void frontend_msgf(const char *format, va_list ap) CONSOLE_PRINTF(1, 0);
+extern void frontend_debugf(const char *format, va_list ap) CONSOLE_PRINTF(1, 0);
+extern void frontend_errorf(const char *format, va_list ap) CONSOLE_PRINTF(1, 0);
+extern void frontend_print_null(const char *format, va_list ap) CONSOLE_PRINTF(1, 0);
+extern void frontend_attach_reporting(lame_global_flags * gfp);
 
-int     console_printf(const char *format, ...);
-int     error_printf(const char *format, ...);
-int     report_printf(const char *format, ...);
+int     console_printf(const char *format, ...) CONSOLE_PRINTF(1, 2);
+int     error_printf(const char *format, ...) CONSOLE_PRINTF(1, 2);
+int     report_printf(const char *format, ...) CONSOLE_PRINTF(1, 2);
 
 void    console_flush(void);
 void    error_flush(void);

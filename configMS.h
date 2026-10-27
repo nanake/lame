@@ -18,33 +18,6 @@
 # define _CRT_NONSTDC_NO_WARNINGS 1
 #endif
 
-/* The number of bytes in a double.  */
-#define SIZEOF_DOUBLE 8
-
-/* The number of bytes in a float.  */
-#define SIZEOF_FLOAT 4
-
-/* The number of bytes in a int.  */
-#define SIZEOF_INT 4
-
-/* The number of bytes in a long.  */
-#define SIZEOF_LONG 4
-
-/* The number of bytes in a long double.  */
-#define SIZEOF_LONG_DOUBLE 12
-
-/* The number of bytes in a short.  */
-#define SIZEOF_SHORT 2
-
-/* The number of bytes in a unsigned int.  */
-#define SIZEOF_UNSIGNED_INT 4
-
-/* The number of bytes in a unsigned long.  */
-#define SIZEOF_UNSIGNED_LONG 4
-
-/* The number of bytes in a unsigned short.  */
-#define SIZEOF_UNSIGNED_SHORT 2
-
 /* Define if you have the ANSI C header files.  */
 #define STDC_HEADERS
 
@@ -72,25 +45,23 @@
 /* Define if you have the <stdint.h> header file.  */
 #define HAVE_STDINT_H 1
 
+/* Define if you have the <sys/utime.h> header file and utime().  The Windows
+   compilers put utime() there rather than in <utime.h>; the frontend needs
+   both answers for --preserve-modtime.  */
+#define HAVE_SYS_UTIME_H 1
+#define HAVE_UTIME 1
+
+/* <fpu_control.h> is a glibc header; the Windows compilers have their own way
+   of reaching the floating point control word, which util.c uses instead, so
+   this answer is no rather than absent.  */
+/* #undef HAVE_FPU_CONTROL_H */
+
 #if defined(_MSC_VER) || defined(__BORLANDC__)
 #pragma warning( disable : 4305 )
 #endif
 
-typedef long double ieee854_float80_t;
 typedef double      ieee754_float64_t;
 typedef float       ieee754_float32_t;
-
-#ifdef LAME_ACM
-/* memory hacking for driver purposes */
-#define calloc(x,y) acm_Calloc(x,y)
-#define free(x)     acm_Free(x)
-#define malloc(x)   acm_Malloc(x)
-
-#include <stddef.h>
-void *acm_Calloc( size_t num, size_t size );
-void *acm_Malloc( size_t size );
-void acm_Free( void * mem);
-#endif /* LAME_ACM */
 
 #define LAME_LIBRARY_BUILD
 

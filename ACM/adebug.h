@@ -1,6 +1,6 @@
 /**
  *
- * Lame ACM wrapper, encode/decode MP3 based RIFF/AVI files in MS Windows
+ * Lame ACM wrapper, encode MP3 based RIFF/AVI files in MS Windows
  *
  *  Copyright (c) 2002 Steve Lhomme <steve.lhomme at free.fr>
  *
@@ -25,8 +25,8 @@
 	\version \$Id$
 */
 
-#if !defined(_DEBUG_H__INCLUDED_)
-#define _DEBUG_H__INCLUDED_
+#if !defined(LAME_ACM_ADEBUG_H)
+#define LAME_ACM_ADEBUG_H
 
 #define DEBUG_LEVEL_CREATION 0
 
@@ -35,5 +35,5 @@
 #define DEBUG_LEVEL_FUNC_DEBUG 2
 #define DEBUG_LEVEL_FUNC_CODE 3
 
-#endif /* !defined(_DEBUG_H__INCLUDED_) */
+#endif /* !defined(LAME_ACM_ADEBUG_H) */
 

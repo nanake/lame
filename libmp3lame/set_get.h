@@ -18,8 +18,8 @@
  * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307, USA.
  */
 
-#ifndef __SET_GET_H__
-#define __SET_GET_H__
+#ifndef LAME_SET_GET_H
+#define LAME_SET_GET_H
 
 #include <lame.h>
 
@@ -37,6 +37,7 @@ extern  "C" {
  */
 /*presets*/
     int     apply_preset(lame_global_flags *, int preset, int enforce);
+    int     preset_is_known(int preset);
 
 /* scalefactors scale */
     int CDECL lame_set_sfscale(lame_global_flags *, int);
@@ -65,12 +66,10 @@ extern  "C" {
  * Internal/developer tuning options that NO library code calls - reachable only
  * from the frontend, and only when it is built with the internal options
  * enabled (--enable-internal, alpha only; frontend/parse.c compiles the
- * corresponding switches to no-ops otherwise). Gated on the same macro so the
- * prototypes are not even visible in a normal build, matching the frontend.
- * These symbols are not exported from the shared library, so an
- * internal-options frontend links the static archive.
+ * corresponding switches to no-ops otherwise). These symbols are not exported
+ * from the shared library, so an internal-options frontend links the static
+ * archive.
  */
-#if defined _ALLOW_INTERNAL_OPTIONS
 
 /* combined short-block threshold setter (lrm+s in one call) */
     int CDECL lame_set_short_threshold(lame_global_flags *, float, float);
@@ -86,8 +85,6 @@ extern  "C" {
     int CDECL lame_get_subblock_gain(const lame_global_flags *);
 
     void CDECL lame_set_tune(lame_t, float); /* FOR INTERNAL USE ONLY */
-
-#endif /* _ALLOW_INTERNAL_OPTIONS */
 
 
 #if defined(__cplusplus)

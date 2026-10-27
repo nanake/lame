@@ -36,7 +36,6 @@
 #define VALUE_STEREO_MODE           "Stereo Mode"
 #define VALUE_FORCE_MS              "Force MS"
 
-#define VALUE_LAYER                 "Layer"
 #define VALUE_ORIGINAL              "Original"
 #define VALUE_COPYRIGHT             "Copyright"
 #define VALUE_CRC                   "CRC"
@@ -52,6 +51,9 @@
 #define VALUE_DISABLE_SHORT_BLOCK   "No Short Block"
 #define VALUE_XING_TAG              "Xing Tag"
 #define VALUE_MODE_FIXED            "Mode Fixed"
+#define VALUE_PRIVATE               "Private"
+#define VALUE_RESERVOIR             "Bit Reservoir"
+#define VALUE_AVERAGE_BITRATE       "Average Bitrate"
 
 
 typedef struct 
@@ -91,13 +93,13 @@ class CMpegAudEncOutPin;
 class CMpegAudEncPropertyPage;
 class CMpegAudEnc : public CTransformFilter,
                     public ISpecifyPropertyPages,
-                    public IAudioEncoderProperties,
+                    public IAudioEncoderProperties2,
                     public CPersistStream
 {
 public:
     DECLARE_IUNKNOWN
 
-    static CUnknown *CreateInstance(LPUNKNOWN lpunk, HRESULT *phr);
+    static CUnknown * WINAPI CreateInstance(LPUNKNOWN lpunk, HRESULT *phr);
 
     LPAMOVIESETUP_FILTER GetSetupData();
 
@@ -129,8 +131,6 @@ public:
     STDMETHODIMP get_PESOutputEnabled(DWORD *dwEnabled);    // PES header. Obsolete
     STDMETHODIMP set_PESOutputEnabled(DWORD dwEnabled);     // PES header. Obsolete
 
-    STDMETHODIMP get_MPEGLayer(DWORD *dwLayer);
-    STDMETHODIMP set_MPEGLayer(DWORD dwLayer);
 
     STDMETHODIMP get_Bitrate(DWORD *dwBitrate);
     STDMETHODIMP set_Bitrate(DWORD dwBitrate);   
@@ -182,6 +182,16 @@ public:
     STDMETHODIMP get_SampleOverlap(DWORD *dwFlag);
     STDMETHODIMP set_SampleOverlap(DWORD dwFlag);
 
+    // IAudioEncoderProperties2
+    STDMETHODIMP get_PrivateFlag(DWORD *dwFlag);
+    STDMETHODIMP set_PrivateFlag(DWORD dwFlag);
+    STDMETHODIMP get_BitReservoir(DWORD *dwFlag);
+    STDMETHODIMP set_BitReservoir(DWORD dwFlag);
+    STDMETHODIMP get_Average(DWORD *dwFlag);
+    STDMETHODIMP set_Average(DWORD dwFlag);
+    STDMETHODIMP get_AverageBitrate(DWORD *dwBitrate);
+    STDMETHODIMP set_AverageBitrate(DWORD dwBitrate);
+
     STDMETHODIMP get_ParameterBlockSize(BYTE *pcBlock, DWORD *pdwSize);
     STDMETHODIMP set_ParameterBlockSize(BYTE *pcBlock, DWORD dwSize);
 
@@ -195,6 +205,7 @@ public:
     // CPersistStream
     HRESULT WriteToStream(IStream *pStream);
     HRESULT ReadFromStream(IStream *pStream);
+    DWORD GetSoftwareVersion(void);
 
     int SizeMax();
     STDMETHODIMP GetClassID(CLSID *pClsid);
@@ -203,8 +214,14 @@ private:
     CMpegAudEnc(LPUNKNOWN lpunk, HRESULT *phr);
 
     HRESULT FlushEncodedSamples();
+    HRESULT FlushStream();
+    HRESULT FlushFrames();
+    IStream * DownstreamStream();
+    void ResetTimes();
 
     void ReadPresetSettings(MPEG_ENCODER_CONFIG *pmec);
+    HRESULT GetConfigField(DWORD MPEG_ENCODER_CONFIG::*field, DWORD *value, LPCTSTR name);
+    HRESULT SetConfigField(DWORD MPEG_ENCODER_CONFIG::*field, DWORD value, LPCTSTR name);
 
     void LoadOutputCapabilities(DWORD sample_rate);
 
@@ -227,6 +244,7 @@ private:
     int                         m_sync_out_idx;
 
     BOOL                        m_hasFinished;
+    BOOL                        m_restartEncoder;  ///< a flush closed the encoder; the next sample starts a new one
 
     CCritSec                    m_cs;
 

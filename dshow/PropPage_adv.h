@@ -20,11 +20,11 @@
  * Boston, MA 02111-1307, USA.
  */
 
-class CMpegAudEncPropertyPageAdv : public CBasePropertyPage 
+class CMpegAudEncPropertyPageAdv : public CSystemFontPropertyPage
 {
 
 public:
-    static CUnknown *CreateInstance( LPUNKNOWN punk, HRESULT *phr );
+    static CUnknown * WINAPI CreateInstance( LPUNKNOWN punk, HRESULT *phr );
     CMpegAudEncPropertyPageAdv( LPUNKNOWN punk, HRESULT *phr );
 
     HRESULT OnConnect(IUnknown *pUnknown);
@@ -32,7 +32,7 @@ public:
     HRESULT OnActivate();
     HRESULT OnDeactivate();
     HRESULT OnApplyChanges();
-    BOOL OnReceiveMessage(HWND hwnd,UINT uMsg,WPARAM wParam,LPARAM lParam);
+    INT_PTR OnReceiveMessage(HWND hwnd,UINT uMsg,WPARAM wParam,LPARAM lParam);
 
 private:
     void    InitPropertiesDialog(HWND hwndParent);
@@ -40,14 +40,11 @@ private:
     void    SetDirty(void);
 
     DWORD   m_dwEnforceVBRmin;
-    DWORD   m_dwVoiceMode;
     DWORD   m_dwKeepAllFreq;
     DWORD   m_dwStrictISO;
-    DWORD   m_dwNoShortBlock;
     DWORD   m_dwXingTag;
     DWORD   m_dwChannelMode;
     DWORD   m_dwForceMS;
-    DWORD   m_dwModeFixed;
     DWORD   m_dwOverlap;
     DWORD   m_dwSetStop;
 

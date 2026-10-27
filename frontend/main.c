@@ -92,6 +92,19 @@ char   *strchr(), *strrchr();
 #endif
 
 
+#ifndef HAVE_STRNLEN
+size_t
+lame_strnlen(char const* s, size_t n)
+{
+    size_t  i;
+
+    for (i = 0; i < n && s[i] != '\0'; ++i) {
+    }
+    return i;
+}
+#endif
+
+
 static int c_main(int argc, char *argv[]);
 extern int lame_main(lame_t gf, int argc, char *argv[]);
 
@@ -106,38 +119,12 @@ extern int lame_main(lame_t gf, int argc, char *argv[]);
 ************************************************************************/
 
 
-#if defined( _WIN32 ) && !defined(__MINGW32__)
-static void
-set_process_affinity()
-{
-#if 0
-    /* rh 061207
-       the following fix seems to be a workaround for a problem in the
-       parent process calling LAME. It would be better to fix the broken
-       application => code disabled.
-     */
-#if defined(_WIN32)
-    /* set affinity back to all CPUs.  Fix for EAC/lame on SMP systems from
-       "Todd Richmond" <todd.richmond@openwave.com> */
-    typedef BOOL(WINAPI * SPAMFunc) (HANDLE, DWORD_PTR);
-    SPAMFunc func;
-    SYSTEM_INFO si;
-
-    if ((func = (SPAMFunc) GetProcAddress(GetModuleHandleW(L"KERNEL32.DLL"),
-                                          "SetProcessAffinityMask")) != NULL) {
-        GetSystemInfo(&si);
-        func(GetCurrentProcess(), si.dwActiveProcessorMask);
-    }
-#endif
-#endif
-}
-#endif
-
 #if defined(WIN32)
 
 /**
- *  Long Filename support for the WIN32 platform
- *
+ *  Replaces the last part of @p filename, in place, with its long Windows
+ *  file name. If the file is not found, or the long name does not fit,
+ *  @p filename is not changed.
  */
 
 void
@@ -151,7 +138,7 @@ dosToLongFileName(char *filename)
         size_t  namelen, prefix;
 
         FindClose(h);
-        namelen = strnlen(lpFindFileData.cFileName, sizeof(lpFindFileData.cFileName));
+        namelen = lame_strnlen(lpFindFileData.cFileName, sizeof(lpFindFileData.cFileName));
         if (namelen == 0 || namelen >= sizeof(lpFindFileData.cFileName))
             return;             /* empty, or not terminated within the field */
 
@@ -323,8 +310,6 @@ char* mbsToMbs(const char* str, int cp_from, int cp_to)
   return 0;
 }
 
-enum { cp_utf8, cp_console, cp_actual };
-
 wchar_t *utf8ToUnicode(const char *mbstr)
 {
   return mbsToUnicode(mbstr, CP_UTF8);
@@ -345,16 +330,6 @@ char* utf8ToConsole8Bit(const char* str)
   return mbsToMbs(str, CP_UTF8, GetConsoleOutputCP());
 }
 
-char* local8BitToUtf8(const char* str)
-{
-  return mbsToMbs(str, CP_ACP, CP_UTF8);
-}
-
-char* console8BitToUtf8(const char* str)
-{
-  return mbsToMbs(str, GetConsoleOutputCP(), CP_UTF8);
-}
- 
 char* utf8ToLatin1(char const* str)
 {
   return mbsToMbs(str, CP_UTF8, 28591); /* Latin-1 is code page 28591 */
@@ -442,7 +417,6 @@ FILE* lame_fopen(char const* file, char const* mode)
     return fh;
 }
 
-#if !defined(__MINGW32__)
 char* lame_getenv(char const* var)
 {
     char* str = 0;
@@ -456,16 +430,6 @@ char* lame_getenv(char const* var)
     free(wvar);
     return str;
 }
-#else
-char* lame_getenv(char const* var)
-{
-    char* str = getenv(var);
-    if (str) {
-        return strdup(str);
-    }
-    return 0;
-}
-#endif
 
 #else
 
@@ -474,6 +438,14 @@ FILE* lame_fopen(char const* file, char const* mode)
     return fopen(file, mode);
 }
 
+int main(int argc, char *argv[])
+{
+    return c_main(argc, argv);
+}
+
+#endif
+
+#if !defined(_WIN32)
 char* lame_getenv(char const* var)
 {
     char* str = getenv(var);
@@ -482,12 +454,6 @@ char* lame_getenv(char const* var)
     }
     return 0;
 }
-
-int main(int argc, char *argv[])
-{
-    return c_main(argc, argv);
-}
-
 #endif
 
 
@@ -508,9 +474,6 @@ c_main(int argc, char *argv[])
 
     /* This prevents SIGFPE */
     _control87(MCW_EM, MCW_EM);
-#endif
-#if defined( _WIN32 ) && !defined(__MINGW32__)
-    set_process_affinity();
 #endif
 
     frontend_open_console();    

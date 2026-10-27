@@ -1,31 +1,32 @@
 /**
  * @file
  * @ingroup unit_tests
- * @brief Unit tests for the frame headers the encoder buffers before writing
- *        them (libmp3lame/bitstream.c).
+ * @brief Unit tests for the frame headers that the encoder buffers before it
+ *        writes them (libmp3lame/bitstream.c).
  *
- * A frame's header is produced when the frame is encoded but written when the
- * stream reaches the header's own position, so headers wait in between. How
- * many wait at once is the bit reservoir divided by what a frame has room for
- * beyond its own side info - a quantity that stays at one or two for ordinary
- * settings and reaches the hundreds at the format's low end, where an MPEG-2
- * frame at 8 kbit/s and 24 kHz is 24 bytes carrying 23 bytes of side info for
- * two channels with CRC. Silence spends none of the remaining byte, so a
- * silent lead-in fills the reservoir and leaves a header waiting for every
- * eight bits of it.
+ * The encoder produces the header of a frame when it encodes the frame. It
+ * writes the header when the output gets to the position of that header. In
+ * between, the header waits in a buffer. The number of waiting headers is the
+ * bit reservoir divided by the room that a frame has beyond its own side
+ * info. For ordinary settings this number is one or two. At the low end of
+ * the format it is in the hundreds. An MPEG-2 frame at 8 kbit/s and 24 kHz is
+ * 24 bytes. With two channels and CRC, 23 of these bytes are side info.
+ * Silence uses none of the remaining byte. So a silent lead-in fills the
+ * reservoir, and one header waits for every eight bits of it.
  *
- * That is ordinary input - a recording that starts with a gap - and the first
- * test encodes it. The second is an everyday encode, which must be unaffected
- * and which is what says the first one's result is about the settings rather
- * than about the test having encoded nothing.
+ * This is ordinary input: a recording that starts with a gap. The first test
+ * encodes it. The second test is an everyday encode, which must not be
+ * affected. The second test also shows that the result of the first test
+ * comes from its settings. It does not come from a test that encoded nothing.
  *
- * Both ask the same two things: that the encoder reports no error, and that
- * every byte it produced belongs to a frame. The second matters because the
- * failure this guards against is silent - the encoder reports once and carries
- * on writing a stream whose framing it has lost, so a test that only watched
- * for a return code would see a clean encode.
+ * Both tests check the same two things. The encoder reports no error. And
+ * every byte that it produced belongs to a frame. The second check matters
+ * because the failure is silent. The encoder reports once and then continues
+ * to write a stream that has lost its framing. A test that only checks a
+ * return code sees a clean encode.
  *
- * Library-level tests: they link libmp3lame and call the exported API directly.
+ * These are library-level tests. They link libmp3lame and call the exported
+ * API directly.
  */
 
 #ifdef HAVE_CONFIG_H
@@ -41,91 +42,39 @@
 
 #include <cmocka.h>
 
+#include "test_report.h"
+#include "test_encode.h"
+#include "mp3frame.h"
+
 #include "test_unused.h"
 
 #include "lame.h"
 
 /** Samples in an MPEG-2 layer III frame. */
 #define SAMPLES_PER_FRAME 576
-/** Frames of digital silence before the audio starts. One more than the
- *  headers that can be waiting at once, which is where the demand peaks. */
+/** Frames of digital silence before the audio starts. The value is above 256,
+ *  the peak number of header slots that the low-bitrate setting needs. */
 #define SILENT_FRAMES     260
-/** Frames of ordinary audio after it, which is what spends the reservoir. */
+/** Frames of ordinary audio after the silence. These frames spend the reservoir. */
 #define SIGNAL_FRAMES     40
-#define MP3BUF_SIZE       (5 * SAMPLES_PER_FRAME / 4 + 7200)
-/** Room for the whole encode, generously: the loud control is the large one. */
+/** Buffer size for the whole encode, with a large margin. The 128 kbit/s control produces the largest stream. */
 #define STREAM_SIZE       (256 * 1024)
 
-/** Messages the encoder reported through its error callback. */
-static int error_messages;
-/** The first of them, for a failure that says what happened. */
-static char first_message[200];
-
 /**
- * @brief Records that the encoder reported something.
- *
- * The format string carries the whole text in this library - the messages
- * under test take no arguments - so it is kept as it stands rather than
- * formatted, which keeps the callback free of varargs handling.
- */
-static void
-count_error_message(const char *format, LAME_UNUSED va_list ap)
-{
-    if (error_messages == 0 && format != NULL) {
-        strncpy(first_message, format, sizeof first_message - 1);
-        first_message[sizeof first_message - 1] = '\0';
-    }
-    error_messages++;
-}
-
-/** The layer III bitrates, in kbit/s, indexed as the header holds them. */
-static int const bitrate_mpeg1[15] = {
-    0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320
-};
-static int const bitrate_mpeg2[15] = {
-    0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160
-};
-/** Sample rates by the header's version and rate fields. */
-static long const samplerates[4][3] = {
-    {11025, 12000, 8000},       /* MPEG-2.5 */
-    {0, 0, 0},                  /* reserved */
-    {22050, 24000, 16000},      /* MPEG-2 */
-    {44100, 48000, 32000}       /* MPEG-1 */
-};
-
-/**
- * @brief Length in bytes of the frame whose header starts at @p h, or 0 if
- *        that is not a layer III header.
+ * @brief Returns the length in bytes of the frame whose header starts at
+ *        @p h. Returns 0 if that is not a layer III header.
  */
 static int
 frame_length(unsigned char const *h)
 {
-    int const version = (h[1] >> 3) & 3;
-    int const layer = (h[1] >> 1) & 3;
-    int const bitrate_index = (h[2] >> 4) & 15;
-    int const rate_index = (h[2] >> 2) & 3;
-    int const padding = (h[2] >> 1) & 1;
-    int     kbps;
-    long    rate;
-
-    if (h[0] != 0xff || (h[1] & 0xe0) != 0xe0)
+    if (!mp3_is_frame_sync(h) || !mp3_is_layer3(h))
         return 0;
-    if (layer != 1 || version == 1) /* layer III, and not the reserved version */
-        return 0;
-    if (bitrate_index == 0 || bitrate_index == 15 || rate_index == 3)
-        return 0;
-    kbps = version == 3 ? bitrate_mpeg1[bitrate_index]
-        : bitrate_mpeg2[bitrate_index];
-    rate = samplerates[version][rate_index];
-    if (kbps == 0 || rate == 0)
-        return 0;
-    /* 1152 samples a frame in MPEG-1, 576 in the others */
-    return (int) ((version == 3 ? 144000L : 72000L) * kbps / rate) + padding;
+    return mp3_frame_length(h);
 }
 
 /**
- * @brief Follows the frame chain from the first byte, the way a stream parser
- *        does: each frame's length says where the next header must be.
+ * @brief Follows the frame chain from the first byte, as a stream parser
+ *        does. The length of each frame says where the next header must be.
  * @param mp3,len the encoded stream.
  * @param frames set to the number of frames the chain covers.
  * @return the offset of the first byte that is not where a frame header was
@@ -149,58 +98,48 @@ walk_frames(unsigned char const *mp3, int len, int *frames)
 }
 
 /**
- * @brief Encodes @p silent frames of digital silence followed by @p loud
- *        frames of a tone, with the settings the caller has already made.
- * @return the number of bytes collected in @p mp3.
+ * @brief Encodes @p silent frames of digital silence and then @p loud frames
+ *        of a sawtooth tone. Uses the settings that the caller has made.
+ * @return the number of bytes stored in @p mp3.
  */
 static int
 encode(lame_t gfp, int silent, int loud, unsigned char *mp3, int mp3_size)
 {
-    unsigned char frame[MP3BUF_SIZE];
-    short   left[SAMPLES_PER_FRAME];
-    short   right[SAMPLES_PER_FRAME];
-    int     collected = 0;
+    static short left[(SILENT_FRAMES + SIGNAL_FRAMES) * SAMPLES_PER_FRAME];
+    static short right[(SILENT_FRAMES + SIGNAL_FRAMES) * SAMPLES_PER_FRAME];
     int     i, f, rc;
 
+    assert_true(silent + loud <= SILENT_FRAMES + SIGNAL_FRAMES);
     memset(left, 0, sizeof left);
     memset(right, 0, sizeof right);
-    for (f = 0; f < silent + loud; f++) {
-        if (f == silent) {
-            for (i = 0; i < SAMPLES_PER_FRAME; i++) {
-                /* a loud sawtooth: it costs bits in every band, which is what
-                   makes the frame spend from the reservoir the silence filled */
-                short const v = (short) (12000 - 48 * (i % 500));
+    for (f = silent; f < silent + loud; f++) {
+        for (i = 0; i < SAMPLES_PER_FRAME; i++) {
+            /* a loud sawtooth: it costs bits in every band, which is what
+               makes the frame spend from the reservoir the silence filled */
+            short const v = (short) (12000 - 48 * (i % 500));
 
-                left[i] = v;
-                right[i] = (short) -v;
-            }
+            left[f * SAMPLES_PER_FRAME + i] = v;
+            right[f * SAMPLES_PER_FRAME + i] = (short) -v;
         }
-        rc = lame_encode_buffer(gfp, left, right, SAMPLES_PER_FRAME,
-                                frame, (int) sizeof frame);
-        assert_true(rc >= 0);
-        assert_true(collected + rc <= mp3_size);
-        memcpy(mp3 + collected, frame, (size_t) rc);
-        collected += rc;
     }
-    rc = lame_encode_flush(gfp, frame, (int) sizeof frame);
+    rc = encode_collect(gfp, left, right, SAMPLES_PER_FRAME, silent + loud, SAMPLES_PER_FRAME,
+                        mp3, mp3_size);
     assert_true(rc >= 0);
-    assert_true(collected + rc <= mp3_size);
-    memcpy(mp3 + collected, frame, (size_t) rc);
-    return collected + rc;
+    return rc;
 }
 
 /**
- * @brief Prepares an encoder that reports through #count_error_message.
+ * @brief Creates an encoder instance that reports errors through
+ *        report_capture().
  */
 static lame_t
 new_encoder(void)
 {
     lame_t  gfp = lame_init();
 
-    error_messages = 0;
-    first_message[0] = '\0';
+    report_reset();
     assert_non_null(gfp);
-    assert_int_equal(lame_set_errorf(gfp, count_error_message), 0);
+    assert_int_equal(lame_set_errorf(gfp, report_capture), 0);
     assert_int_equal(lame_set_num_channels(gfp, 2), 0);
     assert_int_equal(lame_set_in_samplerate(gfp, 24000), 0);
     /* The tag frame is written by the caller, not by the encoder, so asking
@@ -210,20 +149,45 @@ new_encoder(void)
 }
 
 /**
- * @brief A silent lead-in does not cost the file its framing.
+ * @brief Encodes a silent lead-in and a signal, and checks that the stream is
+ *        whole MPEG frames. Closes the encoder.
+ * @param gfp  the encoder instance, after lame_init_params().
  *
- * MPEG-2 at 8 kbit/s and 24 kHz, two channels, CRC on: one byte of room per
- * frame beyond the side info, so 260 silent frames leave more headers waiting
- * than a ring of 256 slots can hold while also taking the next one. What that
- * used to produce was an encoder that reported once, returned success, and
- * wrote a further 255 frames' worth of audio with no frame headers in it.
+ * Every byte belongs to a frame, and there are as many frames as were
+ * encoded. The second half is what a stream of the right length that carries
+ * no headers would fail.
+ */
+static void
+assert_framed(lame_t gfp)
+{
+    static unsigned char mp3[STREAM_SIZE];
+    int     len, walked, frames;
+
+    len = encode(gfp, SILENT_FRAMES, SIGNAL_FRAMES, mp3, (int) sizeof mp3);
+    walked = walk_frames(mp3, len, &frames);
+
+    if (report_calls != 0)
+        fail_msg("the encoder reported %d message(s): %s", report_calls, report_text);
+    assert_int_equal(walked, len);
+    assert_true(frames >= SILENT_FRAMES);
+    assert_int_equal(lame_close(gfp), 0);
+}
+
+/**
+ * @brief Checks that a silent lead-in keeps the framing of the file.
+ *
+ * The settings are MPEG-2 at 8 kbit/s and 24 kHz, two channels, CRC on. A
+ * frame then has one byte of room beyond the side info. So up to 255 headers
+ * wait at once. The frame that is being encoded needs one more slot. So the
+ * 260 silent frames need 256 slots at the peak. A ring of 256 slots is one
+ * slot short. With a ring that is too small, the encoder reports an error
+ * once and returns success. It then writes about 255 frames of audio with no
+ * frame headers.
  */
 static void
 test_silent_lead_in_keeps_the_framing(LAME_UNUSED void **state)
 {
-    static unsigned char mp3[STREAM_SIZE];
     lame_t  gfp = new_encoder();
-    int     len, walked, frames;
 
     assert_int_equal(lame_set_out_samplerate(gfp, 24000), 0);
     assert_int_equal(lame_set_brate(gfp, 8), 0);
@@ -231,46 +195,25 @@ test_silent_lead_in_keeps_the_framing(LAME_UNUSED void **state)
     assert_int_equal(lame_set_error_protection(gfp, 1), 0);
     assert_int_equal(lame_init_params(gfp), 0);
 
-    len = encode(gfp, SILENT_FRAMES, SIGNAL_FRAMES, mp3, (int) sizeof mp3);
-    walked = walk_frames(mp3, len, &frames);
-
-    if (error_messages != 0)
-        fail_msg("the encoder reported %d message(s), the first being: %s",
-                 error_messages, first_message);
-    /* Every byte belongs to a frame, and there are as many frames as were
-       encoded - the second half of that is what a stream of the right length
-       carrying no headers would fail. */
-    assert_int_equal(walked, len);
-    assert_true(frames >= SILENT_FRAMES);
-    assert_int_equal(lame_close(gfp), 0);
+    assert_framed(gfp);
 }
 
 /**
- * @brief An everyday encode is unaffected.
+ * @brief Checks that an everyday encode keeps its framing.
  *
- * The control: it shows the two checks above pass on a stream that was really
- * produced, so the first test's result belongs to its settings rather than to
- * a walk over an empty buffer.
+ * This test is the control. It shows that the checks of assert_framed() pass
+ * on a stream that the encoder really produced. So the result of the first test
+ * comes from its settings, not from a walk over an empty buffer.
  */
 static void
 test_ordinary_encode_keeps_the_framing(LAME_UNUSED void **state)
 {
-    static unsigned char mp3[STREAM_SIZE];
     lame_t  gfp = new_encoder();
-    int     len, walked, frames;
 
     assert_int_equal(lame_set_brate(gfp, 128), 0);
     assert_int_equal(lame_init_params(gfp), 0);
 
-    len = encode(gfp, SILENT_FRAMES, SIGNAL_FRAMES, mp3, (int) sizeof mp3);
-    walked = walk_frames(mp3, len, &frames);
-
-    if (error_messages != 0)
-        fail_msg("the encoder reported %d message(s), the first being: %s",
-                 error_messages, first_message);
-    assert_int_equal(walked, len);
-    assert_true(frames >= SILENT_FRAMES);
-    assert_int_equal(lame_close(gfp), 0);
+    assert_framed(gfp);
 }
 
 int

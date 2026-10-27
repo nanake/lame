@@ -11,10 +11,17 @@
     </Project>
     <Project Path="vs_lame_acm_tinyxml.vcxproj">
     </Project>
+    <Project Path="vs_lame_acm_test.vcxproj">
+    </Project>
   </Folder>
   <Project Path="vs_lame_dshow.vcxproj">
+    <Build Project="false" />
+  </Project>
+  <Project Path="vs_lame_dshow_test.vcxproj">
+  </Project>
+  <Project Path="vs_lame_blade_test.vcxproj">
   </Project>
   <Project Path="vs_lame_test.vcxproj">
   </Project>
-  <Project Path="vs_libmp3lame.vcxproj" />
+  <Project Path="vs_libmp3lame_nodec.vcxproj" />
 </Solution>

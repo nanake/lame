@@ -3,17 +3,24 @@
  * @ingroup unit_tests
  * @brief Unit tests for the libmp3lame parameter API (set_get.c).
  *
- * set_get.c is almost entirely getter/setter pairs that the CLI frontend never
- * exercises: it drives the encoder through a handful of paths, so the coverage
- * harness leaves ~500 of its ~930 lines unexecuted (report/uncovered.txt). Those
- * lines are not dead - they are the public ABI every third-party caller uses -
- * so they are exactly what a unit test should pin down. Each function is probed
- * three ways where it applies: a valid round-trip, an invalid-@p gfp call (the
- * `is_lame_global_flags_valid` false branch, i.e. the `return -1` / default
- * tail), and an out-of-range value (the validation-reject branch). The first
- * pins behaviour; the latter two are the branches the frontend never reaches.
+ * set_get.c consists almost entirely of getter and setter pairs. The CLI
+ * frontend calls few of them, because it uses the encoder through only a few
+ * paths. The functions are still in use. Every third-party caller uses them as
+ * the public ABI. So a unit test must check them.
  *
- * Library-level tests: they link libmp3lame and call the exported API directly.
+ * Where it applies, the test checks each function in three ways:
+ * - A valid value: the getter returns what the setter stored.
+ * - An invalid @p gfp: this is the false branch of
+ *   `is_lame_global_flags_valid`, which returns -1 or the default value.
+ * - A value out of range: this is the branch where the validation rejects
+ *   the value.
+ *
+ * The first check fixes the behavior. The frontend never runs the other two
+ * branches.
+ *
+ * These are library-level tests. They link libmp3lame and call the exported
+ * API directly. With --enable-internal, the test links the static library, so
+ * that it can also call the internal setters.
  */
 
 #ifdef HAVE_CONFIG_H
@@ -22,6 +29,7 @@
 
 #include <stdarg.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <setjmp.h>
 #include <stdlib.h>
 #include <string.h>
@@ -29,6 +37,10 @@
 #include <limits.h>
 
 #include <cmocka.h>
+
+#include "test_fixture.h"
+#include "test_float_bits.h"
+#include "test_report.h"
 
 #include "lame.h"
 
@@ -63,13 +75,13 @@ extern Padding_type lame_get_padding_type(const lame_global_flags *);
  * Internal-only tuning setters. These are gated exactly as the frontend gates
  * them (frontend/parse.c): a normal build cannot reach them (release frontends
  * #define them to no-ops and the shared library does not export them), while a
- * build with _ALLOW_INTERNAL_OPTIONS pulls in the private set_get.h and calls
+ * build with LAME_INTERNAL_OPTIONS pulls in the private set_get.h and calls
  * the real functions. The tests below follow the same gate, so they are live
  * only in the developer/alpha configuration the functions themselves live in.
  * Reaching the (unexported) symbols additionally needs a static link - see the
  * test's Makefile.am entry.
  */
-#if defined _ALLOW_INTERNAL_OPTIONS
+#if defined LAME_INTERNAL_OPTIONS
 #define INTERNAL_OPTS 1
 #include "set_get.h"
 #else
@@ -92,24 +104,8 @@ extern Padding_type lame_get_padding_type(const lame_global_flags *);
 #define ASM_OPTIM_ARCH 0
 #endif
 
-/** @brief A fresh encoder context for each test; @p *state carries it. */
-static int
-gfp_setup(void **state)
-{
-    lame_t gfp = lame_init();
-    if (gfp == NULL)
-        return -1;
-    *state = gfp;
-    return 0;
-}
-
-static int
-gfp_teardown(void **state)
-{
-    lame_close((lame_t) *state);
-    return 0;
-}
-
+/** @brief Creates a new encoder instance for each test and stores it in
+ *         @p *state. */
 /* A value like 0.5 is exactly representable, so a stored-then-read float
    round-trips bit-for-bit and can be compared with ==. Computed results use an
    epsilon instead. (assert_float_equal is CMocka 2.0-only; the tree still
@@ -197,7 +193,6 @@ static const struct int_pair int_pairs[] = {
     { "ATHonly",               lame_set_ATHonly,               lame_get_ATHonly },
     { "ATHshort",              lame_set_ATHshort,              lame_get_ATHshort },
     { "noATH",                 lame_set_noATH,                 lame_get_noATH },
-    { "ATHtype",               lame_set_ATHtype,               lame_get_ATHtype },
     { "athaa_type",            lame_set_athaa_type,            lame_get_athaa_type },
 };
 
@@ -215,6 +210,32 @@ test_int_roundtrip(void **state)
         assert_int_equal(p->set(NULL, 7), -1);
         assert_int_equal(p->get(NULL), 0);
     }
+}
+
+/**
+ * @brief Checks that the ATH formula takes 0 to 5 and the default -1, and
+ *        refuses any other value, leaving the setting as it was.
+ *
+ * The LAME tag stores the formula in four bits. A value above 15 would change
+ * the flags beside them.
+ *
+ * @param state  the encoder instance of the fixture.
+ */
+static void
+test_athtype_range(void **state)
+{
+    lame_t gfp = (lame_t) *state;
+    int     t;
+
+    for (t = -1; t <= 5; ++t) {
+        assert_int_equal(lame_set_ATHtype(gfp, t), 0);
+        assert_int_equal(lame_get_ATHtype(gfp), t);
+    }
+    assert_int_equal(lame_set_ATHtype(gfp, 6), -1);
+    assert_int_equal(lame_set_ATHtype(gfp, 16), -1);
+    assert_int_equal(lame_set_ATHtype(gfp, -2), -1);
+    assert_int_equal(lame_get_ATHtype(gfp), 5);
+    assert_int_equal(lame_set_ATHtype(NULL, 2), -1);
 }
 
 /*
@@ -594,6 +615,78 @@ test_misc_setters(void **state)
     assert_int_equal(lame_set_preset(NULL, V2), -1);
 }
 
+/**
+ * @brief The settings a preset writes, as the getters report them.
+ */
+typedef struct {
+    int     vbr;            /**< lame_get_VBR() */
+    int     vbr_q;          /**< lame_get_VBR_q() */
+    int     vbr_mean;       /**< lame_get_VBR_mean_bitrate_kbps() */
+    int     brate;          /**< lame_get_brate() */
+    int     quality;        /**< lame_get_quality() */
+    int     lowpass;        /**< lame_get_lowpassfreq() */
+} preset_settings;
+
+/**
+ * @brief Reads the settings a preset writes.
+ * @param gfp  the encoder instance.
+ * @return the settings.
+ */
+static preset_settings
+read_preset_settings(lame_t gfp)
+{
+    preset_settings s;
+
+    s.vbr = (int) lame_get_VBR(gfp);
+    s.vbr_q = lame_get_VBR_q(gfp);
+    s.vbr_mean = lame_get_VBR_mean_bitrate_kbps(gfp);
+    s.brate = lame_get_brate(gfp);
+    s.quality = lame_get_quality(gfp);
+    s.lowpass = lame_get_lowpassfreq(gfp);
+    return s;
+}
+
+/**
+ * @brief lame_set_preset() returns -1 for a value that is no preset and
+ *        changes no setting; each kind of known value returns as documented.
+ *
+ * The values next to the known ranges are the ones a caller misses by one:
+ * below and above the bitrates, between and around the VBR quality steps,
+ * after the named presets.
+ *
+ * @param state  the encoder instance of the fixture.
+ */
+static void
+test_preset_unknown_rejected(void **state)
+{
+    static const int unknown[] = { 0, ABR_8 - 1, ABR_320 + 1, V9 - 1, V9 + 5, V0 + 1, 999,
+                                   MEDIUM_FAST + 1, -5 };
+    lame_t gfp = (lame_t) *state;
+    preset_settings before, after;
+    size_t i;
+
+    /* a known preset first, so that the settings are not the defaults */
+    assert_int_equal(lame_set_preset(gfp, V5), V5);
+    before = read_preset_settings(gfp);
+    for (i = 0; i < sizeof(unknown) / sizeof(unknown[0]); i++) {
+        assert_int_equal(lame_set_preset(gfp, unknown[i]), -1);
+        after = read_preset_settings(gfp);
+        assert_memory_equal(&after, &before, sizeof(before));
+    }
+
+    assert_int_equal(lame_set_preset(gfp, ABR_8), ABR_8);
+    assert_int_equal(lame_set_preset(gfp, 128), 128);
+    assert_int_equal(lame_set_preset(gfp, ABR_320), ABR_320);
+    assert_int_equal(lame_set_preset(gfp, V9), V9);
+    assert_int_equal(lame_set_preset(gfp, V0), V0);
+    assert_int_equal(lame_set_preset(gfp, STANDARD), V2);
+    assert_int_equal(lame_set_preset(gfp, R3MIX), V3);
+    assert_int_equal(lame_set_preset(gfp, MEDIUM_FAST), V4);
+    assert_int_equal(lame_set_preset(gfp, EXTREME), V0);
+    assert_int_equal(lame_set_preset(gfp, INSANE), 320);
+    assert_int_equal(lame_set_preset(NULL, V2), -1);
+}
+
 /*
  * ---- read-only getters (populated by lame_init_params) ----------------------
  * These read through internal_flags, so they need a configured encoder. They
@@ -641,6 +734,30 @@ test_readonly_getters(void **state)
     assert_int_equal(lame_get_noclipGainChange(NULL), 0);
     ASSERT_FLT_EXACT(lame_get_noclipScale(NULL), 0.0f);
     assert_int_equal(lame_get_maximum_number_of_samples(NULL, 65536), LAME_GENERICERROR);
+}
+
+/**
+ * @brief Checks that lame_get_size_mp3buffer() reports no error before the
+ *        first frame is encoded.
+ *
+ * It is a query. Right after lame_init_params() no frame header is written yet,
+ * and the getter must still return a size without calling the error callback.
+ *
+ * @param state the encoder instance from the fixture.
+ */
+static void
+test_size_mp3buffer_is_silent(void **state)
+{
+    lame_t gfp = (lame_t) *state;
+
+    assert_int_equal(lame_set_errorf(gfp, report_capture), 0);
+    assert_int_equal(lame_set_in_samplerate(gfp, 44100), 0);
+    assert_int_equal(lame_set_num_channels(gfp, 2), 0);
+    assert_int_equal(lame_set_brate(gfp, 128), 0);
+    assert_int_equal(lame_init_params(gfp), 0);
+    report_reset();
+    assert_true(lame_get_size_mp3buffer(gfp) > 0);
+    assert_int_equal(report_calls, 0);
 }
 
 /*
@@ -790,8 +907,9 @@ test_asm_optimizations_roundtrip(void **state)
  * size and returns it in an int, so every step of the estimate has to be
  * bounded to that int - the frame count, their product with the frame size,
  * and the resampled result. At 44.1 kHz stereo 128 kbps CBR the arithmetic is
- * fully determined (418 bytes per frame, no resampling), so both the ordinary
- * answers and the two ceilings can be asserted exactly.
+ * fully determined (418 bytes per frame, no resampling, and with the LAME tag
+ * frame off nothing waiting in the stream), so both the ordinary answers and
+ * the two ceilings can be asserted exactly.
  */
 static void
 test_maximum_number_of_samples(void **state)
@@ -802,12 +920,14 @@ test_maximum_number_of_samples(void **state)
     assert_int_equal(lame_set_num_channels(gfp, 2), 0);
     assert_int_equal(lame_set_brate(gfp, 128), 0);
     assert_int_equal(lame_set_VBR(gfp, vbr_off), 0);
+    assert_int_equal(lame_set_bWriteVbrTag(gfp, 0), 0);
     assert_int_equal(lame_init_params(gfp), 0);
 
-    /* ordinary buffers: 65536/418 = 156 frames, 268435456/418 = 642190,
-       1152 samples each - these must be reported exactly, not clamped */
-    assert_int_equal(lame_get_maximum_number_of_samples(gfp, 65536), 156 * 1152);
-    assert_int_equal(lame_get_maximum_number_of_samples(gfp, 268435456), 642190 * 1152);
+    /* ordinary buffers: 65536/418 = 156 frames, 268435456/418 = 642190, one
+       of them held back, 1152 samples each - these must be reported exactly,
+       not clamped */
+    assert_int_equal(lame_get_maximum_number_of_samples(gfp, 65536), 155 * 1152);
+    assert_int_equal(lame_get_maximum_number_of_samples(gfp, 268435456), 642189 * 1152);
 
     /* a buffer whose frame count still fits an int but whose sample count does
        not, and the largest buffer expressible at all: both report the ceiling
@@ -817,6 +937,372 @@ test_maximum_number_of_samples(void **state)
     assert_int_equal(lame_get_maximum_number_of_samples(gfp, (size_t) -1), INT_MAX);
 
     assert_int_equal(lame_get_maximum_number_of_samples(NULL, 65536), LAME_GENERICERROR);
+}
+
+/**
+ * @brief Checks that lame_init_params() rejects an output sample rate more
+ *        than 128 times the input sample rate.
+ *
+ * It accepts an output sample rate of exactly 128 times the input sample
+ * rate. The test covers both sources of the output sample rate. The caller
+ * can set it, or LAME can choose it. For a very low input sample rate, LAME
+ * chooses its lowest rate, 8 kHz.
+ *
+ * @param state cmocka fixture state (unused).
+ */
+static void
+test_upsampling_ratio_limit(void **state)
+{
+    static const struct {
+        int     in, out, accepted;
+    } cases[] = {
+        { 250, 32000, 1 },      /* 128 times */
+        { 249, 32000, 0 },      /* just over */
+        { 1, 44100, 0 },
+        { 100, 0, 1 },          /* picked: 8000 Hz, 80 times */
+        { 50, 0, 0 },           /* picked: 8000 Hz, 160 times */
+        { 8000, 48000, 1 },
+    };
+    size_t  c;
+    (void) state;
+    for (c = 0; c < sizeof cases / sizeof cases[0]; ++c) {
+        lame_t  gf = lame_init();
+        int     r;
+        assert_non_null(gf);
+        assert_int_equal(lame_set_in_samplerate(gf, cases[c].in), 0);
+        assert_int_equal(lame_set_out_samplerate(gf, cases[c].out), 0);
+        r = lame_init_params(gf);
+        if ((r >= 0) != cases[c].accepted)
+            fail_msg("%d Hz to %d Hz: lame_init_params() answered %d", cases[c].in, cases[c].out, r);
+        lame_close(gf);
+    }
+}
+
+/**
+ * @brief Checks that lame_init_params() rejects a minimum VBR bitrate above
+ *        the maximum, in every VBR mode.
+ *
+ * It accepts a minimum that is equal to the maximum. The comparison uses the
+ * bitrates after LAME rounds them to valid bitrates. At 22.05 kHz, a minimum
+ * of 256 becomes 160, which is still above a maximum of 128. At 11.025 kHz,
+ * both become 64.
+ *
+ * @param state cmocka fixture state (unused).
+ */
+static void
+test_vbr_floor_above_ceiling(void **state)
+{
+    static const vbr_mode modes[] = { vbr_abr, vbr_mt, vbr_rh, vbr_mtrh };
+    static const struct {
+        int     rate, floor_kbps, ceiling_kbps, accepted;
+    } cases[] = {
+        { 44100, 256, 128, 0 },
+        { 44100, 64, 8, 0 },    /* the ceiling snaps to 32 */
+        { 44100, 128, 128, 1 },
+        { 44100, 128, 256, 1 },
+        { 44100, 160, 0, 1 },   /* no ceiling asked for */
+        { 22050, 256, 128, 0 },
+        { 11025, 256, 128, 1 },
+    };
+    size_t  m, c;
+    (void) state;
+    for (m = 0; m < sizeof modes / sizeof modes[0]; ++m) {
+        for (c = 0; c < sizeof cases / sizeof cases[0]; ++c) {
+            lame_t  gf = lame_init();
+            int     r;
+            assert_non_null(gf);
+            assert_int_equal(lame_set_out_samplerate(gf, cases[c].rate), 0);
+            assert_int_equal(lame_set_VBR(gf, modes[m]), 0);
+            assert_int_equal(lame_set_VBR_min_bitrate_kbps(gf, cases[c].floor_kbps), 0);
+            assert_int_equal(lame_set_VBR_max_bitrate_kbps(gf, cases[c].ceiling_kbps), 0);
+            r = lame_init_params(gf);
+            if ((r >= 0) != cases[c].accepted)
+                fail_msg("mode %d, %d Hz, floor %d, ceiling %d kbps: lame_init_params() answered %d",
+                         (int) modes[m], cases[c].rate, cases[c].floor_kbps, cases[c].ceiling_kbps, r);
+            lame_close(gf);
+        }
+    }
+}
+
+/**
+ * @brief Checks that lame_init_params() handles INT_MIN and INT_MAX as the
+ *        bitrates and the lowpass frequency.
+ *
+ * Under UBSan with halt_on_error, any arithmetic overflow fails this test.
+ * Without UBSan, the test checks that the settings are usable after the call.
+ * The bitrate must be from 0 to 320 kbps. The lowpass frequency must be
+ * within the output band.
+ *
+ * @param state cmocka fixture state (unused).
+ */
+static void
+test_extreme_int_settings(void **state)
+{
+    static const int values[] = { INT_MIN, INT_MAX };
+    size_t  v, s;
+    (void) state;
+    for (v = 0; v < sizeof values / sizeof values[0]; ++v) {
+        for (s = 0; s < 5; ++s) {
+            lame_t  gf = lame_init();
+            int     r;
+            assert_non_null(gf);
+            switch (s) {
+            case 0: (void) lame_set_brate(gf, values[v]); break;
+            case 1: (void) lame_set_VBR(gf, vbr_abr); (void) lame_set_VBR_mean_bitrate_kbps(gf, values[v]); break;
+            case 2: (void) lame_set_VBR(gf, vbr_mtrh); (void) lame_set_VBR_min_bitrate_kbps(gf, values[v]); break;
+            case 3: (void) lame_set_VBR(gf, vbr_mtrh); (void) lame_set_VBR_max_bitrate_kbps(gf, values[v]); break;
+            default: (void) lame_set_lowpassfreq(gf, values[v]); break;
+            }
+            r = lame_init_params(gf);
+            if (r >= 0) {
+                assert_true(lame_get_brate(gf) >= 0 && lame_get_brate(gf) <= 320);
+                assert_true(lame_get_lowpassfreq(gf) <= lame_get_out_samplerate(gf) / 2);
+            }
+            lame_close(gf);
+        }
+    }
+}
+
+/**
+ * @brief Checks that a very small compression ratio gives the highest
+ *        bitrate, not an overflow.
+ *
+ * The ratio is small enough to ask for more kbit/s than an int can store.
+ * Under UBSan with halt_on_error, an overflow in the conversion fails this
+ * test. In every build, the result must be the highest bitrate of the format.
+ *
+ * @param state cmocka fixture state (unused).
+ */
+static void
+test_tiny_compression_ratio(void **state)
+{
+    /* normal floats: a denormal could be flushed to 0 under fast maths */
+    static const float ratios[] = { 1e-30f, 1e-20f };
+    size_t  i;
+    (void) state;
+    for (i = 0; i < sizeof ratios / sizeof ratios[0]; ++i) {
+        lame_t  gf = lame_init();
+        assert_non_null(gf);
+        assert_int_equal(lame_set_compression_ratio(gf, ratios[i]), 0);
+        assert_true(lame_init_params(gf) >= 0);
+        assert_int_equal(lame_get_brate(gf), 320);
+        lame_close(gf);
+    }
+}
+
+/**
+ * @brief Checks that a VBR stream encodes under strict ISO when a CBR bitrate
+ *        far above the tables is also set.
+ *
+ * In VBR mode, the CBR bitrate is not the bitrate of the stream. The -b option
+ * of the frontend sets it together with the minimum VBR bitrate. The test
+ * encodes noise at an MPEG-2 sample rate and at an MPEG-1 sample rate. The bit
+ * reservoir is off, because lame_set_brate() turns it off above 320 kbps.
+ *
+ * @param state cmocka fixture state (unused).
+ */
+static void
+test_vbr_with_cbr_bitrate_beyond_tables(void **state)
+{
+    static const int rates[] = { 22050, 44100 };
+    static short pcm[2 * 1152];
+    static unsigned char mp3[LAME_MAXMP3BUFFER];
+    size_t  r;
+    int     i, f;
+    (void) state;
+    for (r = 0; r < sizeof rates / sizeof rates[0]; ++r) {
+        unsigned seed = 12345u;
+        lame_t  gf = lame_init();
+        assert_non_null(gf);
+        assert_int_equal(lame_set_in_samplerate(gf, rates[r]), 0);
+        assert_int_equal(lame_set_VBR(gf, vbr_mtrh), 0);
+        assert_int_equal(lame_set_brate(gf, 41536), 0);
+        assert_int_equal(lame_set_VBR_min_bitrate_kbps(gf, 41536), 0);
+        assert_int_equal(lame_set_strict_ISO(gf, 1), 0);
+        assert_true(lame_init_params(gf) >= 0);
+        for (f = 0; f < 20; ++f) {
+            for (i = 0; i < 2 * 1152; ++i) {
+                seed = seed * 1103515245u + 12345u;
+                pcm[i] = (short) (seed >> 16);
+            }
+            assert_true(lame_encode_buffer_interleaved(gf, pcm, 1152, mp3, sizeof mp3) >= 0);
+        }
+        assert_true(lame_encode_flush(gf, mp3, sizeof mp3) >= 0);
+        lame_close(gf);
+    }
+}
+
+/**
+ * @brief Checks that the floating point setters reject NaN and the
+ *        infinities, and keep the stored value.
+ *
+ * Each setter first gets a valid value, then a value that is not finite. The
+ * getter must still return the valid value. After this, an encode must run.
+ * lame_set_msfix() returns nothing, so for it the test checks only the
+ * getter.
+ *
+ * @param state cmocka fixture state (unused).
+ */
+static void
+test_float_setters_refuse_nonfinite(void **state)
+{
+    static const uint32_t bad_bits[] = { 0x7FC00000u, 0x7F800000u, 0xFF800000u };
+    static short pcm[1152 * 4];
+    static unsigned char mp3[16384];
+    size_t  b;
+    (void) state;
+    for (b = 0; b < sizeof bad_bits / sizeof bad_bits[0]; ++b) {
+        float const bad = float_from_bits(bad_bits[b]);
+        lame_t  gf = lame_init();
+        assert_non_null(gf);
+        assert_int_equal(lame_set_scale(gf, 0.5f), 0);
+        assert_int_equal(lame_set_scale(gf, bad), -1);
+        ASSERT_FLT_EXACT(lame_get_scale(gf), 0.5f);
+        assert_int_equal(lame_set_scale_left(gf, 0.5f), 0);
+        assert_int_equal(lame_set_scale_left(gf, bad), -1);
+        ASSERT_FLT_EXACT(lame_get_scale_left(gf), 0.5f);
+        assert_int_equal(lame_set_scale_right(gf, 0.5f), 0);
+        assert_int_equal(lame_set_scale_right(gf, bad), -1);
+        ASSERT_FLT_EXACT(lame_get_scale_right(gf), 0.5f);
+        assert_int_equal(lame_set_compression_ratio(gf, 11.0f), 0);
+        assert_int_equal(lame_set_compression_ratio(gf, bad), -1);
+        ASSERT_FLT_EXACT(lame_get_compression_ratio(gf), 11.0f);
+        lame_set_msfix(gf, 1.5);
+        lame_set_msfix(gf, (double) bad);
+        ASSERT_FLT_EXACT(lame_get_msfix(gf), 1.5f);
+        assert_int_equal(lame_set_VBR_quality(gf, 2.5f), 0);
+        assert_int_equal(lame_set_VBR_quality(gf, bad), -1);
+        ASSERT_FLT_NEAR(lame_get_VBR_quality(gf), 2.5f);
+        assert_int_equal(lame_set_ATHlower(gf, 3.0f), 0);
+        assert_int_equal(lame_set_ATHlower(gf, bad), -1);
+        ASSERT_FLT_EXACT(lame_get_ATHlower(gf), 3.0f);
+        assert_int_equal(lame_set_athaa_sensitivity(gf, -2.0f), 0);
+        assert_int_equal(lame_set_athaa_sensitivity(gf, bad), -1);
+        ASSERT_FLT_EXACT(lame_get_athaa_sensitivity(gf), -2.0f);
+        assert_int_equal(lame_set_num_channels(gf, 1), 0);
+        assert_true(lame_init_params(gf) >= 0);
+        assert_true(lame_encode_buffer(gf, pcm, pcm, (int) (sizeof pcm / sizeof pcm[0]), mp3, sizeof mp3) >= 0);
+        assert_true(lame_encode_flush(gf, mp3, sizeof mp3) >= 0);
+        lame_close(gf);
+    }
+}
+
+/**
+ * @brief Checks that the scaling factor setters accept a magnitude up to 4096,
+ *        and reject a larger one.
+ *
+ * After a rejected value, the getter returns the value stored before.
+ *
+ * @param state cmocka fixture state (unused).
+ */
+static void
+test_scale_setters_refuse_beyond_bound(void **state)
+{
+    static const float taken[] = { 4096.0f, -4096.0f, 0.0f };
+    static const float refused[] = { 4097.0f, -4097.0f, 1.e9f };
+    size_t  i;
+    lame_t  gf = lame_init();
+    (void) state;
+    assert_non_null(gf);
+    for (i = 0; i < sizeof taken / sizeof taken[0]; ++i) {
+        assert_int_equal(lame_set_scale(gf, taken[i]), 0);
+        ASSERT_FLT_EXACT(lame_get_scale(gf), taken[i]);
+        assert_int_equal(lame_set_scale_left(gf, taken[i]), 0);
+        ASSERT_FLT_EXACT(lame_get_scale_left(gf), taken[i]);
+        assert_int_equal(lame_set_scale_right(gf, taken[i]), 0);
+        ASSERT_FLT_EXACT(lame_get_scale_right(gf), taken[i]);
+    }
+    assert_int_equal(lame_set_scale(gf, 2.0f), 0);
+    assert_int_equal(lame_set_scale_left(gf, 2.0f), 0);
+    assert_int_equal(lame_set_scale_right(gf, 2.0f), 0);
+    for (i = 0; i < sizeof refused / sizeof refused[0]; ++i) {
+        assert_int_equal(lame_set_scale(gf, refused[i]), -1);
+        assert_int_equal(lame_set_scale_left(gf, refused[i]), -1);
+        assert_int_equal(lame_set_scale_right(gf, refused[i]), -1);
+    }
+    ASSERT_FLT_EXACT(lame_get_scale(gf), 2.0f);
+    ASSERT_FLT_EXACT(lame_get_scale_left(gf), 2.0f);
+    ASSERT_FLT_EXACT(lame_get_scale_right(gf), 2.0f);
+    lame_close(gf);
+}
+
+/**
+ * @brief Checks that lame_get_maximum_number_of_samples() keeps its promise.
+ *
+ * The promise: an encode call with that many samples never overflows the
+ * buffer size that the caller passed.
+ *
+ * The test calls the function before every encode call. The data that the
+ * encoder keeps changes from call to call:
+ * - The first call also returns what lame_init_params() wrote. This is the
+ *   ID3v2 tag and the LAME tag frame.
+ * - A resampling encoder returns the output of input that it kept back in the
+ *   call before.
+ *
+ * The input is white noise, which needs the most bits. The cases include
+ * resampling up to a ratio of 80, free format, and a tag with album art.
+ *
+ * @param state cmocka fixture state (unused).
+ */
+static void
+test_maximum_number_of_samples_holds(void **state)
+{
+    static const struct {
+        int     in, out, kbps, free_format, vbr, tag;
+    } cases[] = {
+        { 44100, 44100, 320, 0, 0, 0 },
+        { 44100, 44100, 0, 0, 1, 1 },
+        { 8000, 44100, 128, 0, 0, 1 },
+        { 11025, 32000, 640, 1, 0, 0 },
+        { 400, 32000, 32, 0, 0, 0 },
+        { 100, 8000, 64, 0, 0, 1 },
+    };
+    static short pcm_l[65536], pcm_r[65536];
+    static unsigned char mp3[16384], art[4096];
+    unsigned int s = 1;
+    size_t  c;
+    int     i;
+    (void) state;
+    for (i = 0; i < 65536; ++i) {
+        s = s * 1103515245u + 12345u;
+        pcm_l[i] = (short) (s >> 16);
+        s = s * 1103515245u + 12345u;
+        pcm_r[i] = (short) (s >> 16);
+    }
+    memcpy(art, "\x89PNG", 4);
+    for (c = 0; c < sizeof cases / sizeof cases[0]; ++c) {
+        lame_t  gf = lame_init();
+        int     call;
+        assert_non_null(gf);
+        assert_int_equal(lame_set_in_samplerate(gf, cases[c].in), 0);
+        assert_int_equal(lame_set_out_samplerate(gf, cases[c].out), 0);
+        assert_int_equal(lame_set_num_channels(gf, 2), 0);
+        assert_int_equal(lame_set_quality(gf, 7), 0);
+        if (cases[c].vbr) {
+            assert_int_equal(lame_set_VBR(gf, vbr_mtrh), 0);
+        }
+        else {
+            assert_int_equal(lame_set_brate(gf, cases[c].kbps), 0);
+            assert_int_equal(lame_set_free_format(gf, cases[c].free_format), 0);
+        }
+        if (cases[c].tag) {
+            id3tag_init(gf);
+            id3tag_add_v2(gf);
+            id3tag_set_title(gf, "a title");
+            assert_int_equal(id3tag_set_albumart(gf, (const char *) art, sizeof art), 0);
+        }
+        assert_int_equal(lame_init_params(gf), 0);
+        for (call = 0; call < 12; ++call) {
+            int const n = lame_get_maximum_number_of_samples(gf, sizeof mp3);
+            int     r;
+            assert_true(n > 0);
+            r = lame_encode_buffer(gf, pcm_l, pcm_r, n < 65536 ? n : 65536, mp3, sizeof mp3);
+            if (r < 0)
+                fail_msg("case %d, call %d: %d samples for %u bytes answered %d", (int) c, call, n,
+                         (unsigned int) sizeof mp3, r);
+        }
+        lame_close(gf);
+    }
 }
 
 /*
@@ -894,28 +1380,41 @@ int
 main(void)
 {
     const struct CMUnitTest tests[] = {
-        cmocka_unit_test_setup_teardown(test_boolean_validated, gfp_setup, gfp_teardown),
-        cmocka_unit_test_setup_teardown(test_int_roundtrip, gfp_setup, gfp_teardown),
-        cmocka_unit_test_setup_teardown(test_float_roundtrip, gfp_setup, gfp_teardown),
-        cmocka_unit_test_setup_teardown(test_ranges, gfp_setup, gfp_teardown),
-        cmocka_unit_test_setup_teardown(test_clamping, gfp_setup, gfp_teardown),
-        cmocka_unit_test_setup_teardown(test_side_effects, gfp_setup, gfp_teardown),
-        cmocka_unit_test_setup_teardown(test_deprecated_stubs, gfp_setup, gfp_teardown),
-        cmocka_unit_test_setup_teardown(test_decode_on_the_fly, gfp_setup, gfp_teardown),
-        cmocka_unit_test_setup_teardown(test_replaygain_decode, gfp_setup, gfp_teardown),
-        cmocka_unit_test_setup_teardown(test_num_samples, gfp_setup, gfp_teardown),
-        cmocka_unit_test_setup_teardown(test_misc_setters, gfp_setup, gfp_teardown),
-        cmocka_unit_test_setup_teardown(test_readonly_getters, gfp_setup, gfp_teardown),
-        cmocka_unit_test_setup_teardown(test_unset_markers, gfp_setup, gfp_teardown),
+        cmocka_unit_test_setup_teardown(test_boolean_validated, lame_fixture_setup, lame_fixture_teardown),
+        cmocka_unit_test_setup_teardown(test_int_roundtrip, lame_fixture_setup, lame_fixture_teardown),
+        cmocka_unit_test_setup_teardown(test_float_roundtrip, lame_fixture_setup, lame_fixture_teardown),
+        cmocka_unit_test_setup_teardown(test_ranges, lame_fixture_setup, lame_fixture_teardown),
+        cmocka_unit_test_setup_teardown(test_clamping, lame_fixture_setup, lame_fixture_teardown),
+        cmocka_unit_test_setup_teardown(test_side_effects, lame_fixture_setup, lame_fixture_teardown),
+        cmocka_unit_test_setup_teardown(test_deprecated_stubs, lame_fixture_setup, lame_fixture_teardown),
+        cmocka_unit_test_setup_teardown(test_decode_on_the_fly, lame_fixture_setup, lame_fixture_teardown),
+        cmocka_unit_test_setup_teardown(test_replaygain_decode, lame_fixture_setup, lame_fixture_teardown),
+        cmocka_unit_test_setup_teardown(test_num_samples, lame_fixture_setup, lame_fixture_teardown),
+        cmocka_unit_test_setup_teardown(test_misc_setters, lame_fixture_setup, lame_fixture_teardown),
+        cmocka_unit_test_setup_teardown(test_preset_unknown_rejected, lame_fixture_setup,
+                                        lame_fixture_teardown),
+        cmocka_unit_test_setup_teardown(test_readonly_getters, lame_fixture_setup, lame_fixture_teardown),
+        cmocka_unit_test_setup_teardown(test_size_mp3buffer_is_silent, lame_fixture_setup,
+                                        lame_fixture_teardown),
+        cmocka_unit_test_setup_teardown(test_unset_markers, lame_fixture_setup, lame_fixture_teardown),
         cmocka_unit_test_setup_teardown(test_athaa_type_explicit_choice_survives,
-                                        gfp_setup, gfp_teardown),
+                                        lame_fixture_setup, lame_fixture_teardown),
 #if ASM_OPTIM_ARCH
         cmocka_unit_test_setup_teardown(test_asm_optimizations_roundtrip,
-                                        gfp_setup, gfp_teardown),
+                                        lame_fixture_setup, lame_fixture_teardown),
 #endif
-        cmocka_unit_test_setup_teardown(test_maximum_number_of_samples, gfp_setup, gfp_teardown),
+        cmocka_unit_test_setup_teardown(test_maximum_number_of_samples, lame_fixture_setup, lame_fixture_teardown),
+        cmocka_unit_test(test_maximum_number_of_samples_holds),
+        cmocka_unit_test(test_upsampling_ratio_limit),
+        cmocka_unit_test(test_vbr_floor_above_ceiling),
+        cmocka_unit_test(test_float_setters_refuse_nonfinite),
+        cmocka_unit_test(test_scale_setters_refuse_beyond_bound),
+        cmocka_unit_test(test_extreme_int_settings),
+        cmocka_unit_test_setup_teardown(test_athtype_range, lame_fixture_setup, lame_fixture_teardown),
+        cmocka_unit_test(test_tiny_compression_ratio),
+        cmocka_unit_test(test_vbr_with_cbr_bitrate_beyond_tables),
 #if INTERNAL_OPTS
-        cmocka_unit_test_setup_teardown(test_internal_opts, gfp_setup, gfp_teardown),
+        cmocka_unit_test_setup_teardown(test_internal_opts, lame_fixture_setup, lame_fixture_teardown),
 #endif
     };
     return cmocka_run_group_tests(tests, NULL, NULL);

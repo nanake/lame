@@ -19,6 +19,12 @@
  * Boston, MA 02111-1307, USA.
  */
 
+/**
+ * \file
+ * \internal
+ * \brief Declarations of the vector routines and their compiler attributes.
+ */
+
 
 #ifndef LAME_INTRIN_H
 #define LAME_INTRIN_H
@@ -53,7 +59,7 @@
 
 
 void
-init_xrpow_core_sse(gr_info * const cod_info, FLOAT xrpow[576], int upper, FLOAT * sum);
+init_xrpow_core_sse(gr_info * const cod_info, FLOAT xrpow[SAMPLES_PER_GRANULE], int upper, FLOAT * sum);
 
 void
 fht_SSE2(FLOAT* , int);

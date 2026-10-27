@@ -22,13 +22,13 @@
  *  \brief The GTK4 mp3x application: window, menus and transport.
  *  \internal
  *
- *  The frontend drives the toolkit-independent analyzer engine in mp3x_core.c,
- *  displays the analyzer's eight plots via mp3x_plot.c, and owns the
- *  application and window lifecycle plus the File menu.
+ *  The frontend calls the analyzer engine in mp3x_core.c, shows the eight
+ *  graphs of the analyzer with mp3x_plot.c, and controls the application, the
+ *  window and the File menu.
  *
- *  The ownership and lifetime rules summarised below are set out in full, with
- *  the transport and end-of-input reasoning, on the \ref mp3x_internals page.
- *  What the program looks like to someone using it is the mp3x(1) manual page.
+ *  The \ref mp3x_internals page describes the ownership and lifetime rules,
+ *  and how playback and the end of the input work. The mp3x(1) manual page
+ *  describes the program for its users.
  */
 
 /*
@@ -82,6 +82,7 @@
 #include "parse.h"
 #include "get_audio.h"
 #include "console.h"
+#include "machine.h"
 #include "mp3x_core.h"
 #include "mp3x_plot.h"
 #include "mp3x_session.h"
@@ -120,7 +121,7 @@ struct Mp3xDriver {
     GMenuModel          *menubar;
     GtkCssProvider      *noncomposite_css;
     Mp3xSession         *session;              /* NULL when empty */
-    FrontendGlobalsBaseline baseline;          /* plain value data */
+    FrontendConfig baseline;          /* plain value data */
     FileDialogRequest   *open_request;         /* identity pointer; non-owning */
     FileDialogRequest   *save_request;         /* identity pointer; non-owning */
 
@@ -179,7 +180,7 @@ static void     mp3x_driver_refresh_for_empty  (Mp3xDriver *d);
 
 /* Accessors consumed by mp3x_session.c. */
 guint64                  mp3x_driver_next_generation(Mp3xDriver *d);
-FrontendGlobalsBaseline *mp3x_driver_baseline       (Mp3xDriver *d);
+FrontendConfig *mp3x_driver_baseline       (Mp3xDriver *d);
 
 
 /* ==========================================================================
@@ -273,7 +274,7 @@ mp3x_driver_next_generation(Mp3xDriver *d)
     return ++d->next_session_generation;
 }
 
-FrontendGlobalsBaseline *
+FrontendConfig *
 mp3x_driver_baseline(Mp3xDriver *d)
 {
     return &d->baseline;
@@ -484,6 +485,22 @@ make_all_files_filter(void)
     return f;
 }
 
+/**
+ * \internal
+ * \brief Returns whether a file dialog ended with an error that the user must
+ *        see. Closing or cancelling the dialog is not such an error.
+ *
+ * \param err  the error of the dialog's finish call.
+ * \return TRUE for an error to show, FALSE when the user closed or cancelled
+ *         the dialog.
+ */
+static gboolean
+file_dialog_failed(const GError *err)
+{
+    return !g_error_matches(err, GTK_DIALOG_ERROR, GTK_DIALOG_ERROR_DISMISSED)
+        && !g_error_matches(err, GTK_DIALOG_ERROR, GTK_DIALOG_ERROR_CANCELLED);
+}
+
 static void
 on_open_dialog_finished(GObject *source, GAsyncResult *res, gpointer user_data)
 {
@@ -501,10 +518,7 @@ on_open_dialog_finished(GObject *source, GAsyncResult *res, gpointer user_data)
     GFile   *gfile = gtk_file_dialog_open_finish(dlg, res, &err);
 
     if (gfile == NULL) {
-        /* GTK_DIALOG_ERROR_DISMISSED and GTK_DIALOG_ERROR_CANCELLED are
-           silent. Other errors get a modal dialog. */
-        if (!g_error_matches(err, GTK_DIALOG_ERROR, GTK_DIALOG_ERROR_DISMISSED) &&
-            !g_error_matches(err, GTK_DIALOG_ERROR, GTK_DIALOG_ERROR_CANCELLED)) {
+        if (file_dialog_failed(err)) {
             mp3x_driver_show_error(d, "Could not open file: %s", err->message);
         }
         g_clear_error(&err);
@@ -535,16 +549,15 @@ on_open_dialog_finished(GObject *source, GAsyncResult *res, gpointer user_data)
 }
 
 static void
-act_open(GSimpleAction *action, GVariant *parameter, gpointer user_data)
+act_open(LAME_UNUSED GSimpleAction *action, LAME_UNUSED GVariant *parameter, gpointer user_data)
 {
     Mp3xDriver *d = user_data;
     FileDialogRequest *req;
-    (void) action; (void) parameter;
 
     if (d->shutting_down)
         return;
 
-    req = request_new(d, /*is_save=*/FALSE, /*export_kind=*/0);
+    req = request_new(d, /*is_save=*/FALSE, /*export_kind=*/MP3X_GRAPH_COMPOSITE);
     if (req == NULL)
         return;
 
@@ -722,13 +735,12 @@ mp3x_recent_refresh(Mp3xDriver *d)
 }
 
 static void
-act_open_recent(GSimpleAction *action, GVariant *parameter, gpointer user_data)
+act_open_recent(LAME_UNUSED GSimpleAction *action, GVariant *parameter, gpointer user_data)
 {
     Mp3xDriver *d = user_data;
     const char *uri = g_variant_get_string(parameter, NULL);
     GFile      *gfile;
     GError     *err = NULL;
-    (void) action;
 
     if (d->shutting_down)
         return;
@@ -747,10 +759,9 @@ act_open_recent(GSimpleAction *action, GVariant *parameter, gpointer user_data)
  * ========================================================================== */
 
 static void
-act_close(GSimpleAction *action, GVariant *parameter, gpointer user_data)
+act_close(LAME_UNUSED GSimpleAction *action, LAME_UNUSED GVariant *parameter, gpointer user_data)
 {
     Mp3xDriver *d = user_data;
-    (void) action; (void) parameter;
     mp3x_driver_close_file(d);
 }
 
@@ -763,15 +774,15 @@ static const char *
 export_suffix(int export_kind)
 {
     switch (export_kind) {
-    case 0: return "screenshot";
-    case 1: return "pcm";
-    case 2: return "resynthesis";
-    case 3: return "mdct-0";
-    case 4: return "mdct-1";
-    case 5: return "psy-0";
-    case 6: return "psy-1";
-    case 7: return "scalefactors-0";
-    case 8: return "scalefactors-1";
+    case MP3X_GRAPH_COMPOSITE: return "screenshot";
+    case MP3X_GRAPH_PCM: return "pcm";
+    case MP3X_GRAPH_RESYNTH: return "resynthesis";
+    case MP3X_GRAPH_MDCT0: return "mdct-0";
+    case MP3X_GRAPH_MDCT1: return "mdct-1";
+    case MP3X_GRAPH_PSY0: return "psy-0";
+    case MP3X_GRAPH_PSY1: return "psy-1";
+    case MP3X_GRAPH_SFB0: return "scalefactors-0";
+    case MP3X_GRAPH_SFB1: return "scalefactors-1";
     default: return "audio";
     }
 }
@@ -824,15 +835,17 @@ perform_save_write(SaveWriteTask *task)
 
     /* Write the appropriate PNG. Each function is in mp3x_plot.c. */
     switch (task->export_kind) {
-    case 0: status = mp3x_plot_composite_write_png(task->path); break;
-    case 1: status = mp3x_plot_pcm_write_png(task->path, 600, 150); break;
-    case 2: status = mp3x_plot_resynth_write_png(task->path, 600, 150); break;
-    case 3: status = mp3x_plot_mdct_write_png(task->path, 0, 300, 150); break;
-    case 4: status = mp3x_plot_mdct_write_png(task->path, 1, 300, 150); break;
-    case 5: status = mp3x_plot_psy_write_png(task->path, 0, 300, 150); break;
-    case 6: status = mp3x_plot_psy_write_png(task->path, 1, 300, 150); break;
-    case 7: status = mp3x_plot_sfb_write_png(task->path, 0, 300, 150); break;
-    case 8: status = mp3x_plot_sfb_write_png(task->path, 1, 300, 150); break;
+    case MP3X_GRAPH_COMPOSITE:
+    case MP3X_GRAPH_PCM:
+    case MP3X_GRAPH_RESYNTH:
+    case MP3X_GRAPH_MDCT0:
+    case MP3X_GRAPH_MDCT1:
+    case MP3X_GRAPH_PSY0:
+    case MP3X_GRAPH_PSY1:
+    case MP3X_GRAPH_SFB0:
+    case MP3X_GRAPH_SFB1:
+        status = mp3x_plot_write_png((Mp3xGraph) task->export_kind, task->path);
+        break;
     default: status = CAIRO_STATUS_INVALID_STATUS; break;
     }
 
@@ -862,8 +875,7 @@ on_save_dialog_finished(GObject *source, GAsyncResult *res, gpointer user_data)
     GFile  *gfile = gtk_file_dialog_save_finish(dlg, res, &err);
 
     if (gfile == NULL) {
-        if (!g_error_matches(err, GTK_DIALOG_ERROR, GTK_DIALOG_ERROR_DISMISSED) &&
-            !g_error_matches(err, GTK_DIALOG_ERROR, GTK_DIALOG_ERROR_CANCELLED)) {
+        if (file_dialog_failed(err)) {
             mp3x_driver_show_error(d, "Could not save: %s", err->message);
         }
         g_clear_error(&err);
@@ -945,15 +957,25 @@ request_start_save(Mp3xDriver *d, int export_kind)
                          req);
 }
 
-static void act_screenshot   (GSimpleAction *a, GVariant *p, gpointer d) { (void)a;(void)p; request_start_save(d, 0); }
-static void act_export_pcm   (GSimpleAction *a, GVariant *p, gpointer d) { (void)a;(void)p; request_start_save(d, 1); }
-static void act_export_resynth(GSimpleAction*a, GVariant*p, gpointer d) { (void)a;(void)p; request_start_save(d, 2); }
-static void act_export_mdct0 (GSimpleAction *a, GVariant *p, gpointer d) { (void)a;(void)p; request_start_save(d, 3); }
-static void act_export_mdct1 (GSimpleAction *a, GVariant *p, gpointer d) { (void)a;(void)p; request_start_save(d, 4); }
-static void act_export_psy0  (GSimpleAction *a, GVariant *p, gpointer d) { (void)a;(void)p; request_start_save(d, 5); }
-static void act_export_psy1  (GSimpleAction *a, GVariant *p, gpointer d) { (void)a;(void)p; request_start_save(d, 6); }
-static void act_export_sfb0  (GSimpleAction *a, GVariant *p, gpointer d) { (void)a;(void)p; request_start_save(d, 7); }
-static void act_export_sfb1  (GSimpleAction *a, GVariant *p, gpointer d) { (void)a;(void)p; request_start_save(d, 8); }
+/**
+ * \internal
+ * \brief The win.export action: File > Save Screenshot and the items of
+ *        File > Export.
+ *
+ * \param a  the action.
+ * \param p  the target, an int32 Mp3xGraph. A value outside the enumeration
+ *           does nothing; the action can be activated from outside the menu.
+ * \param d  the driver.
+ */
+static void
+act_export(LAME_UNUSED GSimpleAction *a, GVariant *p, gpointer d)
+{
+    gint32 const graph = g_variant_get_int32(p);
+
+    if (graph < MP3X_GRAPH_COMPOSITE || graph > MP3X_GRAPH_SFB1)
+        return;
+    request_start_save(d, graph);
+}
 
 
 /* ==========================================================================
@@ -1137,15 +1159,15 @@ maybe_shot(Mp3xDriver *d)
         cairo_status_t shot_status_ = (call); \
         if (status == CAIRO_STATUS_SUCCESS) status = shot_status_; \
     } while (0)
-    if (path)  TEST_SHOT(mp3x_plot_pcm_write_png(path, 600, 150));
-    if (rpath) TEST_SHOT(mp3x_plot_resynth_write_png(rpath, 600, 150));
-    if (mpath) TEST_SHOT(mp3x_plot_mdct_write_png(mpath, 0, 300, 150));
-    if (mpath1) TEST_SHOT(mp3x_plot_mdct_write_png(mpath1, 1, 300, 150));
-    if (ppath) TEST_SHOT(mp3x_plot_psy_write_png(ppath, 0, 300, 150));
-    if (ppath1) TEST_SHOT(mp3x_plot_psy_write_png(ppath1, 1, 300, 150));
-    if (spath) TEST_SHOT(mp3x_plot_sfb_write_png(spath, 0, 300, 150));
-    if (spath1) TEST_SHOT(mp3x_plot_sfb_write_png(spath1, 1, 300, 150));
-    if (cpath) TEST_SHOT(mp3x_plot_composite_write_png(cpath));
+    if (path)  TEST_SHOT(mp3x_plot_write_png(MP3X_GRAPH_PCM, path));
+    if (rpath) TEST_SHOT(mp3x_plot_write_png(MP3X_GRAPH_RESYNTH, rpath));
+    if (mpath) TEST_SHOT(mp3x_plot_write_png(MP3X_GRAPH_MDCT0, mpath));
+    if (mpath1) TEST_SHOT(mp3x_plot_write_png(MP3X_GRAPH_MDCT1, mpath1));
+    if (ppath) TEST_SHOT(mp3x_plot_write_png(MP3X_GRAPH_PSY0, ppath));
+    if (ppath1) TEST_SHOT(mp3x_plot_write_png(MP3X_GRAPH_PSY1, ppath1));
+    if (spath) TEST_SHOT(mp3x_plot_write_png(MP3X_GRAPH_SFB0, spath));
+    if (spath1) TEST_SHOT(mp3x_plot_write_png(MP3X_GRAPH_SFB1, spath1));
+    if (cpath) TEST_SHOT(mp3x_plot_write_png(MP3X_GRAPH_COMPOSITE, cpath));
 #undef TEST_SHOT
     if (status != CAIRO_STATUS_SUCCESS) {
         d->analysis_failed = TRUE;
@@ -1198,8 +1220,8 @@ maybe_shot(Mp3xDriver *d)
     }
 }
 #else
-static void maybe_autoquit(Mp3xDriver *d) { (void) d; }
-static void maybe_shot(Mp3xDriver *d) { (void) d; }
+static void maybe_autoquit(LAME_UNUSED Mp3xDriver *d) { return; }
+static void maybe_shot(LAME_UNUSED Mp3xDriver *d) { return; }
 #endif
 
 
@@ -1408,18 +1430,18 @@ do_pause(Mp3xDriver *d)
 }
 
 static void
-on_playpause(GtkButton *btn, gpointer data)
+on_playpause(LAME_UNUSED GtkButton *btn, gpointer data)
 {
-    Mp3xDriver *d = data; (void) btn;
+    Mp3xDriver *d = data;
     Mp3xSession *s = d->session;
     if (s == NULL) return;
     if (s->running) do_pause(d); else do_play(d);
 }
 
 static void
-on_step(GtkButton *btn, gpointer data)
+on_step(LAME_UNUSED GtkButton *btn, gpointer data)
 {
-    Mp3xDriver *d = data; (void) btn;
+    Mp3xDriver *d = data;
     Mp3xSession *s = d->session;
     if (s == NULL || s->running) return;
     if (mp3x_core_disp_backpos() > 0) {
@@ -1433,9 +1455,9 @@ on_step(GtkButton *btn, gpointer data)
 }
 
 static void
-on_back(GtkButton *btn, gpointer data)
+on_back(LAME_UNUSED GtkButton *btn, gpointer data)
 {
-    Mp3xDriver *d = data; (void) btn;
+    Mp3xDriver *d = data;
     Mp3xSession *s = d->session;
     if (s == NULL) return;
     if (s->running) {
@@ -1457,17 +1479,15 @@ on_back(GtkButton *btn, gpointer data)
  * -------------------------------------------------------------------------- */
 
 static void
-activate_radio(GSimpleAction *action, GVariant *parameter, gpointer data)
+activate_radio(GSimpleAction *action, GVariant *parameter, LAME_UNUSED gpointer data)
 {
-    (void) data;
     g_action_change_state(G_ACTION(action), parameter);
 }
 
 static void
-activate_toggle(GSimpleAction *action, GVariant *parameter, gpointer data)
+activate_toggle(GSimpleAction *action, LAME_UNUSED GVariant *parameter, LAME_UNUSED gpointer data)
 {
     GVariant *state = g_action_get_state(G_ACTION(action));
-    (void) parameter; (void) data;
     g_action_change_state(G_ACTION(action),
                           g_variant_new_boolean(!g_variant_get_boolean(state)));
     g_variant_unref(state);
@@ -1577,14 +1597,117 @@ change_fullscreen_state(GSimpleAction *action, GVariant *state, gpointer data)
  * Menu transport wrappers - reuse the button handlers (which ignore button).
  * -------------------------------------------------------------------------- */
 
-static void act_playpause (GSimpleAction *a, GVariant *p, gpointer d){(void)a;(void)p;on_playpause(NULL,d);}
-static void act_step      (GSimpleAction *a, GVariant *p, gpointer d){(void)a;(void)p;on_step(NULL,d);}
-static void act_back      (GSimpleAction *a, GVariant *p, gpointer d){(void)a;(void)p;on_back(NULL,d);}
-static void act_adv10     (GSimpleAction *a, GVariant *p, gpointer d){(void)a;(void)p;do_advance(d,10);}
-static void act_adv100    (GSimpleAction *a, GVariant *p, gpointer d){(void)a;(void)p;do_advance(d,100);}
-static void act_last      (GSimpleAction *a, GVariant *p, gpointer d){(void)a;(void)p;do_advance(d,-1);}
-static void act_play      (GSimpleAction *a, GVariant *p, gpointer d){(void)a;(void)p;do_play(d);}
-static void act_pause     (GSimpleAction *a, GVariant *p, gpointer d){(void)a;(void)p;do_pause(d);}
+/**
+ * \internal
+ * \brief Menu action that starts or pauses the analysis, as the button does.
+ *
+ * \param a  the action, unused.
+ * \param p  the action parameter, unused.
+ * \param d  the driver.
+ */
+static void
+act_playpause(LAME_UNUSED GSimpleAction *a, LAME_UNUSED GVariant *p, gpointer d)
+{
+    on_playpause(NULL, d);
+}
+
+/**
+ * \internal
+ * \brief Menu action that shows the next frame, as the button does.
+ *
+ * \param a  the action, unused.
+ * \param p  the action parameter, unused.
+ * \param d  the driver.
+ */
+static void
+act_step(LAME_UNUSED GSimpleAction *a, LAME_UNUSED GVariant *p, gpointer d)
+{
+    on_step(NULL, d);
+}
+
+/**
+ * \internal
+ * \brief Menu action that shows the previous frame, as the button does.
+ *
+ * \param a  the action, unused.
+ * \param p  the action parameter, unused.
+ * \param d  the driver.
+ */
+static void
+act_back(LAME_UNUSED GSimpleAction *a, LAME_UNUSED GVariant *p, gpointer d)
+{
+    on_back(NULL, d);
+}
+
+/**
+ * \internal
+ * \brief Menu action that analyzes the next 10 frames.
+ *
+ * \param a  the action, unused.
+ * \param p  the action parameter, unused.
+ * \param d  the driver.
+ */
+static void
+act_adv10(LAME_UNUSED GSimpleAction *a, LAME_UNUSED GVariant *p, gpointer d)
+{
+    do_advance(d, 10);
+}
+
+/**
+ * \internal
+ * \brief Menu action that analyzes the next 100 frames.
+ *
+ * \param a  the action, unused.
+ * \param p  the action parameter, unused.
+ * \param d  the driver.
+ */
+static void
+act_adv100(LAME_UNUSED GSimpleAction *a, LAME_UNUSED GVariant *p, gpointer d)
+{
+    do_advance(d, 100);
+}
+
+/**
+ * \internal
+ * \brief Menu action that analyzes the frames up to the end of the file.
+ *
+ * \param a  the action, unused.
+ * \param p  the action parameter, unused.
+ * \param d  the driver.
+ */
+static void
+act_last(LAME_UNUSED GSimpleAction *a, LAME_UNUSED GVariant *p, gpointer d)
+{
+    do_advance(d, -1);
+}
+
+/**
+ * \internal
+ * \brief Menu action that starts the analysis.
+ *
+ * \param a  the action, unused.
+ * \param p  the action parameter, unused.
+ * \param d  the driver.
+ */
+static void
+act_play(LAME_UNUSED GSimpleAction *a, LAME_UNUSED GVariant *p, gpointer d)
+{
+    do_play(d);
+}
+
+/**
+ * \internal
+ * \brief Menu action that pauses the analysis.
+ *
+ * \param a  the action, unused.
+ * \param p  the action parameter, unused.
+ * \param d  the driver.
+ */
+static void
+act_pause(LAME_UNUSED GSimpleAction *a, LAME_UNUSED GVariant *p, gpointer d)
+{
+    do_pause(d);
+}
 
 
 /* --------------------------------------------------------------------------
@@ -1592,13 +1715,12 @@ static void act_pause     (GSimpleAction *a, GVariant *p, gpointer d){(void)a;(v
  * -------------------------------------------------------------------------- */
 
 static void
-act_stats(GSimpleAction *action, GVariant *parameter, gpointer user_data)
+act_stats(LAME_UNUSED GSimpleAction *action, LAME_UNUSED GVariant *parameter, gpointer user_data)
 {
     Mp3xDriver *d = user_data;
     const Mp3xStats *s = mp3x_core_stats();
     GtkWidget       *win, *label;
     char            *text;
-    (void) action; (void) parameter;
 
     text = g_strdup_printf(
         "frames processed so far: %d\n"
@@ -1694,11 +1816,10 @@ static const char mp3x_documentation[] =
     "analyzing .mp3 files.)";
 
 static void
-act_docs(GSimpleAction *action, GVariant *parameter, gpointer user_data)
+act_docs(LAME_UNUSED GSimpleAction *action, LAME_UNUSED GVariant *parameter, gpointer user_data)
 {
     Mp3xDriver *d = user_data;
     GtkWidget *win, *scroller, *label;
-    (void) action; (void) parameter;
 
     win = gtk_window_new();
     gtk_window_set_title(GTK_WINDOW(win), "Documentation");
@@ -1725,12 +1846,11 @@ act_docs(GSimpleAction *action, GVariant *parameter, gpointer user_data)
 }
 
 static void
-act_about(GSimpleAction *action, GVariant *parameter, gpointer user_data)
+act_about(LAME_UNUSED GSimpleAction *action, LAME_UNUSED GVariant *parameter, gpointer user_data)
 {
     Mp3xDriver *d = user_data;
     GtkAlertDialog *dlg = gtk_alert_dialog_new("mp3x");
     char        *detail, *decoder;
-    (void) action; (void) parameter;
 
 #ifdef HAVE_MPG123
     decoder = g_strdup_printf("decoder:  libmpg123 %s\n"
@@ -1755,10 +1875,9 @@ act_about(GSimpleAction *action, GVariant *parameter, gpointer user_data)
 }
 
 static void
-act_quit(GSimpleAction *action, GVariant *parameter, gpointer user_data)
+act_quit(LAME_UNUSED GSimpleAction *action, LAME_UNUSED GVariant *parameter, gpointer user_data)
 {
     Mp3xDriver *d = user_data;
-    (void) action; (void) parameter;
     mp3x_driver_request_shutdown(d);
 }
 
@@ -1772,15 +1891,7 @@ static const GActionEntry mp3x_win_actions[] = {
     { .name = "open",      .activate = act_open },
     { .name = "recent",    .activate = act_open_recent, .parameter_type = "s" },
     { .name = "close",     .activate = act_close },
-    { .name = "screenshot", .activate = act_screenshot },
-    { .name = "export-pcm",     .activate = act_export_pcm },
-    { .name = "export-resynth", .activate = act_export_resynth },
-    { .name = "export-mdct-0",  .activate = act_export_mdct0 },
-    { .name = "export-mdct-1",  .activate = act_export_mdct1 },
-    { .name = "export-psy-0",   .activate = act_export_psy0 },
-    { .name = "export-psy-1",   .activate = act_export_psy1 },
-    { .name = "export-sfb-0",   .activate = act_export_sfb0 },
-    { .name = "export-sfb-1",   .activate = act_export_sfb1 },
+    { .name = "export",    .activate = act_export, .parameter_type = "i" },
 
     /* Transport */
     { .name = "playpause", .activate = act_playpause },
@@ -1837,6 +1948,24 @@ menu_append_radio(GMenu *menu, const char *label, const char *action, const char
     g_object_unref(it);
 }
 
+/**
+ * \internal
+ * \brief Appends a menu item that saves one graph, or the screenshot, through
+ *        win.export.
+ *
+ * \param menu   the menu.
+ * \param label  the text of the item.
+ * \param graph  what the item saves.
+ */
+static void
+menu_append_export(GMenu *menu, const char *label, Mp3xGraph graph)
+{
+    GMenuItem *it = g_menu_item_new(label, NULL);
+    g_menu_item_set_action_and_target_value(it, "win.export", g_variant_new_int32(graph));
+    g_menu_append_item(menu, it);
+    g_object_unref(it);
+}
+
 static GMenuModel *
 build_menubar(gboolean native_app_menu)
 {
@@ -1853,27 +1982,27 @@ build_menubar(gboolean native_app_menu)
     g_object_unref(sub);
 
     g_menu_append(m, "Close", "win.close");
-    g_menu_append(m, "Save Screenshot…", "win.screenshot");
+    menu_append_export(m, "Save Screenshot…", MP3X_GRAPH_COMPOSITE);
 
     sub = g_menu_new();                                  /* Export ▸ */
-    g_menu_append(sub, "PCM Waveform…",       "win.export-pcm");
-    g_menu_append(sub, "Re-synthesis…",       "win.export-resynth");
+    menu_append_export(sub, "PCM Waveform…",  MP3X_GRAPH_PCM);
+    menu_append_export(sub, "Re-synthesis…",  MP3X_GRAPH_RESYNTH);
 
     sub2 = g_menu_new();                                  /* MDCT ▸ */
-    g_menu_append(sub2, "Granule 0…", "win.export-mdct-0");
-    g_menu_append(sub2, "Granule 1…", "win.export-mdct-1");
+    menu_append_export(sub2, "Granule 0…", MP3X_GRAPH_MDCT0);
+    menu_append_export(sub2, "Granule 1…", MP3X_GRAPH_MDCT1);
     g_menu_append_submenu(sub, "MDCT", G_MENU_MODEL(sub2));
     g_object_unref(sub2);
 
     sub2 = g_menu_new();                                  /* FFT/Psy ▸ */
-    g_menu_append(sub2, "Granule 0…", "win.export-psy-0");
-    g_menu_append(sub2, "Granule 1…", "win.export-psy-1");
+    menu_append_export(sub2, "Granule 0…", MP3X_GRAPH_PSY0);
+    menu_append_export(sub2, "Granule 1…", MP3X_GRAPH_PSY1);
     g_menu_append_submenu(sub, "FFT / Psychoacoustic", G_MENU_MODEL(sub2));
     g_object_unref(sub2);
 
     sub2 = g_menu_new();                                  /* Scalefactors ▸ */
-    g_menu_append(sub2, "Granule 0…", "win.export-sfb-0");
-    g_menu_append(sub2, "Granule 1…", "win.export-sfb-1");
+    menu_append_export(sub2, "Granule 0…", MP3X_GRAPH_SFB0);
+    menu_append_export(sub2, "Granule 1…", MP3X_GRAPH_SFB1);
     g_menu_append_submenu(sub, "Scalefactors", G_MENU_MODEL(sub2));
     g_object_unref(sub2);
 
@@ -2141,11 +2270,7 @@ update_action_sensitivity(Mp3xDriver *d)
     if (m == NULL) return;
 
     static const char *const file_actions[] = {
-        "close", "screenshot",
-        "export-pcm", "export-resynth",
-        "export-mdct-0", "export-mdct-1",
-        "export-psy-0", "export-psy-1",
-        "export-sfb-0", "export-sfb-1"
+        "close", "export"
     };
     for (gsize i = 0; i < G_N_ELEMENTS(file_actions); i++) {
         GAction *a = g_action_map_lookup_action(m, file_actions[i]);
@@ -2227,7 +2352,7 @@ mp3x_driver_refresh_for_empty(Mp3xDriver *d)
        called mp3x_core_shutdown (which zeroed core_state.hip), the
        init's hip guard is a no-op, and the memset on Pinfo clears
        pdisp->sampfreq so the render functions bail on their own check. */
-    mp3x_core_init();
+    mp3x_core_init(NULL);
 
     /* Clear graphs so they display a deliberate empty state, not stale data. */
     mp3x_apply_display(d);
@@ -2244,11 +2369,10 @@ mp3x_driver_refresh_for_empty(Mp3xDriver *d)
  * ========================================================================== */
 
 static gboolean
-on_key(GtkEventControllerKey *kc, guint keyval, guint keycode,
-       GdkModifierType state, gpointer data)
+on_key(LAME_UNUSED GtkEventControllerKey *kc, guint keyval, LAME_UNUSED guint keycode,
+       LAME_UNUSED GdkModifierType state, gpointer data)
 {
     Mp3xDriver *d = data;
-    (void) kc; (void) keycode; (void) state;
 
     if (d->session == NULL)
         return FALSE;
@@ -2275,10 +2399,9 @@ on_key(GtkEventControllerKey *kc, guint keyval, guint keycode,
  * ========================================================================== */
 
 static gboolean
-on_close_request(GtkWindow *win, gpointer user_data)
+on_close_request(LAME_UNUSED GtkWindow *win, gpointer user_data)
 {
     Mp3xDriver *d = user_data;
-    (void) win;
     mp3x_driver_request_shutdown(d);
     return TRUE;   /* stop the default close; shutdown destroys the window */
 }
@@ -2287,7 +2410,6 @@ static void
 on_window_destroy(GtkWindow *win, gpointer user_data)
 {
     Mp3xDriver *d = user_data;
-    (void) win;
     if (d->win == GTK_WINDOW(win))
         d->win = NULL;
 }
@@ -2324,8 +2446,13 @@ on_startup(GtkApplication *app, gpointer data)
 
     gtk_application_set_accels_for_action(app, "win.open",  on_macos ? open_mac  : open_pc);
     gtk_application_set_accels_for_action(app, "win.close", on_macos ? close_mac : close_pc);
-    gtk_application_set_accels_for_action(app, "win.screenshot",
+    GVariant *screenshot = g_variant_ref_sink(g_variant_new_int32(MP3X_GRAPH_COMPOSITE));
+    gchar    *screenshot_action = g_action_print_detailed_name("win.export", screenshot);
+
+    gtk_application_set_accels_for_action(app, screenshot_action,
                                           on_macos ? ss_mac : ss_pc);
+    g_free(screenshot_action);
+    g_variant_unref(screenshot);
     gtk_application_set_accels_for_action(app, "app.quit",  on_macos ? quit_mac  : quit_pc);
 
     menubar = build_menubar(on_macos);
@@ -2475,20 +2602,20 @@ on_activate(GtkApplication *app, gpointer user_data)
 #endif
 
     /* Graph widgets */
-    d->plot = mp3x_plot_pcm_new();
+    d->plot = mp3x_plot_new(MP3X_GRAPH_PCM);
     gtk_widget_set_hexpand(d->plot, TRUE);
     gtk_widget_set_vexpand(d->plot, TRUE);
     gtk_box_append(GTK_BOX(plots), d->plot);
 
-    d->plot_resynth = mp3x_plot_resynth_new();
+    d->plot_resynth = mp3x_plot_new(MP3X_GRAPH_RESYNTH);
     gtk_widget_set_hexpand(d->plot_resynth, TRUE);
     gtk_widget_set_vexpand(d->plot_resynth, TRUE);
     gtk_box_append(GTK_BOX(plots), d->plot_resynth);
 
     {
         GtkWidget *mdct_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
-        d->plot_mdct[0] = mp3x_plot_mdct_new(0);
-        d->plot_mdct[1] = mp3x_plot_mdct_new(1);
+        d->plot_mdct[0] = mp3x_plot_new(MP3X_GRAPH_MDCT0);
+        d->plot_mdct[1] = mp3x_plot_new(MP3X_GRAPH_MDCT1);
         gtk_widget_set_hexpand(d->plot_mdct[0], TRUE);
         gtk_widget_set_vexpand(d->plot_mdct[0], TRUE);
         gtk_widget_set_hexpand(d->plot_mdct[1], TRUE);
@@ -2499,8 +2626,8 @@ on_activate(GtkApplication *app, gpointer user_data)
     }
     {
         GtkWidget *psy_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
-        d->plot_psy[0] = mp3x_plot_psy_new(0);
-        d->plot_psy[1] = mp3x_plot_psy_new(1);
+        d->plot_psy[0] = mp3x_plot_new(MP3X_GRAPH_PSY0);
+        d->plot_psy[1] = mp3x_plot_new(MP3X_GRAPH_PSY1);
         gtk_widget_set_hexpand(d->plot_psy[0], TRUE);
         gtk_widget_set_vexpand(d->plot_psy[0], TRUE);
         gtk_widget_set_hexpand(d->plot_psy[1], TRUE);
@@ -2511,8 +2638,8 @@ on_activate(GtkApplication *app, gpointer user_data)
     }
     {
         GtkWidget *sfb_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
-        d->plot_sfb[0] = mp3x_plot_sfb_new(0);
-        d->plot_sfb[1] = mp3x_plot_sfb_new(1);
+        d->plot_sfb[0] = mp3x_plot_new(MP3X_GRAPH_SFB0);
+        d->plot_sfb[1] = mp3x_plot_new(MP3X_GRAPH_SFB1);
         gtk_widget_set_hexpand(d->plot_sfb[0], TRUE);
         gtk_widget_set_vexpand(d->plot_sfb[0], TRUE);
         gtk_widget_set_hexpand(d->plot_sfb[1], TRUE);
@@ -2592,13 +2719,11 @@ on_activate(GtkApplication *app, gpointer user_data)
  * ========================================================================== */
 
 int
-lame_main(lame_t main_c_gf_borrowed, int argc, char **argv)
+lame_main(LAME_UNUSED lame_t main_c_gf_borrowed, int argc, char **argv)
 {
     Mp3xDriver   *d;
     GtkApplication *app;
     int           status;
-
-    (void) main_c_gf_borrowed;   /* main.c owns and closes this; mp3x never uses it */
 
     d = mp3x_driver_new();
 

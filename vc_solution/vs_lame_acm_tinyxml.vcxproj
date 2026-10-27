@@ -42,7 +42,7 @@
       <Optimization>MaxSpeed</Optimization>
       <InlineFunctionExpansion>OnlyExplicitInline</InlineFunctionExpansion>
       <PreprocessorDefinitions>WIN32;NDEBUG;_WINDOWS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
-      <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
+      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
     </ClCompile>
     <ResourceCompile>
       <PreprocessorDefinitions>NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
@@ -54,7 +54,7 @@
     <ClCompile>
       <Optimization>Disabled</Optimization>
       <PreprocessorDefinitions>WIN32;_DEBUG;_WINDOWS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
-      <RuntimeLibrary>MultiThreadedDebugDLL</RuntimeLibrary>
+      <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
     </ClCompile>
     <ResourceCompile>
       <PreprocessorDefinitions>_DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
@@ -66,10 +66,21 @@
     <None Include="..\ACM\tinyxml\changes.txt" />
     <None Include="..\ACM\tinyxml\readme.txt" />
   </ItemGroup>
+  <!-- Vendored third-party sources, held to their author's warning bar and not
+       to this project's.  The level is set on the items rather than in an
+       ItemDefinitionGroup on purpose: item metadata is what survives a
+       property sheet forced in ahead of the C++ targets, which is how the
+       warning harness raises everything else here to /W4. -->
   <ItemGroup>
-    <ClCompile Include="..\ACM\tinyxml\tinyxml.cpp" />
-    <ClCompile Include="..\ACM\tinyxml\tinyxmlerror.cpp" />
-    <ClCompile Include="..\ACM\tinyxml\tinyxmlparser.cpp" />
+    <ClCompile Include="..\ACM\tinyxml\tinyxml.cpp">
+      <WarningLevel>TurnOffAllWarnings</WarningLevel>
+    </ClCompile>
+    <ClCompile Include="..\ACM\tinyxml\tinyxmlerror.cpp">
+      <WarningLevel>TurnOffAllWarnings</WarningLevel>
+    </ClCompile>
+    <ClCompile Include="..\ACM\tinyxml\tinyxmlparser.cpp">
+      <WarningLevel>TurnOffAllWarnings</WarningLevel>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\ACM\tinyxml\tinyxml.h" />

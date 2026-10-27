@@ -37,6 +37,15 @@
 #if defined(__FreeBSD__) && !defined(__alpha__)
 # include <machine/floatingpoint.h>
 #endif
+#if defined( _WIN32 )
+# define WIN32_LEAN_AND_MEAN
+# include <windows.h>
+#endif
+
+/* For the debug build's floating point exception trapping below. */
+#if defined( HAVE_FENV_H ) && defined( HAVE_FEENABLEEXCEPT )
+# include <fenv.h>
+#endif
 
 /* Headers for the ARM capability probe in has_NEON() below.  configure says
  * which of these exist; this says where they are needed.  HWCAP_NEON lives in
@@ -127,6 +136,33 @@ free_global_data(lame_internal_flags * gfc)
 }
 
 
+/*! Release what a failed \c lame_init_params() built. */
+/*!
+  \internal
+  The next \c lame_init_params() then builds the psychoacoustic tables, the
+  quantizer tables, the bitstream buffer and the decoder again, for its own
+  settings. The ID3 tag data and the buffers of \c lame_init() stay.
+
+  \param gfc the internal flags of the encoder instance.
+*/
+void
+free_init_state(lame_internal_flags * const gfc)
+{
+    free_global_data(gfc);
+    gfc->iteration_init_init = 0;
+    if (gfc->bs.buf != NULL) {
+        free(gfc->bs.buf);
+        gfc->bs.buf = NULL;
+    }
+#ifdef HAVE_MPG123
+    if (gfc->hip) {
+        hip_decode_exit(gfc->hip);
+        gfc->hip = 0;
+    }
+#endif
+}
+
+
 void
 freegfc(lame_internal_flags * const gfc)
 {                       /* bit stream structure */
@@ -188,6 +224,27 @@ freegfc(lame_internal_flags * const gfc)
 /*those ATH formulas are returning
 their minimum value for input = -1*/
 
+/**
+ * \brief The absolute threshold of hearing, in dB, at frequency \a f.
+ *
+ * Terhardt's threshold formula, as given by Painter and Spanias, with two
+ * changes based on measured threshold values: an added term that raises the
+ * curve around 8-9 kHz, and a high-frequency tail whose steepness \a value
+ * selects. A comment in the source says that the unchanged formula was not
+ * accurate at high frequencies, and that the correction costs a lot of
+ * bitrate in VBR.
+ *
+ * With \a value, one formula covers the whole quality range. The tail goes
+ * from close to the published curve at the lowest quality settings towards
+ * the measured curve at the highest.
+ *
+ * \param f      frequency in Hz. A value below -0.3 returns the minimum of the
+ *               curve instead of the value at a frequency.
+ * \param value  selects the high-frequency tail.
+ * \param f_min  frequency range of the curve. \a f is first limited to this
+ * \param f_max  range, so the curve is flat outside it.
+ * \return the threshold in dB.
+ */
 static  FLOAT
 ATHformula_GB(FLOAT f, FLOAT value, FLOAT f_min, FLOAT f_max)
 {
@@ -232,6 +289,18 @@ bitrate is more balanced according to the -V value.*/
 
 
 
+/**
+ * \internal
+ * \brief The absolute threshold of hearing for the configured curve.
+ *
+ * Calls ATHformula_GB() for the selected curve type. The types differ in the
+ * high-frequency tail they use, in whether the caller can choose it, and in
+ * the frequency range before the curve is flat. One of them also shifts the
+ * whole curve.
+ *
+ * The threshold that the quantizer uses is not only this value. A configured
+ * offset is added, and adjust_ATH() can lower the result in quiet passages.
+ */
 FLOAT
 ATHformula(SessionConfig_t const *cfg, FLOAT freq)
 {
@@ -263,6 +332,16 @@ ATHformula(SessionConfig_t const *cfg, FLOAT freq)
 }
 
 /* see for example "Zwicker: Psychoakustik, 1982; ISBN 3-540-11401-7 */
+/**
+ * \internal
+ * \brief Convert a frequency in Hz to the Bark scale.
+ *
+ * On this scale, masking has about the same shape at every frequency, so one
+ * spreading function covers all frequencies. This is Zwicker's analytic
+ * approximation.
+ *
+ * \see s3_func(), init_numline()
+ */
 FLOAT
 freq2bark(FLOAT freq)
 {
@@ -304,9 +383,11 @@ FindNearestBitrate(int bRate, /* legal rates from 8 to 320 */
 
     bitrate = bitrate_table[version][1];
 
+    /* the distances in double, which holds every difference of two ints
+       exactly: bRate is whatever the caller set */
     for (i = 2; i <= 14; i++) {
         if (bitrate_table[version][i] > 0) {
-            if (ABS(bitrate_table[version][i] - bRate) < ABS(bitrate - bRate))
+            if (ABS((double) bitrate_table[version][i] - bRate) < ABS((double) bitrate - bRate))
                 bitrate = bitrate_table[version][i];
         }
     }
@@ -315,14 +396,6 @@ FindNearestBitrate(int bRate, /* legal rates from 8 to 320 */
 
 
 
-
-
-#ifndef Min
-#define         Min(A, B)       ((A) < (B) ? (A) : (B))
-#endif
-#ifndef Max
-#define         Max(A, B)       ((A) > (B) ? (A) : (B))
-#endif
 
 
 /* Used to find table index when
@@ -334,14 +407,8 @@ FindNearestBitrate(int bRate, /* legal rates from 8 to 320 */
  * Gabriel Bouvigne 2002-11-03
  */
 int
-nearestBitrateFullIndex(uint16_t bitrate)
+nearestBitrateFullIndex(int bitrate)
 {
-    /* borrowed from DM abr presets */
-
-    const int full_bitrate_table[] =
-        { 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320 };
-
-
     int     lower_range = 0, lower_range_kbps = 0, upper_range = 0, upper_range_kbps = 0;
 
 
@@ -367,8 +434,9 @@ nearestBitrateFullIndex(uint16_t bitrate)
         }
     }
 
-    /* Determine which range the value specified is closer to */
-    if ((upper_range_kbps - bitrate) > (bitrate - lower_range_kbps)) {
+    /* Determine which range the value specified is closer to; the distances in
+       double, which holds every difference of two ints exactly */
+    if (((double) upper_range_kbps - bitrate) > ((double) bitrate - lower_range_kbps)) {
         return lower_range;
     }
     return upper_range;
@@ -378,6 +446,10 @@ nearestBitrateFullIndex(uint16_t bitrate)
 
 
 
+/** The sample rates of MP3, in Hz, from the lowest to the highest. */
+static const int mp3_samplerates[] =
+    { 8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000 };
+
 /* map frequency to a valid MP3 sample frequency
  *
  * Robert Hegemann 2000-07-01
@@ -385,24 +457,32 @@ nearestBitrateFullIndex(uint16_t bitrate)
 int
 map2MP3Frequency(int freq)
 {
-    if (freq <= 8000)
-        return 8000;
-    if (freq <= 11025)
-        return 11025;
-    if (freq <= 12000)
-        return 12000;
-    if (freq <= 16000)
-        return 16000;
-    if (freq <= 22050)
-        return 22050;
-    if (freq <= 24000)
-        return 24000;
-    if (freq <= 32000)
-        return 32000;
-    if (freq <= 44100)
-        return 44100;
+    size_t  i;
 
-    return 48000;
+    for (i = 0; i + 1 < dimension_of(mp3_samplerates); i++) {
+        if (freq <= mp3_samplerates[i])
+            return mp3_samplerates[i];
+    }
+    return mp3_samplerates[dimension_of(mp3_samplerates) - 1];
+}
+
+/**
+ * \internal
+ * \brief Returns the highest MP3 sample rate that is not above \a freq.
+ * \param freq a sample rate in Hz.
+ * \return the MP3 sample rate in Hz. 0 when \a freq is below the lowest one.
+ */
+int
+floorMP3Frequency(int freq)
+{
+    size_t  i = dimension_of(mp3_samplerates);
+
+    while (i > 0) {
+        --i;
+        if (mp3_samplerates[i] <= freq)
+            return mp3_samplerates[i];
+    }
+    return 0;
 }
 
 int
@@ -428,38 +508,20 @@ BitrateIndex(int bRate,      /* legal rates from 32 to 448 kbps */
 int
 SmpFrqIndex(int sample_freq, int *const version)
 {
-    switch (sample_freq) {
-    case 44100:
-        *version = 1;
-        return 0;
-    case 48000:
-        *version = 1;
-        return 1;
-    case 32000:
-        *version = 1;
-        return 2;
-    case 22050:
-        *version = 0;
-        return 0;
-    case 24000:
-        *version = 0;
-        return 1;
-    case 16000:
-        *version = 0;
-        return 2;
-    case 11025:
-        *version = 0;
-        return 0;
-    case 12000:
-        *version = 0;
-        return 1;
-    case 8000:
-        *version = 0;
-        return 2;
-    default:
-        *version = 0;
-        return -1;
+    int     row, i;
+
+    /* Rows 0, 1 and 2 of the table are MPEG-2, MPEG-1 and MPEG-2.5. The
+       version bit is 0 for MPEG-2.5 too; the sample rate tells it apart. */
+    for (row = 0; row < 3; row++) {
+        for (i = 0; i < 3; i++) {
+            if (samplerate_table[row][i] == sample_freq) {
+                *version = (row == 1) ? 1 : 0;
+                return i;
+            }
+        }
     }
+    *version = 0;
+    return -1;
 }
 
 
@@ -544,7 +606,7 @@ fill_buffer_resample(lame_internal_flags * gfc,
     fcn = 1.00 / resample_ratio;
     if (fcn > 1.00)
         fcn = 1.00;
-    filter_l = 31;     /* must be odd */
+    filter_l = RESAMPLE_FILTER_LENGTH; /* must be odd */
     filter_l += intratio; /* unless resample_ratio=int, it must be even */
 
 
@@ -682,9 +744,7 @@ fill_buffer_resample(lame_internal_flags * gfc,
 int
 isResamplingNecessary(SessionConfig_t const* cfg)
 {
-    int const l = cfg->samplerate_out * 0.9995f;
-    int const h = cfg->samplerate_out * 1.0005f;
-    return (cfg->samplerate_in < l) || (h < cfg->samplerate_in) ? 1 : 0;
+    return cfg->samplerate_in != cfg->samplerate_out ? 1 : 0;
 }
 
 /* copy in new samples from in_buffer into mfbuf, with resampling
@@ -697,7 +757,7 @@ fill_buffer(lame_internal_flags * gfc,
 {
     SessionConfig_t const *const cfg = &gfc->cfg;
     int     mf_size = gfc->sv_enc.mf_size;
-    int     framesize = 576 * cfg->mode_gr;
+    int     framesize = SAMPLES_PER_GRANULE * cfg->mode_gr;
     int     nout, ch = 0;
     int     nch = cfg->channels_out;
 
@@ -843,19 +903,12 @@ lame_errorf(const lame_internal_flags* gfc, const char *format, ...)
 #define LAME_BASELINE_NEON 1
 #endif
 
-/* LAME_TARGET_X86 comes from util.h, where the vector ladder needs it too. */
-#if defined( LAME_TARGET_X86 )
-# if defined( __has_builtin )
-#  if __has_builtin( __builtin_cpu_supports )
-#   define LAME_CPU_SUPPORTS 1
-#  endif
-# elif defined( __GNUC__ ) && (__GNUC__ > 4 || (__GNUC__ == 4 && __GNUC_MINOR__ >= 8))
-#  define LAME_CPU_SUPPORTS 1
-# endif
-# if defined( _MSC_VER )
-#  include <intrin.h>
-#  define LAME_CPUID_MSVC 1
-# endif
+/* LAME_TARGET_X86 and the two LAME_CPU_SUPPORTS macros come from util.h,
+   where the vector ladder and the unit tests need them too.  MSVC has neither
+   builtin and answers from CPUID instead. */
+#if defined( LAME_TARGET_X86 ) && defined( _MSC_VER )
+# include <intrin.h>
+# define LAME_CPUID_MSVC 1
 #endif
 
 #if defined( LAME_CPUID_MSVC )
@@ -968,9 +1021,15 @@ has_AVX2(void)
 int
 has_AVX512(void)
 {
-#if defined( LAME_BASELINE_AVX512 )
+#if !defined( HAVE_AVX512_INTRINSICS )
+    /* The dispatch table is the only reader of this answer and is compiled
+       under the same condition, so where the routines do not exist there is
+       nothing to decide - and a build with no use for the query should not
+       be making it. */
+    return 0;
+#elif defined( LAME_BASELINE_AVX512 )
     return 1;
-#elif defined( LAME_CPU_SUPPORTS )
+#elif defined( LAME_CPU_SUPPORTS_AVX512 )
     /* Asked as four questions for the same reason the baseline test is four:
        the kernels use all four subsets, and a CPU carrying only the
        foundation would fault on the rest. */
@@ -1041,26 +1100,23 @@ has_NEON(void)
 }
 
 /** @internal
- * The one table.  Every question about vector routines is answered from it -
- * how many this build carries, what they are called, whether a name is one of
- * them, whether this CPU can run it, and which one an encode ends up using.
+ * The vector routine sets of this build.  All code reads this table to find
+ * out how many sets the build has, their names, whether a name is valid,
+ * whether this CPU can run a set, and which set an encode uses.  Because
+ * there is only one table, the sets that the library reports always match the
+ * sets that the encoder can use.
  *
- * That is the point of it existing rather than the answers being spread over
- * the places that need them.  A build can otherwise advertise a set the
- * encoder never dispatches, and nothing is able to see the disagreement,
- * because the claim and the behaviour come from different code.
+ * The order is ascending capability, and the public API promises this order:
+ * index count-1 is the widest set of this build, so "the best available" is
+ * found from the end.  The names are the identifiers that the API takes:
+ * lowercase, and the real instruction set, not a family, so SSE2 and not SSE.
+ * For display, the name is converted to uppercase; there is no second string.
  *
- * Ascending capability, and the public enumeration promises that order: index
- * count-1 is the widest set this build has, so "the best available" is a walk
- * from the end.  Names are the identifiers the API takes - lowercase, and the
- * real instruction set rather than a family, so SSE2 and not SSE.  The
- * displayed form is this name upper-cased; there is no second string.
- *
- * On x86 the ladder is scalar -> SSE2 -> AVX2 -> AVX-512, with no SSE4.1/SSE4.2
- * rung, and the top rung carries only the constant-bitrate kernels.  On ARM it
- * is scalar -> NEON, and that rung carries one routine, the compiler already
- * vectorising the rest as well or better.  See @ref vector_dispatch for why
- * each is shaped the way it is.
+ * On x86 the tiers are scalar, SSE2, AVX2 and AVX-512, with no SSE4.1/SSE4.2
+ * tier, and the top tier has only the quantization loop of count_bits().  On
+ * ARM the tiers are scalar and NEON, and NEON has one routine, because the
+ * compiler already vectorizes the rest as well or better.  See
+ * @ref vector_dispatch for the reasons.
  */
 static const struct {
     const char *name;
@@ -1087,17 +1143,17 @@ static const struct {
 /** @internal
  * Every name LAME knows, on any architecture and in any configuration.
  *
- * The table above holds what this build *has*; this holds what the project
- * has ever *called* something, so that a request can be refused with the
- * reason rather than a shrug: a name in here that is missing from the table
- * means "not compiled into this build" (rebuild, or use another binary),
- * while a name in neither means "no such thing" (a typo).
+ * The table above lists the sets this build has.  This list has every set
+ * name LAME uses, so that an error can give the reason.  A name in this list
+ * but not in the table is not compiled into this build (rebuild, or use
+ * another binary).  A name in neither list is wrong, for example a typo.
  *
- * Deliberately plain strings: it must list sets this architecture does not
- * have, whose vector_impl_t values do not exist here to be named.
+ * These are plain strings, because the list must also name sets that this
+ * architecture does not have, and their vector_impl_t values do not exist
+ * here.
  *
- * The two lists can drift, which is the price of the second one; a unit test
- * asserts that every name in the table appears here.
+ * The two lists can differ.  Every name in the table must also be in this
+ * list.  test_vector_ladder.c checks this for the sets that a build compiles.
  */
 static const char *const vector_impl_known_names[] = {
     "sse2", "avx2", "avx512", "neon", 0
@@ -1178,13 +1234,12 @@ vector_impl_supported(vector_impl_t impl)
 }
 
 /** @internal
- * Decide, once, what this instance will run.
+ * Decide, once, which set this instance runs.
  *
- * @p request is VECTOR_IMPL_AUTO, or a set validated when it was selected.
- * Under AUTO the answer is the widest set the machine offers that the
- * deprecated asm_optimizations mask still allows - which is exactly what this
- * library did before the selection existed, and has to stay so, because the
- * encoder's output must not depend on which of the two APIs a caller used.
+ * @p request is VECTOR_IMPL_AUTO, or a set that was checked when it was
+ * selected.  With AUTO the result is the widest set of the machine that the
+ * deprecated asm_optimizations mask still allows.  The output of the encoder
+ * must not depend on which of the two APIs a caller used.
  */
 void
 vector_impl_init(lame_internal_flags * gfc, int request)
@@ -1273,11 +1328,11 @@ display_name(const char *name, char *buf, size_t size)
 }
 
 /** @internal
- * The displayed spelling of a set: the identifier, upper-cased.
+ * The display form of a set: the identifier in uppercase.
  *
- * There is deliberately no second string per set.  One name is stored, in the
- * form the API takes, and display is derived from it - so the two can never
- * drift, and adding a set means adding one string.
+ * There is no second string per set.  One name is stored, in the form that
+ * the API takes, and the display form comes from it.  So the two cannot
+ * differ, and a new set needs one string.
  */
 const char *
 vector_impl_display(const char *name, char *buf, size_t size)
@@ -1289,16 +1344,15 @@ vector_impl_display(const char *name, char *buf, size_t size)
 }
 
 /** @internal
- * The sets this build carries that the processor can also execute, in display
- * form, in table order, comma-separated.
+ * The sets of this build that the processor can also run, in display form,
+ * in table order, separated by commas.
  *
- * Both conditions are required: a set the build lacks cannot run however
- * capable the processor is, and a set the processor lacks cannot run however
- * the build was configured.  What is left is exactly the range
- * lame_set_vector_routines() accepts here.
+ * Both conditions are needed.  A set that the build does not have cannot run
+ * on any processor.  A set that the processor does not have cannot run in any
+ * build.  The rest is exactly what lame_set_vector_routines() accepts here.
  *
- * The result is empty when there are none, which is an ordinary answer.
- * Entries are appended whole or not at all.
+ * The result is empty when there are none, which is a normal result.  Each
+ * entry is added whole or not at all.
  */
 const char *
 vector_impl_available_list(char *buf, size_t size)
@@ -1378,19 +1432,6 @@ disable_FPE(void)
 #if defined(ABORTFP)
 #if defined(_MSC_VER)
     {
-#if 0
-        /* rh 061207
-           the following fix seems to be a workaround for a problem in the
-           parent process calling LAME. It would be better to fix the broken
-           application => code disabled.
-         */
-
-        /* set affinity to a single CPU.  Fix for EAC/lame on SMP systems from
-           "Todd Richmond" <todd.richmond@openwave.com> */
-        SYSTEM_INFO si;
-        GetSystemInfo(&si);
-        SetProcessAffinityMask(GetCurrentProcess(), si.dwActiveProcessorMask);
-#endif
 #include <float.h>
         unsigned int mask;
         mask = _controlfp(0, 0);
@@ -1398,42 +1439,64 @@ disable_FPE(void)
         mask = _controlfp(mask, _MCW_EM);
     }
 #elif defined(__CYGWIN__)
-#  define _FPU_GETCW(cw) __asm__ ("fnstcw %0" : "=m" (*&cw))
-#  define _FPU_SETCW(cw) __asm__ ("fldcw %0" : : "m" (*&cw))
+#  define LAME_X87_GETCW(cw) __asm__ ("fnstcw %0" : "=m" (*&cw))
+#  define LAME_X87_SETCW(cw) __asm__ ("fldcw %0" : : "m" (*&cw))
 
-#  define _EM_INEXACT     0x00000020 /* inexact (precision) */
-#  define _EM_UNDERFLOW   0x00000010 /* underflow */
-#  define _EM_OVERFLOW    0x00000008 /* overflow */
-#  define _EM_ZERODIVIDE  0x00000004 /* zero divide */
-#  define _EM_INVALID     0x00000001 /* invalid */
+/* x87 control word: the mask bits of three exceptions */
+#  define LAME_X87_MASK_OVERFLOW    0x00000008
+#  define LAME_X87_MASK_ZERODIVIDE  0x00000004
+#  define LAME_X87_MASK_INVALID     0x00000001
     {
         unsigned int mask;
-        _FPU_GETCW(mask);
+        LAME_X87_GETCW(mask);
         /* Set the FPU control word to abort on most FPEs */
-        mask &= ~(_EM_OVERFLOW | _EM_ZERODIVIDE | _EM_INVALID);
-        _FPU_SETCW(mask);
+        mask &= ~(LAME_X87_MASK_OVERFLOW | LAME_X87_MASK_ZERODIVIDE | LAME_X87_MASK_INVALID);
+        LAME_X87_SETCW(mask);
     }
-# elif defined(__linux__)
+# elif defined(HAVE_FENV_H) && defined(HAVE_FEENABLEEXCEPT)
+    {
+        /*
+         * feenableexcept() reaches the systems the x87 path below cannot -
+         * the BSDs, and Linux on anything without an x87. Whether anything
+         * then traps is the hardware's business: an AArch64 implementation
+         * need not offer trapping exceptions, and there the call succeeds
+         * and execution continues past the division.
+         */
+        (void) feenableexcept(FE_INVALID | FE_DIVBYZERO | FE_OVERFLOW);
+    }
+# elif defined(HAVE_FPU_CONTROL_H)
     {
 
 #  include <fpu_control.h>
-#  ifndef _FPU_GETCW
-#  define _FPU_GETCW(cw) __asm__ ("fnstcw %0" : "=m" (*&cw))
-#  endif
-#  ifndef _FPU_SETCW
-#  define _FPU_SETCW(cw) __asm__ ("fldcw %0" : : "m" (*&cw))
-#  endif
+/*
+ * <fpu_control.h> exists wherever the C library is glibc - Android and musl
+ * say __linux__ and do not have it. The mask names below are the x87 ones,
+ * and glibc ships the header without them on architectures that have no x87,
+ * so the body is compiled only where they turn up.
+ */
+#  if defined(_FPU_MASK_IM) && defined(_FPU_MASK_ZM) && defined(_FPU_MASK_OM)
+#   ifdef _FPU_GETCW
+#    define LAME_X87_GETCW(cw) _FPU_GETCW(cw)
+#   else
+#    define LAME_X87_GETCW(cw) __asm__ ("fnstcw %0" : "=m" (*&cw))
+#   endif
+#   ifdef _FPU_SETCW
+#    define LAME_X87_SETCW(cw) _FPU_SETCW(cw)
+#   else
+#    define LAME_X87_SETCW(cw) __asm__ ("fldcw %0" : : "m" (*&cw))
+#   endif
 
-        /* 
-         * Set the Linux mask to abort on most FPE's
+        /*
+         * Set the mask to abort on most FPE's
          * if bit is set, we _mask_ SIGFPE on that error!
          *  mask &= ~( _FPU_MASK_IM | _FPU_MASK_ZM | _FPU_MASK_OM | _FPU_MASK_UM );
          */
 
         unsigned int mask;
-        _FPU_GETCW(mask);
+        LAME_X87_GETCW(mask);
         mask &= ~(_FPU_MASK_IM | _FPU_MASK_ZM | _FPU_MASK_OM);
-        _FPU_SETCW(mask);
+        LAME_X87_SETCW(mask);
+#  endif
     }
 #endif
 #endif /* ABORTFP */

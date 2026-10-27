@@ -20,8 +20,13 @@
  * Boston, MA  02111-1307, USA.
  */
 
-#ifndef ___BLADEDLL_H_INCLUDED___
-#define ___BLADEDLL_H_INCLUDED___
+#ifndef LAME_BLADEDLL_H
+#define LAME_BLADEDLL_H
+
+#ifdef _BLADEDLL
+#undef FLOAT
+#include <windows.h>
+#endif
 
 #pragma pack(push)
 #pragma pack(1)
@@ -65,11 +70,6 @@ typedef		unsigned long			BE_ERR;
 
 #define		MPEG1	1
 #define		MPEG2	0
-
-#ifdef _BLADEDLL
-#undef FLOAT
-	#include <Windows.h>
-#endif
 
 #define CURRENT_STRUCT_VERSION 1
 #define CURRENT_STRUCT_SIZE sizeof(BE_CONFIG)	// is currently 331 bytes

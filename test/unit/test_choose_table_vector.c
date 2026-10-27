@@ -1,26 +1,29 @@
 /**
  * @file
  * @ingroup unit_tests
- * @brief Unit tests for the vectorised Huffman table search primitives.
+ * @brief Unit tests for the vectorized Huffman table search primitives.
  *
- * The bitstream-identity check covers these routines from a long way off: it
- * encodes whole files and compares the result. That answers "does a real
- * encode still produce the same bits", but it exercises whatever region
- * lengths and value ranges the music happens to produce, and it says nothing
- * about the ones it never reaches. These tests go at the routines directly,
- * over the cases that are awkward by construction rather than by luck: the
- * lengths either side of the block size and the vector threshold, the value
- * where the code lengths switch to escape coding, and the range where
- * narrowing to sixteen bits saturates.
+ * The bitstream-identity check tests these routines only from far away. It
+ * encodes whole files and compares the result. So it tests whether a real
+ * encode still produces the same bits. But it only tests the region lengths
+ * and value ranges that the music happens to produce. It says nothing about
+ * the cases that it never gets to. These tests call the routines directly.
+ * They test the cases that are difficult by design, not by chance:
  *
- * Each routine is checked against an independent scalar reference written
- * here rather than against LAME's own - two spellings of the same loop would
- * agree about a shared misunderstanding.
+ *   - the lengths on both sides of the block size and of the vector
+ *     threshold,
+ *   - the value where the code lengths switch to escape coding,
+ *   - the range where the narrowing to sixteen bits saturates.
+ *
+ * Each routine is checked against an independent scalar reference. The
+ * reference is not LAME's own scalar loop. Two versions of the same loop can
+ * share a mistake and still agree. The escape cases and their reference are
+ * in test_esc_cases.h, because the NEON test runs them as well.
  *
  * The tables are synthetic for the same reason. The routines take their
- * tables as arguments, so nothing here depends on the contents of LAME's, and
- * an index computed one place off shows up as a wrong sum instead of being
- * masked by neighbouring entries that happen to be equal.
+ * tables as arguments. So nothing here depends on the contents of LAME's
+ * tables. An index that is off by one gives a wrong sum. Neighbor entries
+ * with the same value cannot hide the mistake.
  */
 
 #ifdef HAVE_CONFIG_H
@@ -41,32 +44,17 @@
 #include "util.h"
 #include "quantize_pvt.h"
 #include "vector/lame_intrin.h"
+#include "test_esc_cases.h"
+#include "test_cpu_probe.h"
 
-/** Longest region the encoder ever asks about. */
+/** Longest region that the encoder passes to the routines. */
 #define MAX_LEN 576
 
-/** @brief Does the running CPU offer AVX2? */
-static int
-have_avx2(void)
-{
-#if defined( HAVE_AVX2_INTRINSICS )
-# if defined( __AVX2__ )
-    return 1;
-# elif defined( __GNUC__ ) || defined( __clang__ )
-    return __builtin_cpu_supports("avx2") != 0;
-# else
-    return 0;               /* no way to ask; skip rather than crash */
-# endif
-#else
-    return 0;
-#endif
-}
-
 /**
- * @brief The AVX2 maximum, or a stand-in where it was not compiled.
+ * @brief Calls the AVX2 maximum, or returns 0 if the build does not have it.
  *
- * The stand-in is never called: have_avx2() answers no wherever the routine
- * does not exist, so the guard is one test rather than one per call site.
+ * The empty case is never called. have_avx2() returns 0 wherever the routine
+ * does not exist. So one check guards every call site.
  */
 static int
 avx2_max(const int *ix, const int *end)
@@ -118,22 +106,6 @@ ref_max(const int *ix, int n)
     return m;
 }
 
-static unsigned int
-ref_esc(const int *ix, int n, unsigned int *nclamped)
-{
-    unsigned int sum = 0, nc = 0;
-    int     i;
-    for (i = 0; i < n; i += 2) {
-        unsigned int x = (unsigned int) ix[i];
-        unsigned int y = (unsigned int) ix[i + 1];
-        if (x >= 15u) { x = 15u; ++nc; }
-        if (y >= 15u) { y = 15u; ++nc; }
-        sum += largetbl_t[(x << 4u) + y];
-    }
-    *nclamped = nc;
-    return sum;
-}
-
 static void
 ref_from3(const int *ix, int n, int xlen, unsigned int sums[3])
 {
@@ -152,27 +124,17 @@ ref_from3(const int *ix, int n, int xlen, unsigned int sums[3])
 /* helpers                                                             */
 /* ------------------------------------------------------------------ */
 
-/** @brief Fill @p ix with a repeatable pseudo-random pattern in [0, hi]. */
-static void
-fill(int *ix, int n, int hi, unsigned int seed)
-{
-    int     i;
-    for (i = 0; i < n; ++i) {
-        seed = seed * 1103515245u + 12345u;
-        ix[i] = (int) ((seed >> 16) % (unsigned int) (hi + 1));
-    }
-}
-
 /* ------------------------------------------------------------------ */
 /* ix_max                                                              */
 /* ------------------------------------------------------------------ */
 
 /**
- * @brief The vector maximum agrees with a scalar one at every length.
+ * @brief Checks that the vector maximum agrees with a scalar maximum at every
+ *        length.
  *
- * Lengths run from the shortest a region can be up to past two full vector
- * blocks, so the block loop, its remainder, and the case where the loop never
- * runs at all are each covered.
+ * The lengths run from the shortest possible region to more than two full
+ * vector blocks. So the test covers the block loop, its remainder, and the
+ * case where the block loop does not run at all.
  */
 static void
 test_ix_max_lengths(LAME_UNUSED void **state)
@@ -181,7 +143,7 @@ test_ix_max_lengths(LAME_UNUSED void **state)
     int     n;
 
     for (n = 2; n <= 80; n += 2) {
-        fill(ix, n, 8000, (unsigned int) n + 1u);
+        fill_pattern(ix, n, 8000, (unsigned int) n + 1u);
         assert_int_equal(ix_max_sse2(ix, ix + n), ref_max(ix, n));
         if (have_avx2())
             assert_int_equal(avx2_max(ix, ix + n), ref_max(ix, n));
@@ -189,11 +151,12 @@ test_ix_max_lengths(LAME_UNUSED void **state)
 }
 
 /**
- * @brief The values the caller makes decisions on are reported exactly.
+ * @brief Checks that the values on which the caller decides are returned
+ *        exactly.
  *
- * choose_table asks three questions of this number - is it at most 15, is it
- * above IXMAX_VAL, and which linbits bucket does it fall in - so the answers
- * either side of both boundaries have to be exact.
+ * choose_table asks three questions about this number. Is it at most 15? Is
+ * it above IXMAX_VAL? Which linbits range does it fall in? So the results on
+ * both sides of both boundaries must be exact.
  */
 static void
 test_ix_max_boundaries(LAME_UNUSED void **state)
@@ -219,13 +182,14 @@ test_ix_max_boundaries(LAME_UNUSED void **state)
 }
 
 /**
- * @brief Above the narrowing's saturation point the answer stays usable.
+ * @brief Checks that the result stays usable above the saturation point of
+ *        the narrowing.
  *
- * Sixteen bits cannot hold 40000, and the routine does not pretend otherwise.
- * What it promises is weaker and is all the caller needs: a value that is
- * still above IXMAX_VAL, so the region is still rejected. This is the test
- * that fails if IXMAX_VAL is ever raised past the saturation point - together
- * with the compile-time assertion in takehiro.c.
+ * Sixteen bits cannot store 40000, and the routine does not claim otherwise.
+ * It promises less, and that is all the caller needs. The result is still
+ * above IXMAX_VAL, so the caller still rejects the region. This test fails if
+ * IXMAX_VAL is ever raised past the saturation point. The compile-time
+ * assertion in takehiro.c then fails too.
  */
 static void
 test_ix_max_saturation(LAME_UNUSED void **state)
@@ -249,65 +213,44 @@ test_ix_max_saturation(LAME_UNUSED void **state)
 /* count_bit_esc_sse2                                                  */
 /* ------------------------------------------------------------------ */
 
-/** @brief Sum and clamp count agree with a scalar reference at every length. */
+/**
+ * @brief Runs esc_check_lengths() on the SSE2 routine.
+ * @param state cmocka fixture state (unused).
+ */
 static void
 test_esc_lengths(LAME_UNUSED void **state)
 {
-    int     ix[MAX_LEN];
-    int     n;
-
-    for (n = 2; n <= 80; n += 2) {
-        unsigned int nc_v = 12345, nc_r = 0;
-        unsigned int sv, sr;
-        fill(ix, n, 200, (unsigned int) n + 7u);
-        sv = count_bit_esc_sse2(ix, ix + n, largetbl_t, &nc_v);
-        sr = ref_esc(ix, n, &nc_r);
-        assert_int_equal(sv, sr);
-        assert_int_equal(nc_v, nc_r);
-    }
+    esc_check_lengths(count_bit_esc_sse2, largetbl_t);
 }
 
 /**
- * @brief 15 is clamped and 14 is not - the boundary the escape coding turns on.
- *
- * Checked as whole regions of one value so a count that is off by one per
- * block, per lane, or per remainder cannot hide in a mixed sample.
+ * @brief Runs esc_check_clamp_boundary() on the SSE2 routine.
+ * @param state cmocka fixture state (unused).
  */
 static void
 test_esc_clamp_boundary(LAME_UNUSED void **state)
 {
-    int     ix[64];
-    int     v;
-
-    for (v = 13; v <= 17; ++v) {
-        unsigned int nc_v = 0, nc_r = 0;
-        unsigned int sv, sr;
-        int     i;
-        for (i = 0; i < 64; ++i)
-            ix[i] = v;
-        sv = count_bit_esc_sse2(ix, ix + 64, largetbl_t, &nc_v);
-        sr = ref_esc(ix, 64, &nc_r);
-        assert_int_equal(sv, sr);
-        assert_int_equal(nc_v, nc_r);
-        assert_int_equal(nc_v, v >= 15 ? 64u : 0u);
-    }
+    esc_check_clamp_boundary(count_bit_esc_sse2, largetbl_t);
 }
 
-/** @brief Values far above the clamp still count once each, not more. */
+/**
+ * @brief Runs esc_check_large_values() on the SSE2 routine.
+ * @param state cmocka fixture state (unused).
+ */
 static void
 test_esc_large_values(LAME_UNUSED void **state)
 {
-    int     ix[64];
-    unsigned int nc_v = 0, nc_r = 0;
-    unsigned int sv, sr;
-    int     i;
+    esc_check_large_values(count_bit_esc_sse2, largetbl_t);
+}
 
-    for (i = 0; i < 64; ++i)
-        ix[i] = (i % 3 == 0) ? 40000 : 3;
-    sv = count_bit_esc_sse2(ix, ix + 64, largetbl_t, &nc_v);
-    sr = ref_esc(ix, 64, &nc_r);
-    assert_int_equal(sv, sr);
-    assert_int_equal(nc_v, nc_r);
+/**
+ * @brief Runs esc_check_reference_can_disagree() on the SSE2 routine.
+ * @param state cmocka fixture state (unused).
+ */
+static void
+test_esc_reference_can_disagree(LAME_UNUSED void **state)
+{
+    esc_check_reference_can_disagree(count_bit_esc_sse2, largetbl_t);
 }
 
 /* ------------------------------------------------------------------ */
@@ -315,11 +258,12 @@ test_esc_large_values(LAME_UNUSED void **state)
 /* ------------------------------------------------------------------ */
 
 /**
- * @brief The three sums agree with a scalar reference, at each table width.
+ * @brief Checks that the three sums agree with a scalar reference at each
+ *        table width.
  *
- * The widths are the ones the table selection can produce, and each caps the
- * values that can occur with it - a wider index than that would run off the
- * end of the code-length table, so the ranges here are the real ones.
+ * The widths are the ones that the table selection can produce. Each width
+ * limits the values that can occur with it. A larger index would run past the
+ * end of the code-length table. So the value ranges here are the real ones.
  */
 static void
 test_from3_widths(LAME_UNUSED void **state)
@@ -332,7 +276,7 @@ test_from3_widths(LAME_UNUSED void **state)
         int     n;
         for (n = 2; n <= 80; n += 2) {
             unsigned int sv[3], sr[3];
-            fill(ix, n, cases[c].maxv, (unsigned int) (n + cases[c].xlen));
+            fill_pattern(ix, n, cases[c].maxv, (unsigned int) (n + cases[c].xlen));
             count_bit_noESC_from3_sse2(ix, ix + n, cases[c].xlen,
                                        hlen_a, hlen_b, hlen_c, sv);
             ref_from3(ix, n, cases[c].xlen, sr);
@@ -343,7 +287,7 @@ test_from3_widths(LAME_UNUSED void **state)
     }
 }
 
-/** @brief The extreme index of each width is computed, not wrapped or clipped. */
+/** @brief Checks that the extreme indices of each width are computed exactly, without wrap or clip. */
 static void
 test_from3_index_extremes(LAME_UNUSED void **state)
 {
@@ -373,7 +317,7 @@ test_from3_index_extremes(LAME_UNUSED void **state)
 
 /* ------------------------------------------------------------------ */
 
-/** @brief Guard: a reference that agreed with everything would prove nothing. */
+/** @brief Guard: checks that the reference can disagree. A reference that agrees with everything proves nothing. */
 static void
 test_reference_can_disagree(LAME_UNUSED void **state)
 {
@@ -402,6 +346,7 @@ main(void)
         cmocka_unit_test(test_esc_lengths),
         cmocka_unit_test(test_esc_clamp_boundary),
         cmocka_unit_test(test_esc_large_values),
+        cmocka_unit_test(test_esc_reference_can_disagree),
         cmocka_unit_test(test_from3_widths),
         cmocka_unit_test(test_from3_index_extremes),
         cmocka_unit_test(test_reference_can_disagree),

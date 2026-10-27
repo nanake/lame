@@ -54,6 +54,9 @@ typedef struct ReaderConfig
 typedef struct WriterConfig
 {
     int   flush_write;
+    int   preserve_modtime;        /* give the output file the input file's times */
+    int   replaygain_id3v2;        /* also write ReplayGain to ID3v2 TXXX frames */
+    int   id3v2_padding;           /* bytes of ID3v2 padding the user asked for */
 } WriterConfig;
 
 typedef struct UiConfig
@@ -69,6 +72,7 @@ typedef struct DecoderConfig
     int   mp3_delay;                /* to adjust the number of samples truncated during decode */
     int   mp3_delay_set;            /* user specified the value of the mp3 encoder delay to assume for decoding */
     int   disable_wav_header;
+    int   swapbytes;                /* -x with --decode: swap the bytes of raw output */
     mp3data_struct mp3input_data;
 } DecoderConfig;
 
@@ -81,19 +85,57 @@ typedef struct RawPCMConfig
     ByteOrder in_endian;
 } RawPCMConfig;
 
-extern ReaderConfig global_reader;
-extern WriterConfig global_writer;
-extern UiConfig global_ui_config;
-extern DecoderConfig global_decoder;
-extern RawPCMConfig global_raw_pcm;
+/**
+ * @internal
+ * @brief The configuration of the frontend programs. parse_args() sets it
+ *        from the command line.
+ *
+ * All members are plain values without pointers, so a struct copy saves and
+ * restores the whole configuration.
+ */
+typedef struct FrontendConfig
+{
+    ReaderConfig  reader;           /**< how the input file is read */
+    WriterConfig  writer;           /**< how the output file is written */
+    UiConfig      ui_config;        /**< what is printed while encoding */
+    RawPCMConfig  raw_pcm;          /**< the format of raw PCM input */
+    DecoderConfig decoder;          /**< the settings of --decode */
+} FrontendConfig;
 
+/**
+ * @internal
+ * @brief The initializer of the default configuration: the settings without
+ *        any option.
+ */
+#define FRONTEND_CONFIG_DEFAULTS                                        \
+{ /* reader    */ { sf_unknown, 0, 0, 0, 0 }                            \
+, /* writer    */ { 0, 0, 0, 0 }                                        \
+, /* ui_config */ { 0, 1, 0, 0 }                                        \
+, /* raw_pcm   */ { 16, -1, ByteOrderLittleEndian }                     \
+, /* decoder   */ { 0, 0, 0, 0, { 0 } }                                 \
+}
+
+/** @internal @brief The default configuration, ::FRONTEND_CONFIG_DEFAULTS. */
+extern const FrontendConfig frontend_config_defaults;
+
+/** @internal @brief The configuration of this run. */
+extern FrontendConfig frontend_config;
+
+
+/*  strnlen is C11 and POSIX.1-2008; older systems do not have it.  The calls
+    that use it are bounded on purpose - the buffer need not contain a NUL at
+    all - so strlen is not a substitute for it. */
+#ifdef HAVE_STRNLEN
+# define lame_strnlen strnlen
+#else
+extern size_t lame_strnlen(char const* s, size_t n);
+#endif
 
 extern FILE* lame_fopen(char const* file, char const* mode);
 extern char* utf8ToConsole8Bit(const char* str);
 extern char* utf8ToLocal8Bit(const char* str);
 extern unsigned short* utf8ToUtf16(char const* mbstr);
 extern char* utf8ToLatin1(char const* str);
-extern char* local8BitToUtf8(const char* str);
 #ifdef _WIN32
 extern wchar_t* utf8ToUnicode(char const* mbstr);
 extern char *unicodeToUtf8(const wchar_t *wstr);

@@ -20,21 +20,33 @@
  * Boston, MA 02111-1307, USA.
  */
 
-#if !defined(AFX_VITECENCODER_H__40DC8A44_B937_11D2_A381_A2FD7C37FA15__INCLUDED_)
-#define AFX_VITECENCODER_H__40DC8A44_B937_11D2_A381_A2FD7C37FA15__INCLUDED_
+#if !defined(LAME_DSHOW_ENCODER_H)
+#define LAME_DSHOW_ENCODER_H
 
 #if _MSC_VER >= 1000
 #pragma once
 #endif // _MSC_VER >= 1000
 
+#include <stddef.h>
+
 #include <lame.h>
 
 
-const unsigned int dwBitRateValue[2][14] =
+/**
+ * Returns a bitrate of the standard, in kbit/s, lowest first.
+ *
+ * \param lsf    0 for MPEG-1, 1 for MPEG-2 and MPEG-2.5, which share the
+ *               MPEG-2 bitrates here.
+ * \param index  0 to 13: the frame header's bitrate index, less 1.
+ * \return the bitrate in kbit/s.
+ */
+inline unsigned int BitRateValue(int lsf, int index)
 {
-    {32,40,48,56,64,80,96,112,128,160,192,224,256,320},     // MPEG-1
-    {8,16,24,32,40,48,56,64,80,96,112,128,144,160}          // MPEG-2/2.5
-};
+    return (unsigned int) lame_get_bitrate(lsf ? 0 : 1, index + 1);
+}
+
+/** \brief Samples in one Layer III frame of MPEG-1, and of MPEG-2 and MPEG-2.5. */
+enum { MPEG1_SAMPLES_PER_FRAME = 1152, MPEG2_SAMPLES_PER_FRAME = 576 };
 /*
 #define STEREO           0
 #define JOINT_STEREO     1
@@ -48,25 +60,24 @@ const unsigned int dwBitRateValue[2][14] =
 #define OUT_BUFFER_MAX              (OUT_BUFFER_SIZE - OUT_BUFFER_GUARD)
 
 typedef struct {
-    DWORD   dwSampleRate;                   //SF in Hz
-    DWORD   dwBitrate;                      //BR in bit per second
+    DWORD   dwSampleRate;                   ///< output sample rate in Hz
+    DWORD   dwBitrate;                      ///< bitrate in kbit/s
     vbr_mode    vmVariable;
-    DWORD   dwVariableMin;                  //specify a minimum allowed bitrate
-    DWORD   dwVariableMax;                  //specify a maximum allowed bitrate
-    DWORD   dwQuality;                      //Encoding quality
-    DWORD   dwVBRq;                         // VBR quality setting (0=highest quality, 9=lowest)                         
-    long    lLayer;                         //Layer: 1 or 2
+    DWORD   dwVariableMin;                  ///< lowest VBR bitrate in kbit/s
+    DWORD   dwVariableMax;                  ///< highest VBR bitrate in kbit/s
+    DWORD   dwQuality;                      ///< encoding quality
+    DWORD   dwVBRq;                         ///< VBR quality, 0 (highest) to 9 (lowest)                         
 
-    MPEG_mode ChMode;                       //Channel coding mode: see doc
+    MPEG_mode ChMode;                       ///< channel mode
     DWORD   dwForceMS;
 
-    DWORD   bCRCProtect;                    //Is CRC protection activated?
+    DWORD   bCRCProtect;                    ///< nonzero to write CRC checksums
     DWORD   bForceMono;
     DWORD   bSetDuration;
-    DWORD   bCopyright;                     //Is the stream protected by copyright?
-    DWORD   bOriginal;                      //Is the stream an original?
+    DWORD   bCopyright;                     ///< nonzero to set the copyright bit
+    DWORD   bOriginal;                      ///< nonzero to set the original bit
 
-    DWORD   dwPES;                          // PES header. Obsolete
+    DWORD   dwPES;                          ///< the PES setting. The encoder does not support PES output.
 
     DWORD   dwEnforceVBRmin;
     DWORD   dwVoiceMode;
@@ -76,7 +87,17 @@ typedef struct {
     DWORD   dwXingTag;
     DWORD   dwModeFixed;
     DWORD   bSampleOverlap;
+    DWORD   bPrivate;                       ///< nonzero to set the private bit
+    DWORD   bReservoir;                     ///< nonzero to use the bit reservoir
+    DWORD   dwAverageBitrate;               ///< the bitrate that ABR aims at, in kbit/s
 } MPEG_ENCODER_CONFIG;
+
+/**
+ * The size of the settings up to bSampleOverlap: the parameter block and the
+ * saved graphs of the filter before bPrivate was added. The filter still reads
+ * both.
+ */
+#define MPEG_ENCODER_CONFIG_FIRST_BYTES offsetof(MPEG_ENCODER_CONFIG, bPrivate)
 
 
 class CEncoder
@@ -86,10 +107,9 @@ public:
     CEncoder();
     virtual ~CEncoder();
 
-    // Initialize encoder with PCM stream properties
-    HRESULT SetInputType(LPWAVEFORMATEX lpwfex, bool bJustCheck = FALSE);   // returns E_INVALIDARG if not supported
-    // GetInputType - returns current input type
-    HRESULT GetInputType(WAVEFORMATEX *pwfex)
+    HRESULT SetInputType(const WAVEFORMATEX *lpwfex, bool bJustCheck = FALSE);
+    /// Copies the input format. Returns E_UNEXPECTED if it is not set.
+    HRESULT GetInputType(WAVEFORMATEX *pwfex) const
     {
         if(m_bInpuTypeSet)
         {
@@ -100,11 +120,9 @@ public:
             return E_UNEXPECTED;
     }
 
-    // Set MPEG audio parameters
-    HRESULT SetOutputType(MPEG_ENCODER_CONFIG &mabsi);      // returns E_INVALIDARG if not supported or
-                                                            // not compatible with input type
-    // Return current MPEG audio settings
-    HRESULT GetOutputType(MPEG_ENCODER_CONFIG* pmabsi)
+    HRESULT SetOutputType(const MPEG_ENCODER_CONFIG &mabsi);
+    /// Copies the encoder settings. Returns E_UNEXPECTED if they are not set.
+    HRESULT GetOutputType(MPEG_ENCODER_CONFIG* pmabsi) const
     {
         if (m_bOutpuTypeSet)
         {
@@ -115,27 +133,23 @@ public:
             return E_UNEXPECTED;
     }
 
-    // Set if output stream is a PES. Obsolete
+    /// Sets the PES setting to 0, whatever @p bPES is.
     void SetPES(bool bPES)
     {
         m_mabsi.dwPES = false;//bPES;
     }
-    // Is output stream a PES. Obsolete
+    /// Returns the PES setting. The encoder does not support PES output.
     BOOL IsPES() const
     {
         return (BOOL)m_mabsi.dwPES;
     }
 
-    // Initialize encoder SDK
     HRESULT Init();
-    // Close encoder SDK
     HRESULT Close(IStream* pStream);
 
-    // Encode media sample data
     int Encode(const short * pdata, int data_size);
-    int GetFrame(const unsigned char ** pframe);
+    int GetFrame(const unsigned char ** pframe, bool * preroll);
 
-    // Returns block of a mp3 file, witch size integer multiples of cbAlign
     int GetBlockAligned(const unsigned char ** pblock, int* piBufferSize, const long& cbAlign);
 
     HRESULT Finish();
@@ -144,7 +158,6 @@ protected:
     HRESULT updateLameTagFrame(IStream* pStream);
     static HRESULT skipId3v2(IStream *pStream, size_t lametag_frame_size);
     static HRESULT maybeSyncWord(IStream *pStream);
-    HRESULT SetDefaultOutputType(LPWAVEFORMATEX lpwfex);
 
     // Input media type
     WAVEFORMATEX        m_wfex;
@@ -162,11 +175,11 @@ protected:
     BOOL                m_bFinished;
     int                 m_frameCount;
 
-    unsigned char *     m_outFrameBuf;
+    unsigned char       m_outFrameBuf[OUT_BUFFER_SIZE];
     int                 m_outOffset;
     int                 m_outReadOffset;
 
     CCritSec            m_lock;
 };
 
-#endif // !defined(AFX_VITECENCODER_H__40DC8A44_B937_11D2_A381_A2FD7C37FA15__INCLUDED_)
+#endif // !defined(LAME_DSHOW_ENCODER_H)

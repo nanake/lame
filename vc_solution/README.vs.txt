@@ -13,6 +13,7 @@ There are two solution files in the "lame/vc_solution" folder that can be
 opened. The solution "vs_lame.slnx" contains the following projects:
 
 - lame: The lame.exe command line executable
+- lame_enc: The Blade-compatible encoder DLL lame_enc.dll
 - libmp3lame: The dynamic library libmp3lame.dll
 - libmp3lame-static: The static library variant of the above
 - mp3rtp: command line tool to stream mp3 via RTP protocol
@@ -23,6 +24,29 @@ The solution "vs_lame_clients.slnx" contains several more projects:
 - ACM, ADbg, tinyxml: Ancient Windows "Audio Codec Manager"
 - lame_DirectShow: DirectShow filter
 - lame_test: Test program
+- lame_acm_test, lame_dshow_test, lame_blade_test: component tests
+
+The component tests are console programs that report one line per check
+and exit non-zero if any of them failed, so a build step can read their
+status. Run them from the output directory with no arguments; each finds the
+component it tests beside itself.
+
+lame_acm_test checks the codec's sample rate selection and its stored
+configuration, then hands the built lameACM.acm to the Audio Compression
+Manager and has it convert a second of audio. lame_dshow_test builds a filter
+graph around the built lame.ax and streams a WAV file through it.
+lame_blade_test drives the built lame_enc.dll through the Blade calls a
+host makes - encode, drain, tag rewrite - and walks the frames that come
+out; lame_enc.dll is built by the vs_lame.slnx solution, so this test
+skips when there is none beside it, or fails under --require. None of
+them registers anything: the ACM accepts a driver for one process given its entry
+point, and the filter comes from its own class factory rather than by CLSID,
+so no registry entry and no administrator are involved. What that leaves
+uncovered is the machine-wide registration itself.
+
+The DirectShow filter builds only where the base class sources are (see
+below), so lame_dshow_test reports that it skipped when there is no lame.ax
+to load. Pass --require to turn that into a failure instead.
 
 In the two solutions there are several configurations that can be used to
 compile different flavors of LAME libraries and executables:
@@ -85,7 +109,9 @@ Open the file "lame/vc_solution/vs_libmpg123_config.props" and edit the
 following  two user macro parameters:
 
 - The value of `HaveMpg123` can be set to false or true, and specifies if
-  the libmpg123 library is available and used in lame.exe and libmp3lame.dll.
+  the libmpg123 library is available and used in lame.exe, mp3rtp.exe,
+  mp3x.exe and libmp3lame.dll. These then need `libmpg123-0.dll` at run time;
+  the build copies it beside them.
   When set to false, decoding is not available in LAME. This includes
   calculating accurate Replaygain by decoding the just encoded data on-the-fly.
 - `Mpg123Path` specifies the path to the root folder of mpg123. The paths built
@@ -99,6 +125,11 @@ following  two user macro parameters:
 
 As described above, you can also use the Property Manager view to change the
 values.
+
+The Blade encoder DLL (lame_enc.dll), the ACM codec and the DirectShow filter
+never contain the decoder, whatever `HaveMpg123` says. They link
+`libmp3lame-static-nodec.lib`, which `vs_libmp3lame_nodec.vcxproj` builds from
+the same sources, and do not need `libmpg123-0.dll`.
 
 Note that when compiling for the x64 platform, you have to use the 64-bit
 version of libmpg123. Alternatively you can use the `Mpg123Path` as is
@@ -143,26 +174,31 @@ values.
 
 Note that compiling mp3x for 64-bit platforms is currently not available.
 
-### Windows SDK 7.1
+### DirectShow base classes
 
-For the DirectShow filter, the Windows SDK 7.1 is needed, especially the
-samples folder where a multimedia base class library must be compiled before.
+The lame_DirectShow filter derives from the DirectShow base classes. Microsoft
+publishes those as source rather than as part of the Windows SDK, in the
+Windows classic samples repository:
+https://github.com/microsoft/Windows-classic-samples
 
-Download the Windows SDK 7.1 installer from here:
-https://www.microsoft.com/en-us/download/details.aspx?id=8279
-(or search for "Microsoft Windows SDK for Windows 7 and .NET Framework 4",
-version 7.1)
+Take the folder "Samples\Win7Samples\multimedia\directshow\baseclasses" from it
+and extract that into the "vc_solution\baseclasses" folder, the same way as
+mpg123 and libsndfile above. Nothing needs to be built there: the sources are
+compiled into the filter.
 
-When starting the web setup, you can choose the installation options. Only the
-"Samples" under "Windows Native Code Development" is actually necessary.
+Open the file "lame/vc_solution/vs_dshow_config.props" and edit the following
+two user macro parameters:
 
-Open the file "lame/vc_solution/vs_win71sdk_config.props" and edit the
-`Win71SdkPath` in the first few lines of the file, ending the path with a
-backslash. As described above, you can also use the Property Manager view to
-change the values.
+- The value of `HaveDShowBaseClasses` can be set to false or true, and
+  specifies whether the base class sources are available and lame_DirectShow
+  can be built. The filter is not selected for building in the solution by
+  default, since it needs them.
+- `DShowBaseClassesPath` specifies the folder that holds the base class
+  sources (the default value is `.\baseclasses`). Do not end it with a
+  backslash: the paths built from it supply their own separator, so that the
+  value can be quoted against spaces.
 
-In the Win71SdkPath path, locate the solution file
-"Samples\multimedia\directshow\baseclasses\baseclasses.sln", convert it from
-the old Visual Studio project format and compile the "Debug_MBCS" and
-"Release_MBCS" configurations. The resulting files strmbasd.lib and
-strmbase.lib are used by the lame_DirectShow project for linking.
+As described above, you can also use the Property Manager view to change the
+values.
+
+The filter is built for the Win32 platform.

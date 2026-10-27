@@ -3,20 +3,19 @@
  *  \brief mp3x analyzer session - implementation.
  *  \internal
  *
- *  Per-file lifecycle for the GTK4 mp3x frame analyzer. Each open input file
- *  lives in its own Mp3xSession; closing or replacing the file tears down the
- *  session entirely - idle source, analyzer core, input decoder, \c lame_t - so
- *  that the next open starts from documented clean defaults rather than
- *  accumulated state.
+ *  Opening and closing input files in the GTK4 mp3x frame analyzer. Each open
+ *  input file has its own Mp3xSession. Closing or replacing the file closes and
+ *  frees the whole session: the idle source, the analyzer engine, the input
+ *  decoder and the \c lame_t. So the next open starts from the documented
+ *  defaults, and not from the state of earlier files.
  *
- *  The two open routes, mp3x_session_open_prevalidated() for the GUI path and
- *  mp3x_session_open_cli_initial() for the initial CLI-named file, both funnel
- *  through the same teardown and installation sequence; only the \c parse_args
- *  call differs.
+ *  There are two ways to open a file: mp3x_session_open_prevalidated() for the
+ *  GUI, and mp3x_session_open_cli_initial() for the first file named on the
+ *  command line. Both use the same close and install steps. Only the call of
+ *  \c parse_args differs.
  *
- *  This module is toolkit-independent: no GTK widgets, and no GLib main-loop
- *  code beyond what close and open need for path handling. The GTK frontend in
- *  mp3x_ui.c drives it.
+ *  This file has no GTK widgets, and no GLib main-loop code except what open
+ *  and close need for the file paths. The GTK frontend in mp3x_ui.c uses it.
  */
 
 #ifdef HAVE_CONFIG_H
@@ -45,84 +44,39 @@
  * GTK layer is their natural owner.
  * -------------------------------------------------------------------------- */
 extern guint64                  mp3x_driver_next_generation(Mp3xDriver *d);
-extern FrontendGlobalsBaseline *mp3x_driver_baseline(Mp3xDriver *d);
+extern FrontendConfig *mp3x_driver_baseline(Mp3xDriver *d);
 
 
 /* ==========================================================================
  * Frontend-global baseline
  *
- * All five parse.c globals (and get_audio.c's `global`) are process-wide
- * singletons. Because mp3x holds at most one open input at a time, we treat
+ * frontend_config is a process-wide
+ * singleton. Because mp3x holds at most one open input at a time, we treat
  * them as current-session state: every mp3x_session_open restores the
  * baseline captured at startup, so options from a prior file or
  * from raw-input CLI flags on the initial file cannot leak into a later
  * GUI-opened self-describing file.
  *
- * The five parse.c structs contain only value data: integers, an enum, a
- * float, and an mp3data_struct containing integers. Struct-copy is therefore
- * a safe capture/restore.
- *
- * get_audio.c's `global` is intentionally NOT captured here; it is fully
- * reset by the existing init_infile()/close_infile() pair. init_infile resets
- * its fields; close_infile releases its owned resources and clears pointers.
+ * The input is not part of it: each session opens its own reader with
+ * init_infile() and closes it with close_infile().
  * ========================================================================== */
 
 void
 mp3x_apply_documented_defaults(void)
 {
-    /* These mirror parse_args() at frontend/parse.c:1659-1666 - the values
-       it sets unconditionally at the top of every call. */
-    global_ui_config.silent             = 0;
-    global_ui_config.brhist             = 1;
-    global_decoder.mp3_delay            = 0;
-    global_decoder.mp3_delay_set        = 0;
-    global_decoder.disable_wav_header   = 0;
-    global_ui_config.print_clipping_info = 0;
-
-    /* raw-PCM defaults that init_infile assumes when -r is NOT given.
-       init_infile:654 reads global_raw_pcm.in_bitwidth; the safe default
-       for self-describing WAV/AIFF/MP3 input is 16-bit signed little-endian
-       (the value parse_args would set if -r were given without further
-       flags). */
-    global_raw_pcm.in_bitwidth = 16;
-    global_raw_pcm.in_signed   = 1;
-    global_raw_pcm.in_endian   = ByteOrderLittleEndian;
-
-    /* global_reader documented defaults - matches post-parse_args-with-no-flags. */
-    global_reader.input_format     = sf_unknown;
-    global_reader.swapbytes        = 0;
-    global_reader.swap_channel     = 0;
-    global_reader.input_samplerate = 0;
-    global_reader.ignorewavlength  = 0;
-
-    /* global_writer - mp3x has no output stream; flush_write stays at 0. */
-    global_writer.flush_write      = 0;
-
-    /* global_decoder.mp3input_data is filled by the MP3 header parser on
-       open; start each session from a clean slate. */
-    memset(&global_decoder.mp3input_data, 0, sizeof global_decoder.mp3input_data);
+    frontend_config = frontend_config_defaults;
 }
 
 void
-mp3x_globals_capture(FrontendGlobalsBaseline *b)
+mp3x_globals_capture(FrontendConfig *b)
 {
-    /* Struct-copy; verified safe (no pointers in any member). */
-    b->reader    = global_reader;
-    b->writer    = global_writer;
-    b->ui_config = global_ui_config;
-    b->decoder   = global_decoder;
-    b->raw_pcm   = global_raw_pcm;
+    *b = frontend_config;
 }
 
 void
-mp3x_globals_restore(const FrontendGlobalsBaseline *b)
+mp3x_globals_restore(const FrontendConfig *b)
 {
-    /* Struct-copy back; restore the captured startup state. */
-    global_reader    = b->reader;
-    global_writer    = b->writer;
-    global_ui_config = b->ui_config;
-    global_decoder   = b->decoder;
-    global_raw_pcm   = b->raw_pcm;
+    frontend_config = *b;
 }
 
 
@@ -273,49 +227,6 @@ mp3x_prevalidate_result_clear(Mp3xPrevalidateResult *result)
 
 
 /* ==========================================================================
- * File-extension classification
- *
- * parse.c:filename_to_type only matches the last 4 characters and so would
- * reject .wave, .aiff, .aifc (their last 4 chars are "wave", "aiff", "aifc"
- * - none of which the function recognizes). Our classifier accepts all the
- * extensions the GUI filter advertises. The format decision still belongs
- * to init_infile's header parsers - this is just the hint
- * that picks which opener runs.
- * ========================================================================== */
-
-sound_file_format
-mp3x_classify_extension(const char *path)
-{
-    const char *dot;
-
-    if (path == NULL)
-        return sf_unknown;
-
-    dot = strrchr(path, '.');
-    if (dot == NULL || dot == path)
-        return sf_unknown;
-    dot++;   /* skip the dot */
-
-    if (g_ascii_strcasecmp(dot, "wav")  == 0 ||
-        g_ascii_strcasecmp(dot, "wave") == 0)
-        return sf_wave;
-
-    if (g_ascii_strcasecmp(dot, "aif")  == 0 ||
-        g_ascii_strcasecmp(dot, "aiff") == 0 ||
-        g_ascii_strcasecmp(dot, "aifc") == 0)
-        return sf_aiff;
-
-    if (g_ascii_strcasecmp(dot, "mp1")  == 0 ||
-        g_ascii_strcasecmp(dot, "mp2")  == 0 ||
-        g_ascii_strcasecmp(dot, "mp3")  == 0 ||
-        g_ascii_strcasecmp(dot, "mpg")  == 0)
-        return sf_mp123;
-
-    return sf_unknown;
-}
-
-
-/* ==========================================================================
  * Filename sanitization
  *
  * Used for save-dialog default filenames. Strips directory components and
@@ -406,6 +317,39 @@ mp3x_session_reset_fields(Mp3xSession *s)
 }
 
 
+/**
+ * \internal
+ * \brief Opens the input file of a session, initializes its encoder and
+ *        brings the analyzer up.
+ *
+ * Calls init_infile(), then lame_init_params() through
+ * frontend_init_params(), then mp3x_core_init(), which closes any decoder
+ * handle that it may still hold.
+ *
+ * \param s     the session, with its encoder set up.
+ * \param path  the input file.
+ * \param err   receives the error of the step that failed.
+ * \return TRUE on success. FALSE when a step fails; the caller then closes
+ *         the input file.
+ */
+static gboolean
+mp3x_session_open_input(Mp3xSession *s, const char *path, GError **err)
+{
+    if ((s->reader = init_infile(s->gf, path)) == NULL) {
+        g_set_error(err, MP3X_OPEN_ERROR, MP3X_OPEN_ERR_INIT_INFILE,
+                    "mp3x: unable to initialize input file '%s'", path);
+        return FALSE;
+    }
+    if (frontend_init_params(s->gf) < 0) {
+        g_set_error(err, MP3X_OPEN_ERROR, MP3X_OPEN_ERR_INIT_PARAMS,
+                    "mp3x: fatal error during initialization");
+        return FALSE;
+    }
+    mp3x_core_init(s->reader);
+    return TRUE;
+}
+
+
 /* Internal: the post-prevalidation common path. Assumes path is heap-owned
    and transferable. Takes ownership of `path` on success; frees it on
    failure. */
@@ -424,9 +368,7 @@ mp3x_session_install(Mp3xSession *s,
     }
 
     /* Standard reporting hooks so LAME's diagnostics reach the frontend. */
-    lame_set_errorf(s->gf, &frontend_errorf);
-    lame_set_debugf(s->gf, &frontend_debugf);
-    lame_set_msgf(s->gf, &frontend_msgf);
+    frontend_attach_reporting(s->gf);
 
     /* 2. Turn on the analyzer hooks. */
     (void) lame_set_analysis(s->gf, 1);
@@ -435,47 +377,29 @@ mp3x_session_install(Mp3xSession *s,
           pre-classified extension hint is set first; if our classifier
           did not recognize the extension, we let init_infile's own header
           parser decide. */
-    s->input_format = mp3x_classify_extension(path);
+    s->input_format = frontend_classify_suffix(path);
     if (s->input_format != sf_unknown)
-        global_reader.input_format = s->input_format;
+        frontend_config.reader.input_format = s->input_format;
 
-    if (init_infile(s->gf, path) < 0) {
-        g_set_error(err, MP3X_OPEN_ERROR, MP3X_OPEN_ERR_INIT_INFILE,
-                    "mp3x: unable to initialize input file '%s'", path);
+    /* 4. Open the input, initialize the encoder and the analyzer. */
+    if (!mp3x_session_open_input(s, path, err))
         goto fail_with_infile;
-    }
 
-    /* 4. lame_init_params. On failure (-1 specifically) LAME documents a
-          bitrate-table dump; we mirror the existing frontend behavior. */
-    {
-        int ret = lame_init_params(s->gf);
-        if (ret < 0) {
-            if (ret == -1)
-                display_bitrates(stderr);
-            g_set_error(err, MP3X_OPEN_ERROR, MP3X_OPEN_ERR_INIT_PARAMS,
-                        "mp3x: fatal error during initialization");
-            goto fail_with_infile;
-        }
-    }
-
-    /* 5. Bring the analyzer engine up. mp3x_core_init is idempotent and
-          closes any prior decoder handle it may still hold. */
-    mp3x_core_init();
-
-    /* 6. Install the path. */
+    /* 5. Install the path. */
     s->in_path      = path;
     s->display_name = display_name;
     s->is_open      = TRUE;
 
-    /* 7. Recompute the source default from the actual format. MP3 input
+    /* 6. Recompute the source default from the actual format. MP3 input
           defaults to mpg123-side analysis; PCM (WAV/AIFF) to LAME-side. */
-    s->source = is_mpeg_file_format(global_reader.input_format) ? 1 : 0;
+    s->source = is_mpeg_file_format(frontend_config.reader.input_format) ? 1 : 0;
 
     mp3x_session_reset_fields(s);
     return TRUE;
 
 fail_with_infile:
-    close_infile();
+    close_infile(s->reader);
+    s->reader = NULL;
     lame_close(s->gf);
     s->gf = NULL;
     g_free(path);
@@ -518,6 +442,7 @@ mp3x_session_open_cli_initial(Mp3xSession *s, Mp3xDriver *d,
 {
     char  in_path[PATH_MAX + 1]  = {0};
     char  out_path[PATH_MAX + 1] = {0};
+    char  out_dir[PATH_MAX + 1]  = {0};
     int   pa_ret;
     GFile *gfile = NULL;
     Mp3xPrevalidateResult pre = {0};
@@ -535,16 +460,14 @@ mp3x_session_open_cli_initial(Mp3xSession *s, Mp3xDriver *d,
                     "mp3x: lame_init() failed; out of memory");
         return MP3X_CLI_OPEN_ERROR;
     }
-    lame_set_errorf(s->gf, &frontend_errorf);
-    lame_set_debugf(s->gf, &frontend_debugf);
-    lame_set_msgf(s->gf, &frontend_msgf);
+    frontend_attach_reporting(s->gf);
 
     /* parse_args runs against the FULL original argv. It sets Cat-1
        encoder/analyzer options, applies any input-specific options
        (raw forcing, format forcing, byte swap), and copies the first
        positional argument to in_path and the second to out_path.
        parse_args' own error reporting is preserved. */
-    pa_ret = parse_args(s->gf, argc, argv, in_path, out_path, NULL, NULL);
+    pa_ret = parse_args(s->gf, argc, argv, in_path, out_path, out_dir, NULL, NULL);
     if (pa_ret == -2) {
         lame_close(s->gf);
         s->gf = NULL;
@@ -584,40 +507,22 @@ mp3x_session_open_cli_initial(Mp3xSession *s, Mp3xDriver *d,
     /* Turn on the analyzer hooks (parse_args may not have). */
     (void) lame_set_analysis(s->gf, 1);
 
-    /* init_infile from the actual path. */
-    if (init_infile(s->gf, pre.fs_path) < 0) {
-        g_set_error(err, MP3X_OPEN_ERROR, MP3X_OPEN_ERR_INIT_INFILE,
-                    "mp3x: unable to initialize input file '%s'", pre.fs_path);
+    if (!mp3x_session_open_input(s, pre.fs_path, err))
         goto fail_with_infile;
-    }
-
-    /* lame_init_params. */
-    {
-        int ret = lame_init_params(s->gf);
-        if (ret < 0) {
-            if (ret == -1)
-                display_bitrates(stderr);
-            g_set_error(err, MP3X_OPEN_ERROR, MP3X_OPEN_ERR_INIT_PARAMS,
-                        "mp3x: fatal error during initialization");
-            goto fail_with_infile;
-        }
-    }
-
-    /* Analyzer engine up. */
-    mp3x_core_init();
 
     /* Take ownership of the prepared path and display metadata. */
     s->in_path      = g_steal_pointer(&pre.fs_path);
     s->display_name = g_steal_pointer(&pre.display_name);
     mp3x_prevalidate_result_clear(&pre);
-    s->input_format = global_reader.input_format;
+    s->input_format = frontend_config.reader.input_format;
     s->is_open      = TRUE;
-    s->source       = is_mpeg_file_format(global_reader.input_format) ? 1 : 0;
+    s->source       = is_mpeg_file_format(frontend_config.reader.input_format) ? 1 : 0;
     mp3x_session_reset_fields(s);
     return MP3X_CLI_OPENED;
 
 fail_with_infile:
-    close_infile();
+    close_infile(s->reader);
+    s->reader = NULL;
 fail_with_lame:
     g_clear_object(&gfile);
     mp3x_prevalidate_result_clear(&pre);
@@ -646,10 +551,11 @@ mp3x_session_close(Mp3xSession *s)
        decoder (core_state.hip). No-op for MP3 input. */
     mp3x_core_shutdown();
 
-    /* get_audio.c teardown: releases the MP3 input decoder (global.hip,
-       which wraps mpg123), the open FILE, libsndfile handle, ID3 buffer,
-       and PCM buffers, then resets the get_audio global. */
-    close_infile();
+    /* Reader teardown: releases the MP3 input decoder (which wraps mpg123),
+       the open FILE, libsndfile handle, ID3 buffer and PCM buffers, and
+       the reader. */
+    close_infile(s->reader);
+    s->reader = NULL;
 
     /* Encoder handle teardown. On normal PCM completion the core has already
        called lame_encode_flush once and fed its bytes to the re-synthesis

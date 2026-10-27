@@ -18,7 +18,7 @@ endif
 ##liblamecpuroutines_la_LIBADD = 
 ##liblamecpuroutines_la_LDFLAGS =
 
-INCLUDES = @INCLUDES@ \
+AM_CPPFLAGS = @LAME_CPPFLAGS@ \
 	-I$(top_srcdir)/libmp3lame \
 	-I$(top_srcdir)/mpglib \
 	-I$(top_builddir)
@@ -57,7 +57,7 @@ liblamevectorneon_la_SOURCES = $(neon_sources)
 liblamevectorneon_la_CFLAGS = $(AM_CFLAGS) @VECTOR_NEON_FLAGS@
 endif
 
-noinst_HEADERS = lame_intrin.h
+noinst_HEADERS = lame_intrin.h xmm_quant_kernel.h
 
 EXTRA_liblamevectorroutines_la_SOURCES = $(xmm_sources)
 EXTRA_liblamevectoravx2_la_SOURCES = $(avx2_sources)
@@ -77,7 +77,7 @@ LCLINTFLAGS= \
 	-Dlint
 
 lclint.txt: ${liblamecpuroutines_la_SOURCES} ${noinst_HEADERS}
-	@lclint ${LCLINTFLAGS} ${INCLUDES} ${DEFS} ${liblamecpuroutines_la_SOURCES} 2>&1 >lclint.txt || true
+	@lclint ${LCLINTFLAGS} ${AM_CPPFLAGS} ${DEFS} ${liblamecpuroutines_la_SOURCES} 2>&1 >lclint.txt || true
 
 lclint: lclint.txt
 	more lclint.txt

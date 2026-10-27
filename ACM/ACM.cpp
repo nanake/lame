@@ -1,6 +1,6 @@
 /**
  *
- * Lame ACM wrapper, encode/decode MP3 based RIFF/AVI files in MS Windows
+ * Lame ACM wrapper, encode MP3 based RIFF/AVI files in MS Windows
  *
  *  Copyright (c) 2002 Steve Lhomme <steve.lhomme at free.fr>
  *
@@ -40,16 +40,16 @@
 #include <msacmdrv.h>
 
 #include <assert.h>
+#include <stdio.h>
 
 #include <lame.h>
+#include "../libmp3lame/version.h"
 
 #include "adebug.h"
 #include "resource.h"
 #include "ACMStream.h"
-
-#ifdef ENABLE_DECODING
-#include "DecodeStream.h"
-#endif // ENABLE_DECODING
+#include "DialogFont.h"
+#include "SettingText.h"
 
 #include "ACM.h"
 
@@ -57,40 +57,52 @@
 #define IDC_HAND            MAKEINTRESOURCE(32649)
 #endif // IDC_HAND
 
-char ACM::VersionString[120];
+char ACM::VersionString[VERSION_STRING_CHARS];
 
-const char ACM_VERSION[] = "0.9.2";
+/// The codec reports the LAME version that it is built from as its driver version.
+#define LAME_ACM_DRIVER_VERSION MAKE_ACM_VERSION(LAME_MAJOR_VERSION, LAME_MINOR_VERSION, LAME_PATCH_VERSION)
 
-#ifdef WIN32
-//
-//  32-bit versions
-//
-#if (WINVER >= 0x0400)
- #define VERSION_ACM_DRIVER  MAKE_ACM_VERSION(4,  0, 0)
-#else
-#define VERSION_ACM_DRIVER  MAKE_ACM_VERSION(3, 51, 0)
-#endif
 #define VERSION_MSACM MAKE_ACM_VERSION(3, 50, 0)
 
-#else
-//
-//  16-bit versions
-//
-#define VERSION_ACM_DRIVER MAKE_ACM_VERSION(1, 0, 0)
-#define VERSION_MSACM MAKE_ACM_VERSION(2, 1, 0)
-
-#endif
-
 #define PERSONAL_FORMAT WAVE_FORMAT_MPEGLAYER3
-#define SIZE_FORMAT_STRUCT sizeof(MPEGLAYER3WAVEFORMAT)
-//#define SIZE_FORMAT_STRUCT 0
 
-//static const char channel_mode[][13] = {"mono","stereo","joint stereo","dual channel"};
+/// The fdwFlags bit of the ABR formats that this codec lists. Windows defines
+/// fdwFlags as the padding mode (MPEGLAYER3_FLAG_PADDING_ISO, _ON and _OFF);
+/// this bit is none of them.
+static const DWORD FORMAT_FLAGS_ABR = 0x80000000;
+/// The fdwFlags value of the CBR formats that this codec lists.
+static const DWORD FORMAT_FLAGS_CBR = 4;
+/// The fdwFlags bit of the VBR formats that this codec lists, beside the ABR
+/// bit and like it none of the padding modes.
+static const DWORD FORMAT_FLAGS_VBR = 0x40000000;
+/// Where the VBR quality level of a VBR format sits in fdwFlags.
+static const int FORMAT_FLAGS_VBR_QUALITY_SHIFT = 24;
+/// The fdwFlags bits of the VBR quality level, 0 to 9.
+static const DWORD FORMAT_FLAGS_VBR_QUALITY_MASK = 0x0F000000;
+
+#define SIZE_FORMAT_STRUCT sizeof(MPEGLAYER3WAVEFORMAT)
+
 static const char channel_mode[][13] = {"mono","stereo"};
-static const unsigned int mpeg1_freq[] = {48000,44100,32000};
-static const unsigned int mpeg2_freq[] = {24000,22050,16000,12000,11025,8000};
-static const unsigned int mpeg1_bitrate[] = {320, 256, 224, 192, 160, 128, 112, 96, 80, 64, 56, 48, 40, 32};
-static const unsigned int mpeg2_bitrate[] = {160, 144, 128, 112,  96,  80,  64, 56, 48, 40, 32, 24, 16,  8};
+// The rates the standard defines: lame_get_bitrate() and
+// lame_get_samplerate() answer for the frame header's two index fields.
+// FillRateTables() fills these before anything reads them.
+//
+// The order is part of the driver's interface.  A host asks for format
+// number N and FormatDetails() turns it into a subscript here, so these
+// stay highest first rather than in the header's index order.
+static unsigned int mpeg1_freq[3];
+static unsigned int mpeg2_freq[6];
+static unsigned int mpeg1_bitrate[14];
+static unsigned int mpeg2_bitrate[14];
+
+// The bitrate, in kbit/s per channel, of the format the driver suggests when
+// an application asks what it should encode a PCM stream to.
+static const unsigned int SUGGESTED_BITRATE_PER_CHANNEL = 64;
+
+// MPEG version, as the two library calls number them.
+static const int LAME_MPEG2  = 0;
+static const int LAME_MPEG1  = 1;
+static const int LAME_MPEG25 = 2;
 
 #define SIZE_CHANNEL_MODE (sizeof(channel_mode)  / (sizeof(char) * 13))
 #define SIZE_FREQ_MPEG1 (sizeof(mpeg1_freq)    / sizeof(unsigned int))
@@ -98,7 +110,59 @@ static const unsigned int mpeg2_bitrate[] = {160, 144, 128, 112,  96,  80,  64, 
 #define SIZE_BITRATE_MPEG1 (sizeof(mpeg1_bitrate) / sizeof(unsigned int))
 #define SIZE_BITRATE_MPEG2 (sizeof(mpeg2_bitrate) / sizeof(unsigned int))
 
+/**
+	\brief Fills mpeg1_bitrate, mpeg2_bitrate, mpeg1_freq and mpeg2_freq from
+	the library.
+
+	Each call writes the same values. So it is safe to call it again for a
+	second driver instance.
+*/
+static void FillRateTables()
+{
+	unsigned int i;
+	static const int freq_order[3] = {1, 0, 2};
+
+	// Header bitrate indices run 1 to 14, lowest first; these tables run
+	// highest first, so index 14 is element 0.
+	for (i = 0;i < SIZE_BITRATE_MPEG1;i++)
+		mpeg1_bitrate[i] = (unsigned int) lame_get_bitrate(LAME_MPEG1, (int)(SIZE_BITRATE_MPEG1 - i));
+	for (i = 0;i < SIZE_BITRATE_MPEG2;i++)
+		mpeg2_bitrate[i] = (unsigned int) lame_get_bitrate(LAME_MPEG2, (int)(SIZE_BITRATE_MPEG2 - i));
+
+	// Sampling-frequency indices are 0 to 2 and are not in rate order: index 1
+	// is the highest of the three, then index 0, then index 2.
+	for (i = 0;i < 3;i++)
+	{
+		mpeg1_freq[i]     = (unsigned int) lame_get_samplerate(LAME_MPEG1,  freq_order[i]);
+		mpeg2_freq[i]     = (unsigned int) lame_get_samplerate(LAME_MPEG2,  freq_order[i]);
+		mpeg2_freq[i + 3] = (unsigned int) lame_get_samplerate(LAME_MPEG25, freq_order[i]);
+	}
+}
+
+/**
+	\brief Tells whether an MPEG Layer-3 stream can have this sample rate.
+
+	\param the_Frequency the sample rate in Hz
+	\return true if the rate is in mpeg1_freq or mpeg2_freq
+*/
+static bool IsMP3Frequency(const unsigned int the_Frequency)
+{
+	unsigned int i;
+
+	for (i = 0;i < SIZE_FREQ_MPEG1;i++)
+		if (mpeg1_freq[i] == the_Frequency)
+			return true;
+	for (i = 0;i < SIZE_FREQ_MPEG2;i++)
+		if (mpeg2_freq[i] == the_Frequency)
+			return true;
+	return false;
+}
+
 static const int FORMAT_TAG_MAX_NB = 2; // PCM and PERSONAL (mandatory to have at least PCM and your format)
+/// The index of the MP3 format tag, the first one
+static const DWORD FORMAT_TAG_INDEX_MP3 = 0;
+/// The index of the PCM format tag, the second one
+static const DWORD FORMAT_TAG_INDEX_PCM = 1;
 static const int FILTER_TAG_MAX_NB = 0; // this is a codec, not a filter
 
 // number of supported PCM formats
@@ -112,60 +176,26 @@ static const int FORMAT_MAX_NB_PCM =
 //////////////////////////////////////////////////////////////////////
 bool bitrate_item::operator<(const bitrate_item & other_bitrate) const
 {
+	// A VBR format comes after the CBR and ABR formats of the same sample
+	// rate, bitrate and channels, and the VBR formats among themselves by
+	// quality level, the best first.
+	bool const is_vbr = (mode == vbr_mtrh);
+	bool const other_is_vbr = (other_bitrate.mode == vbr_mtrh);
+
 	return (other_bitrate.frequency < frequency ||
 		    (other_bitrate.frequency == frequency &&
 			 (other_bitrate.bitrate < bitrate ||
 			  (other_bitrate.bitrate == bitrate &&
-			   (other_bitrate.channels < channels)))));
+			   (other_bitrate.channels < channels ||
+			    (other_bitrate.channels == channels &&
+			     (other_is_vbr > is_vbr ||
+			      (other_is_vbr == is_vbr && quality < other_bitrate.quality))))))));
 }
 
-//////////////////////////////////////////////////////////////////////
-// Configuration Dialog
-//////////////////////////////////////////////////////////////////////
-/*
-static CALLBACK ConfigProc(
-  HWND hwndDlg,  // handle to dialog box
-UINT uMsg,     // message
-WPARAM wParam, // first message parameter
-LPARAM lParam  // second message parameter
-)
-{
-	BOOL bResult;
-
-	switch (uMsg) {
-		case WM_COMMAND:
-			UINT command;
-			command = GET_WM_COMMAND_ID(wParam, lParam);
-            if (IDOK == command)
-            {
-                EndDialog(hwndDlg, (IDOK == command));
-            } else if (IDCANCEL == command)
-            {
-                EndDialog(hwndDlg, (IDOK == command));
-            }
-            bResult = FALSE;
-			break;
-		default:
-			bResult = FALSE; // will be treated by DefWindowProc
-}
-	return bResult;
-}
-
-
-inline DWORD ACM::Configure(HWND hParentWindow, LPDRVCONFIGINFO pConfig)
-{
-	my_debug.OutPut(DEBUG_LEVEL_FUNC_START, "ACM : Configure (Parent Window = 0x%08X)",hParentWindow);
-
-	DialogBoxParam( my_hModule, MAKEINTRESOURCE(IDD_CONFIG), hParentWindow, ::ConfigProc , (LPARAM)this);
-
-	return DRVCNF_OK; // Can also return
-					// DRVCNF_CANCEL
-					// and DRVCNF_RESTART
-}
-*/
 //////////////////////////////////////////////////////////////////////
 // About Dialog
 //////////////////////////////////////////////////////////////////////
+
 
 static BOOL CALLBACK AboutProc(
   HWND hwndDlg,  // handle to dialog box
@@ -174,46 +204,26 @@ WPARAM wParam, // first message parameter
 LPARAM lParam  // second message parameter
 )
 {
-	static HBRUSH hBrushStatic = NULL;
-//	static LOGFONT lf;  // structure for font information  
-//	static HFONT hfnt;
 	static HCURSOR hcOverCursor = NULL;
 	BOOL bResult = FALSE;
 
 	switch (uMsg) {
 		case WM_INITDIALOG:
 			char tmp[150];
-			wsprintf(tmp,"LAME MP3 codec v%s", ACM::GetVersionString());
+			snprintf(tmp, sizeof tmp, "LAME MP3 Codec v%s", ACM::GetVersionString());
 			::SetWindowText(GetDlgItem( hwndDlg, IDC_STATIC_ABOUT_TITLE), tmp);
-
-/*
-			::GetObject(::GetStockObject(DEFAULT_GUI_FONT), sizeof(LOGFONT), &lf); 
-			lf.lfUnderline = TRUE;
-
-			hfnt = ::CreateFontIndirect(&lf);
-
-			::SendMessage(::GetDlgItem(hwndDlg,IDC_STATIC_ABOUT_URL), WM_SETFONT, (WPARAM) hfnt, TRUE);
-* /
-			hBrushStatic = ::CreateSolidBrush(::GetSysColor (COLOR_BTNFACE));
-*/			hcOverCursor = ::LoadCursor(NULL,(LPCTSTR)IDC_HAND); 
+			::SetDlgItemText(hwndDlg, IDC_STATIC_ABOUT_CREDITS, ABOUT_CREDITS);
+			::SetDlgItemText(hwndDlg, IDC_STATIC_ABOUT_URL, get_lame_url());
+			::SetDlgItemText(hwndDlg, IDC_STATIC_ABOUT_ICON, ABOUT_ICON_CREDIT);
+			::SetDlgItemText(hwndDlg, IDC_EDIT_ABOUT_LICENSE, LICENSE_NOTICE);
+			hcOverCursor = ::LoadCursor(NULL,(LPCTSTR)IDC_HAND);
 			if (hcOverCursor == NULL)
-				hcOverCursor = ::LoadCursor(NULL,(LPCTSTR)IDC_CROSS); 
+				hcOverCursor = ::LoadCursor(NULL,(LPCTSTR)IDC_CROSS);
 
-			bResult = TRUE;
+			// The focus goes to OK, not to the licence box, which would select its text.
+			::SetFocus(GetDlgItem(hwndDlg, IDOK));
+			bResult = FALSE;
 			break;
-/*
-		case WM_CTLCOLORSTATIC:
-			/// \todo only if there are URLs
-			if ((HWND)lParam == ::GetDlgItem(hwndDlg,IDC_STATIC_ABOUT_URL))
-			{
-				::SetTextColor((HDC)wParam, ::GetSysColor (COLOR_HIGHLIGHT));
-				::SetBkColor((HDC)wParam, ::GetSysColor (COLOR_BTNFACE));
-
-				return (LRESULT) hBrushStatic;
-			}
-			else
-				return (LRESULT) NULL;
-*/
 		case WM_MOUSEMOVE:
 			{
 				POINT pnt;
@@ -243,7 +253,7 @@ LPARAM lParam  // second message parameter
 				bool bUrl = false;
 				if (::PtInRect(&rect,pnt))
 				{
-					wsprintf(Url,get_lame_url());
+					snprintf(Url, sizeof Url, "%s", get_lame_url());
 					bUrl = true;
 				}
 
@@ -265,8 +275,6 @@ LPARAM lParam  // second message parameter
             bResult = FALSE;
 			break;
 
-		case IDC_STATIC_ABOUT_URL:
-			break;
 		default:
 			bResult = FALSE; // will be treated by DefWindowProc
 }
@@ -277,7 +285,7 @@ inline DWORD ACM::About(HWND hParentWindow)
 {
 	my_debug.OutPut(DEBUG_LEVEL_FUNC_START, "ACM : About (Parent Window = 0x%08X)",hParentWindow);
 
-	DialogBoxParam( my_hModule, MAKEINTRESOURCE(IDD_ABOUT), hParentWindow, ::AboutProc , (LPARAM)this);
+	DialogBoxSystemFont(my_hModule, IDD_ABOUT, hParentWindow, ::AboutProc, (LPARAM) this);
 
 	return DRVCNF_OK; // Can also return
 // DRVCNF_CANCEL
@@ -292,35 +300,20 @@ inline DWORD ACM::About(HWND hParentWindow)
 ACM::ACM( HMODULE hModule )
  :my_hModule(hModule),
   my_hIcon(NULL),
-  my_debug(ADbg(DEBUG_LEVEL_CREATION)),
+  my_debug(DEBUG_LEVEL_CREATION),
   my_EncodingProperties(hModule)
 {
 	my_EncodingProperties.ParamsRestore();
 
 	/// \todo get the debug level from the registry
-	unsigned char DebugFileName[512];
-
 	char tmp[128];
 	wsprintf(tmp,"LAMEacm 0x%08X",this);
 	my_debug.setPrefix(tmp); /// \todo get it from the registry
 	my_debug.setIncludeTime(true);  /// \todo get it from the registry
 
-	// Check in the registry if we have to Output Debug information
-	DebugFileName[0] = '\0';
-
-	HKEY OssKey;
-	if (RegOpenKeyEx( HKEY_LOCAL_MACHINE, "SOFTWARE\\MUKOLI", 0, KEY_READ , &OssKey ) == ERROR_SUCCESS) {
-		DWORD DataType;
-		DWORD DebugFileNameSize = 512;
-		if (RegQueryValueEx( OssKey, "DebugFile", NULL, &DataType, DebugFileName, &DebugFileNameSize ) == ERROR_SUCCESS) {
-			if (DataType == REG_SZ) {
-				my_debug.setUseFile(true);
-				my_debug.setDebugFile((char *)DebugFileName);
-				my_debug.OutPut("Debug file is %s",(char *)DebugFileName);
-			}
-		}
-	}
-        wsprintf(VersionString,"%s - %s", ACM_VERSION, get_lame_version() );
+	ConfigureDebugFromRegistry(my_debug);
+        lstrcpynA(VersionString, get_lame_version(), sizeof VersionString);
+	FillRateTables();
 	BuildBitrateTable();
 	
 	my_debug.OutPut(DEBUG_LEVEL_FUNC_START, "New ACM Creation (0x%08X)",this);
@@ -328,8 +321,6 @@ ACM::ACM( HMODULE hModule )
 
 ACM::~ACM()
 {
-// not used, it's done automatically when closing the driver	if (my_hIcon != NULL)
-//		CloseHandle(my_hIcon);
 
 	bitrate_table.clear();
 
@@ -343,8 +334,6 @@ ACM::~ACM()
 LONG ACM::DriverProcedure(const HDRVR hdrvr, const UINT msg, LONG lParam1, LONG lParam2)
 {
     DWORD dwRes = 0L;
-
-//my_debug.OutPut(DEBUG_LEVEL_MSG, "message 0x%08X for ThisACM 0x%08X", msg, this);
 
 switch (msg) {
     case DRV_INSTALL:
@@ -371,7 +360,6 @@ switch (msg) {
 		my_debug.OutPut(DEBUG_LEVEL_MSG, "DRV_CONFIGURE");
 		// Sent to display the configuration
 		// dialog box for the driver.
-//		dwRes = Configure( (HWND) lParam1, (LPDRVCONFIGINFO) lParam2 );
 		if (my_EncodingProperties.Config(my_hModule, (HWND) lParam1))
 		{
 			dwRes = DRVCNF_OK; // Can also return
@@ -397,7 +385,7 @@ switch (msg) {
 		// Fill-in general informations about the driver/codec
 		my_debug.OutPut(DEBUG_LEVEL_MSG, "ACMDM_DRIVER_DETAILS");
 
-		dwRes = OnDriverDetails(hdrvr, (LPACMDRIVERDETAILS) lParam1);
+		dwRes = OnDriverDetails((LPACMDRIVERDETAILS) lParam1);
         
 		break;
 
@@ -444,14 +432,14 @@ switch (msg) {
 	// prepares an ACMSTREAMHEADER structure for
 	// an ACM stream conversion
 		my_debug.OutPut(DEBUG_LEVEL_MSG, "ACMDM_STREAM_PREPARE");
-		dwRes = OnStreamPrepareHeader((LPACMDRVSTREAMINSTANCE)lParam1, (LPACMSTREAMHEADER) lParam2);
+		dwRes = OnStreamPrepareHeader((LPACMSTREAMHEADER) lParam2);
         break; 
 
 	case ACMDM_STREAM_UNPREPARE:
 	// cleans up the preparation performed by
 	// the ACMDM_STREAM_PREPARE message for an ACM stream
 		my_debug.OutPut(DEBUG_LEVEL_MSG, "ACMDM_STREAM_UNPREPARE");
-		dwRes = OnStreamUnPrepareHeader((LPACMDRVSTREAMINSTANCE)lParam1, (LPACMSTREAMHEADER) lParam2);
+		dwRes = OnStreamUnPrepareHeader((LPACMSTREAMHEADER) lParam2);
         break; 
 
 	case ACMDM_STREAM_CONVERT:
@@ -484,10 +472,13 @@ switch (msg) {
 // Special message handlers
 //////////////////////////////////////////////////////////////////////
 /*!
-	Retreive the config details of this ACM driver
-	The index represent the specified format
+	Fills in the details of one format that this driver supports.
+	The format tag and the format index in \a a_FormatDetails select it.
 
-	\param a_FormatDetails will be filled with all the corresponding data
+	\param a_FormatDetails the format to describe. The function fills in
+	       its other members.
+	\param a_Query the query flags. The bits in
+	       ACM_FORMATDETAILSF_QUERYMASK select the kind of query.
 */
 inline DWORD ACM::OnFormatDetails(LPACMFORMATDETAILS a_FormatDetails, const LPARAM a_Query)
 {
@@ -537,17 +528,32 @@ inline DWORD ACM::OnFormatDetails(LPACMFORMATDETAILS a_FormatDetails, const LPAR
 			{
 				my_debug.OutPut(DEBUG_LEVEL_FUNC_CODE, "Unknown a_FormatDetails->dwFormatTag = 0x%08X",a_FormatDetails->dwFormatTag);
 			}
+			break;
 
 		case ACM_FORMATDETAILSF_FORMAT :
-			/// \todo we may output the corresponding strong (only for personal format)
+		{
 			LPWAVEFORMATEX WaveExt;
 			WaveExt = a_FormatDetails->pwfx;
 
 			my_debug.OutPut(DEBUG_LEVEL_FUNC_CODE, "enter ACM_FORMATDETAILSF_FORMAT : 0x%04X:%03d, format in : channels %d, sample rate %d",a_FormatDetails->dwFormatTag,a_FormatDetails->dwFormatIndex, WaveExt->nChannels, WaveExt->nSamplesPerSec);
 
-			Result = MMSYSERR_NOERROR;
+			if (WaveExt->wFormatTag == PERSONAL_FORMAT) {
+				DescribeMP3Format(*WaveExt, a_FormatDetails->szFormat);
+				Result = MMSYSERR_NOERROR;
+			}
+			else if (WaveExt->wFormatTag == WAVE_FORMAT_PCM) {
+				// An empty description is the ACM's cue to generate its own,
+				// which is localised; that is what the format list gives a
+				// PCM format too.
+				Result = MMSYSERR_NOERROR;
+			}
+			else
+			{
+				my_debug.OutPut(DEBUG_LEVEL_FUNC_CODE, "ACM_FORMATDETAILSF_FORMAT unknown format 0x%04X",WaveExt->wFormatTag);
+			}
 			break;
-		
+		}
+
 		default:
 			Result = ACMERR_NOTPOSSIBLE;
 			break;
@@ -559,148 +565,262 @@ inline DWORD ACM::OnFormatDetails(LPACMFORMATDETAILS a_FormatDetails, const LPAR
 }
 
 /*!
-	Retreive the details of each known format by this ACM driver
-	The index represent the specified format (0 = MP3 / 1 = PCM)
+	Fills in the details of one format tag that this driver supports.
+	The index selects the format tag: 0 is MP3, 1 is PCM. The largest size
+	query for all tags selects the MP3 format tag: its format structure is
+	the larger one.
 
-	\param a_FormatTagDetails will be filled with all the corresponding data
+	\param a_FormatTagDetails the format tag to describe. The function fills
+	       in its other members.
+	\param a_Query the query flags. The bits in
+	       ACM_FORMATTAGDETAILSF_QUERYMASK select the kind of query.
+	\return MMSYSERR_NOERROR, or ACMERR_NOTPOSSIBLE for a query that the
+	        codec does not support.
 */
 inline DWORD ACM::OnFormatTagDetails(LPACMFORMATTAGDETAILS a_FormatTagDetails, const LPARAM a_Query)
 {
-	DWORD Result;
-	DWORD the_format = WAVE_FORMAT_UNKNOWN; // the format to give details
+	DWORD the_format; // the format to give details
 
-	if (a_FormatTagDetails->cbStruct >= sizeof(*a_FormatTagDetails)) {
+	if (a_FormatTagDetails->cbStruct < sizeof(*a_FormatTagDetails))
+	{
+		my_debug.OutPut(DEBUG_LEVEL_FUNC_CODE, "a_FormatTagDetails->cbStruct < sizeof(*a_FormatDetails)");
+		return ACMERR_NOTPOSSIBLE;
+	}
 
-		my_debug.OutPut(DEBUG_LEVEL_FUNC_CODE, "ACMDM_FORMATTAG_DETAILS, a_Query = 0x%08X",a_Query);
-		switch(a_Query & ACM_FORMATTAGDETAILSF_QUERYMASK) {
+	my_debug.OutPut(DEBUG_LEVEL_FUNC_CODE, "ACMDM_FORMATTAG_DETAILS, a_Query = 0x%08X",a_Query);
+	switch(a_Query & ACM_FORMATTAGDETAILSF_QUERYMASK) {
 
-			case ACM_FORMATTAGDETAILSF_INDEX:
-			// Fill-in the informations corresponding to the a_FormatDetails->dwFormatTagIndex
-				my_debug.OutPut(DEBUG_LEVEL_FUNC_CODE, "get ACM_FORMATTAGDETAILSF_INDEX for index %03d",a_FormatTagDetails->dwFormatTagIndex);
+		case ACM_FORMATTAGDETAILSF_INDEX:
+		// the format tag at the index the host asks for
+			my_debug.OutPut(DEBUG_LEVEL_FUNC_CODE, "get ACM_FORMATTAGDETAILSF_INDEX for index %03d",a_FormatTagDetails->dwFormatTagIndex);
 
-				if (a_FormatTagDetails->dwFormatTagIndex < FORMAT_TAG_MAX_NB) {
-					switch (a_FormatTagDetails->dwFormatTagIndex)
-					{
-					case 0:
-						the_format = PERSONAL_FORMAT;
-						break;
-					default :
-						the_format = WAVE_FORMAT_PCM;
-						break;
-					}
-				}
-				else
-				{
-					my_debug.OutPut(DEBUG_LEVEL_FUNC_CODE, "ACM_FORMATTAGDETAILSF_INDEX for unsupported index %03d",a_FormatTagDetails->dwFormatTagIndex);
-					Result = ACMERR_NOTPOSSIBLE;
-				}
+			switch (a_FormatTagDetails->dwFormatTagIndex)
+			{
+			case FORMAT_TAG_INDEX_MP3:
+				the_format = PERSONAL_FORMAT;
 				break;
+			case FORMAT_TAG_INDEX_PCM:
+				the_format = WAVE_FORMAT_PCM;
+				break;
+			default :
+				my_debug.OutPut(DEBUG_LEVEL_FUNC_CODE, "ACM_FORMATTAGDETAILSF_INDEX for unsupported index %03d",a_FormatTagDetails->dwFormatTagIndex);
+				return ACMERR_NOTPOSSIBLE;
+			}
+			break;
 
-			case ACM_FORMATTAGDETAILSF_FORMATTAG:
-			// Fill-in the informations corresponding to the a_FormatDetails->dwFormatTagIndex and hdrvr given
-				switch (a_FormatTagDetails->dwFormatTag)
-				{
-				case WAVE_FORMAT_PCM:
-					the_format = WAVE_FORMAT_PCM;
-					break;
-				case PERSONAL_FORMAT:
-					the_format = PERSONAL_FORMAT;
-					break;
-				default:
-                    return (ACMERR_NOTPOSSIBLE);
-				}
-				my_debug.OutPut(DEBUG_LEVEL_FUNC_CODE, "get ACM_FORMATTAGDETAILSF_FORMATTAG for index 0x%02X, cStandardFormats = %d",a_FormatTagDetails->dwFormatTagIndex,a_FormatTagDetails->cStandardFormats);
-				break;
-			case ACM_FORMATTAGDETAILSF_LARGESTSIZE:
-				my_debug.OutPut(DEBUG_LEVEL_FUNC_CODE, "ACM_FORMATTAGDETAILSF_LARGESTSIZE not used");
-				Result = 0L;
-				break;
-			default:
-				my_debug.OutPut(DEBUG_LEVEL_FUNC_CODE, "OnFormatTagDetails Unknown Format tag query");
-				Result = MMSYSERR_NOTSUPPORTED;
-				break;
-		}
-
-		my_debug.OutPut(DEBUG_LEVEL_FUNC_CODE, "OnFormatTagDetails the_format = 0x%08X",the_format);
-		switch(the_format)
-		{
+		case ACM_FORMATTAGDETAILSF_FORMATTAG:
+		// the format tag the host names
+			switch (a_FormatTagDetails->dwFormatTag)
+			{
 			case WAVE_FORMAT_PCM:
-				a_FormatTagDetails->dwFormatTag      = WAVE_FORMAT_PCM;
-				a_FormatTagDetails->dwFormatTagIndex = 0;
-				a_FormatTagDetails->cbFormatSize     = sizeof(PCMWAVEFORMAT);
-				/// \note 0 may mean we don't know how to decode
-				a_FormatTagDetails->fdwSupport       = ACMDRIVERDETAILS_SUPPORTF_CODEC;
-				a_FormatTagDetails->cStandardFormats = FORMAT_MAX_NB_PCM;
-				// should be filled by Windows				a_FormatTagDetails->szFormatTag[0] = '\0';
-				Result = MMSYSERR_NOERROR;
+				the_format = WAVE_FORMAT_PCM;
 				break;
 			case PERSONAL_FORMAT:
-				a_FormatTagDetails->dwFormatTag      = PERSONAL_FORMAT;
-				a_FormatTagDetails->dwFormatTagIndex = 1;
-				a_FormatTagDetails->cbFormatSize     = SIZE_FORMAT_STRUCT;
-				a_FormatTagDetails->fdwSupport       = ACMDRIVERDETAILS_SUPPORTF_CODEC;
-				a_FormatTagDetails->cStandardFormats = GetNumberEncodingFormats();
-				lstrcpyW( a_FormatTagDetails->szFormatTag, L"Lame MP3" );
-				Result = MMSYSERR_NOERROR;
+				the_format = PERSONAL_FORMAT;
 				break;
 			default:
-				my_debug.OutPut(DEBUG_LEVEL_FUNC_CODE, "OnFormatTagDetails Unknown format 0x%08X",the_format);
-				return (ACMERR_NOTPOSSIBLE);
-		}
-		my_debug.OutPut(DEBUG_LEVEL_FUNC_CODE, "OnFormatTagDetails %d possibilities for format 0x%08X",a_FormatTagDetails->cStandardFormats,the_format);
+				return ACMERR_NOTPOSSIBLE;
+			}
+			my_debug.OutPut(DEBUG_LEVEL_FUNC_CODE, "get ACM_FORMATTAGDETAILSF_FORMATTAG for index 0x%02X, cStandardFormats = %d",a_FormatTagDetails->dwFormatTagIndex,a_FormatTagDetails->cStandardFormats);
+			break;
+		case ACM_FORMATTAGDETAILSF_LARGESTSIZE:
+		// The format tag with the largest format structure, of all tags
+		// (WAVE_FORMAT_UNKNOWN) or of the tag given
+			my_debug.OutPut(DEBUG_LEVEL_FUNC_CODE, "get ACM_FORMATTAGDETAILSF_LARGESTSIZE for format 0x%04X",a_FormatTagDetails->dwFormatTag);
+			switch (a_FormatTagDetails->dwFormatTag)
+			{
+			case WAVE_FORMAT_UNKNOWN:
+			case PERSONAL_FORMAT:
+				the_format = PERSONAL_FORMAT;
+				break;
+			case WAVE_FORMAT_PCM:
+				the_format = WAVE_FORMAT_PCM;
+				break;
+			default:
+				return ACMERR_NOTPOSSIBLE;
+			}
+			break;
+		default:
+			my_debug.OutPut(DEBUG_LEVEL_FUNC_CODE, "OnFormatTagDetails Unknown Format tag query");
+			return ACMERR_NOTPOSSIBLE;
+	}
+
+	my_debug.OutPut(DEBUG_LEVEL_FUNC_CODE, "OnFormatTagDetails the_format = 0x%08X",the_format);
+	if (the_format == WAVE_FORMAT_PCM)
+	{
+		a_FormatTagDetails->dwFormatTag      = WAVE_FORMAT_PCM;
+		a_FormatTagDetails->dwFormatTagIndex = FORMAT_TAG_INDEX_PCM;
+		a_FormatTagDetails->cbFormatSize     = sizeof(PCMWAVEFORMAT);
+		a_FormatTagDetails->fdwSupport       = ACMDRIVERDETAILS_SUPPORTF_CODEC;
+		a_FormatTagDetails->cStandardFormats = FORMAT_MAX_NB_PCM;
+		// szFormatTag is filled by Windows
 	}
 	else
 	{
-		my_debug.OutPut(DEBUG_LEVEL_FUNC_CODE, "a_FormatTagDetails->cbStruct < sizeof(*a_FormatDetails)");
-		Result = ACMERR_NOTPOSSIBLE;
+		a_FormatTagDetails->dwFormatTag      = PERSONAL_FORMAT;
+		a_FormatTagDetails->dwFormatTagIndex = FORMAT_TAG_INDEX_MP3;
+		a_FormatTagDetails->cbFormatSize     = SIZE_FORMAT_STRUCT;
+		a_FormatTagDetails->fdwSupport       = ACMDRIVERDETAILS_SUPPORTF_CODEC;
+		a_FormatTagDetails->cStandardFormats = GetNumberEncodingFormats();
+		lstrcpyW( a_FormatTagDetails->szFormatTag, L"Lame MP3" );
 	}
+	my_debug.OutPut(DEBUG_LEVEL_FUNC_CODE, "OnFormatTagDetails %d possibilities for format 0x%08X",a_FormatTagDetails->cStandardFormats,the_format);
 
-	return Result;
+	return MMSYSERR_NOERROR;
 }
 
 /*!
-	Retreive the global details of this ACM driver
+	Fills in the details of this ACM driver. The icon comes from the module
+	of the codec.
 
-	\param a_DriverDetail will be filled with all the corresponding data
+	\param a_DriverDetail receives the driver details
 */
-inline DWORD ACM::OnDriverDetails(const HDRVR hdrvr, LPACMDRIVERDETAILS a_DriverDetail)
+inline DWORD ACM::OnDriverDetails(LPACMDRIVERDETAILS a_DriverDetail)
 {
 	if (my_hIcon == NULL)
-		my_hIcon = LoadIcon(GetDriverModuleHandle(hdrvr), MAKEINTRESOURCE(IDI_ICON));
+		my_hIcon = LoadIcon(my_hModule, MAKEINTRESOURCE(IDI_ICON));
 	a_DriverDetail->hicon       = my_hIcon;
 
 	a_DriverDetail->fccType     = ACMDRIVERDETAILS_FCCTYPE_AUDIOCODEC;
 	a_DriverDetail->fccComp     = ACMDRIVERDETAILS_FCCCOMP_UNDEFINED;
 
 	/// \note this is an explicit hack of the FhG values
-	/// \note later it could be a new value when the decoding is done
 	a_DriverDetail->wMid        = MM_FRAUNHOFER_IIS;
 	a_DriverDetail->wPid        = MM_FHGIIS_MPEGLAYER3;
 
 	a_DriverDetail->vdwACM      = VERSION_MSACM;
-	a_DriverDetail->vdwDriver   = VERSION_ACM_DRIVER;
+	a_DriverDetail->vdwDriver   = LAME_ACM_DRIVER_VERSION;
 	a_DriverDetail->fdwSupport  = ACMDRIVERDETAILS_SUPPORTF_CODEC;
 	a_DriverDetail->cFormatTags = FORMAT_TAG_MAX_NB; // 2 : MP3 and PCM
-//	a_DriverDetail->cFormatTags = 1; // 2 : MP3 and PCM
 	a_DriverDetail->cFilterTags = FILTER_TAG_MAX_NB;
 
 	lstrcpyW( a_DriverDetail->szShortName, L"LAME MP3" );
-	char tmpStr[128];
-	wsprintf(tmpStr, "LAME MP3 Codec v%s", GetVersionString());
+	char tmpStr[ACMDRIVERDETAILS_LONGNAME_CHARS];
+	snprintf(tmpStr, sizeof tmpStr, "LAME MP3 Codec v%s", GetVersionString());
 	int u = MultiByteToWideChar(CP_ACP, MB_PRECOMPOSED, tmpStr, -1, a_DriverDetail->szLongName, 0);
 	MultiByteToWideChar(CP_ACP, MB_PRECOMPOSED, tmpStr, -1, a_DriverDetail->szLongName, u);
 	lstrcpyW( a_DriverDetail->szCopyright, L"2002 Steve Lhomme" );
 	lstrcpyW( a_DriverDetail->szLicensing, L"LGPL (see gnu.org)" );
 	/// \todo update this part when the code changes
-	lstrcpyW( a_DriverDetail->szFeatures , L"only CBR implementation" );
+	lstrcpyW( a_DriverDetail->szFeatures , L"CBR, ABR and VBR encoding" );
 
     return MMSYSERR_NOERROR;  // Can also return DRVCNF_CANCEL
 }
 
 /*!
-	Suggest an output format for the specified input format
+	Writes one format into the debug log.
 
-	\param a_FormatSuggest will be filled with all the corresponding data
+	\param a_What what the format is, the start of the log line
+	\param a_Format the format
+*/
+void ACM::LogFormat(const char * a_What, const WAVEFORMATEX * a_Format) const
+{
+	my_debug.OutPut(DEBUG_LEVEL_FUNC_CODE, "%s = 0x%04X, channels = %d, Samples/s = %d, AvgB/s = %d, BlockAlign = %d, b/sample = %d",
+				 a_What,
+				 a_Format->wFormatTag,
+				 a_Format->nChannels,
+				 a_Format->nSamplesPerSec,
+				 a_Format->nAvgBytesPerSec,
+				 a_Format->nBlockAlign,
+				 a_Format->wBitsPerSample);
+}
+
+/*!
+	Suggests an MP3 format to encode a PCM source to.
+
+	A field of the destination that the caller fixed is checked against what
+	the codec can produce; a field it left open is filled in.
+
+	\param a_FormatSuggest the PCM source format and the suggestion flags.
+	       The function fills in the suggested MP3 format.
+	\param fdwSuggest the fields of the destination format that the caller
+	       fixed, ACM_FORMATSUGGESTF_TYPEMASK of the suggestion flags
+	\return MMSYSERR_NOERROR, ACMERR_NOTPOSSIBLE if no MP3 format fits the
+	        fixed fields, or MMSYSERR_INVALPARAM for a source that is neither
+	        mono nor stereo.
+*/
+DWORD ACM::SuggestEncode(LPACMDRVFORMATSUGGEST a_FormatSuggest, const DWORD fdwSuggest) const
+{
+	my_debug.OutPut(DEBUG_LEVEL_FUNC_CODE, "Suggest for PCM source");
+	// the destination format can only be MP3
+	if (ACM_FORMATSUGGESTF_WFORMATTAG & fdwSuggest)
+    {
+        if (PERSONAL_FORMAT != a_FormatSuggest->pwfxDst->wFormatTag)
+            return (ACMERR_NOTPOSSIBLE);
+    }
+    else
+	{
+        a_FormatSuggest->pwfxDst->wFormatTag = PERSONAL_FORMAT;
+    }
+
+
+my_debug.OutPut(DEBUG_LEVEL_FUNC_CODE, "Suggest succeed A");
+	// the codec does not change the number of channels
+	if (ACM_FORMATSUGGESTF_NCHANNELS & fdwSuggest)
+    {
+        if (a_FormatSuggest->pwfxDst->nChannels != my_EncodingProperties.OutputChannels(a_FormatSuggest->pwfxSrc->nChannels))
+            return (ACMERR_NOTPOSSIBLE);
+    }
+    else
+	{
+        a_FormatSuggest->pwfxDst->nChannels = (WORD) my_EncodingProperties.OutputChannels(a_FormatSuggest->pwfxSrc->nChannels);
+    }
+
+	if (a_FormatSuggest->pwfxSrc->nChannels != 1 && a_FormatSuggest->pwfxSrc->nChannels != 2)
+		return MMSYSERR_INVALPARAM;
+
+
+my_debug.OutPut(DEBUG_LEVEL_FUNC_CODE, "Suggest succeed B");
+	// the codec does not change the sample rate
+	if (ACM_FORMATSUGGESTF_NSAMPLESPERSEC & fdwSuggest)
+    {
+        if (a_FormatSuggest->pwfxSrc->nSamplesPerSec != a_FormatSuggest->pwfxDst->nSamplesPerSec)
+            return (ACMERR_NOTPOSSIBLE);
+    }
+    else
+	{
+        a_FormatSuggest->pwfxDst->nSamplesPerSec = a_FormatSuggest->pwfxSrc->nSamplesPerSec;
+    }
+
+	if (!IsMP3Frequency(a_FormatSuggest->pwfxDst->nSamplesPerSec))
+		return (ACMERR_NOTPOSSIBLE);
+
+
+my_debug.OutPut(DEBUG_LEVEL_FUNC_CODE, "Suggest succeed C");
+	// a compressed format has no bits per sample, so a restriction
+	// to any other value asks for a format that does not exist
+	if (ACM_FORMATSUGGESTF_WBITSPERSAMPLE & fdwSuggest)
+    {
+        if (0 != a_FormatSuggest->pwfxDst->wBitsPerSample)
+            return (ACMERR_NOTPOSSIBLE);
+    }
+
+	//
+	//  the result is a whole MPEGLAYER3WAVEFORMAT, so the caller's
+	//  buffer has to hold one
+	//
+	if (a_FormatSuggest->cbwfxDst < sizeof(MPEGLAYER3WAVEFORMAT))
+		return (ACMERR_NOTPOSSIBLE);
+
+	FillMP3Format(*a_FormatSuggest->pwfxDst,
+	              a_FormatSuggest->pwfxDst->nSamplesPerSec,
+	              a_FormatSuggest->pwfxDst->nChannels * SUGGESTED_BITRATE_PER_CHANNEL,
+	              a_FormatSuggest->pwfxDst->nChannels,
+	              vbr_off);
+
+	my_debug.OutPut(DEBUG_LEVEL_FUNC_CODE, "Suggest succeed");
+	return MMSYSERR_NOERROR;
+}
+
+/*!
+	Suggests an output format for the given input format. The codec only
+	encodes, so it suggests nothing for an MP3 source.
+
+	\param a_FormatSuggest the input format and the suggestion flags. The
+	       function fills in the suggested output format.
+	\return MMSYSERR_NOERROR, ACMERR_NOTPOSSIBLE if the codec cannot convert
+	        the source, or MMSYSERR_NOTSUPPORTED for a source format it
+	        does not know.
 */
 inline DWORD ACM::OnFormatSuggest(LPACMDRVFORMATSUGGEST a_FormatSuggest)
 {
@@ -714,211 +834,42 @@ my_debug.OutPut(DEBUG_LEVEL_FUNC_CODE, "Suggest %s%s%s%s (0x%08X)",
 				 (fdwSuggest & ACM_FORMATSUGGESTF_WFORMATTAG) ? "format, ":"",
 				 fdwSuggest);
 
-my_debug.OutPut(DEBUG_LEVEL_FUNC_CODE, "Suggest for source format = 0x%04X, channels = %d, Samples/s = %d, AvgB/s = %d, BlockAlign = %d, b/sample = %d",
-				 a_FormatSuggest->pwfxSrc->wFormatTag,
-				 a_FormatSuggest->pwfxSrc->nChannels,
-				 a_FormatSuggest->pwfxSrc->nSamplesPerSec,
-				 a_FormatSuggest->pwfxSrc->nAvgBytesPerSec,
-				 a_FormatSuggest->pwfxSrc->nBlockAlign,
-				 a_FormatSuggest->pwfxSrc->wBitsPerSample);
-
-my_debug.OutPut(DEBUG_LEVEL_FUNC_CODE, "Suggested destination format = 0x%04X, channels = %d, Samples/s = %d, AvgB/s = %d, BlockAlign = %d, b/sample = %d",
-			 a_FormatSuggest->pwfxDst->wFormatTag,
-			 a_FormatSuggest->pwfxDst->nChannels,
-			 a_FormatSuggest->pwfxDst->nSamplesPerSec,
-			 a_FormatSuggest->pwfxDst->nAvgBytesPerSec,
-			 a_FormatSuggest->pwfxDst->nBlockAlign,
-			 a_FormatSuggest->pwfxDst->wBitsPerSample);
+	LogFormat("Suggest for source format", a_FormatSuggest->pwfxSrc);
+	LogFormat("Suggested destination format", a_FormatSuggest->pwfxDst);
 
 	switch (a_FormatSuggest->pwfxSrc->wFormatTag)
 	{
         case WAVE_FORMAT_PCM:
-			/// \todo handle here the decoding ?
-			my_debug.OutPut(DEBUG_LEVEL_FUNC_CODE, "Suggest for PCM source");
-            //
-			//  if the destination format tag is restricted, verify that
-			//  it is within our capabilities...
-			//
-			//  this driver is able to decode to PCM
-			//
-			if (ACM_FORMATSUGGESTF_WFORMATTAG & fdwSuggest)
-            {
-                if (PERSONAL_FORMAT != a_FormatSuggest->pwfxDst->wFormatTag)
-                    return (ACMERR_NOTPOSSIBLE);
-            }
-            else
-			{
-                a_FormatSuggest->pwfxDst->wFormatTag = PERSONAL_FORMAT;
-            }
-
-
-my_debug.OutPut(DEBUG_LEVEL_FUNC_CODE, "Suggest succeed A");
-            //
-			//  if the destination channel count is restricted, verify that
-			//  it is within our capabilities...
-			//
-			//  this driver is not able to change the number of channels
-			//
-			if (ACM_FORMATSUGGESTF_NCHANNELS & fdwSuggest)
-            {
-                if (a_FormatSuggest->pwfxSrc->nChannels != a_FormatSuggest->pwfxDst->nChannels)
-                    return (ACMERR_NOTPOSSIBLE);
-            }
-            else
-			{
-                a_FormatSuggest->pwfxDst->nChannels = a_FormatSuggest->pwfxSrc->nChannels;
-            }
-
-			if (a_FormatSuggest->pwfxSrc->nChannels != 1 && a_FormatSuggest->pwfxSrc->nChannels != 2)
-				return MMSYSERR_INVALPARAM;
-
-
-my_debug.OutPut(DEBUG_LEVEL_FUNC_CODE, "Suggest succeed B");
-            //
-			//  if the destination samples per second is restricted, verify
-			//  that it is within our capabilities...
-			//
-			//  this driver is not able to change the sample rate
-			//
-			if (ACM_FORMATSUGGESTF_NSAMPLESPERSEC & fdwSuggest)
-            {
-                if (a_FormatSuggest->pwfxSrc->nSamplesPerSec != a_FormatSuggest->pwfxDst->nSamplesPerSec)
-                    return (ACMERR_NOTPOSSIBLE);
-            }
-            else
-			{
-                a_FormatSuggest->pwfxDst->nSamplesPerSec = a_FormatSuggest->pwfxSrc->nSamplesPerSec;
-            }
-
-
-my_debug.OutPut(DEBUG_LEVEL_FUNC_CODE, "Suggest succeed C");
-            //
-			//  if the destination bits per sample is restricted, verify
-			//  that it is within our capabilities...
-			//
-			//  We prefer decoding to 16-bit PCM.
-			//
-			if (ACM_FORMATSUGGESTF_WBITSPERSAMPLE & fdwSuggest)
-            {
-                if ( (16 != a_FormatSuggest->pwfxDst->wBitsPerSample) && (8 != a_FormatSuggest->pwfxDst->wBitsPerSample) )
-                    return (ACMERR_NOTPOSSIBLE);
-            }
-            else
-			{
-                a_FormatSuggest->pwfxDst->wBitsPerSample = 16;
-            }
-
-			//			a_FormatSuggest->pwfxDst->nBlockAlign = FORMAT_BLOCK_ALIGN;
-			a_FormatSuggest->pwfxDst->nBlockAlign = a_FormatSuggest->pwfxDst->nChannels * a_FormatSuggest->pwfxDst->wBitsPerSample / 8;
-			
-			a_FormatSuggest->pwfxDst->nAvgBytesPerSec = a_FormatSuggest->pwfxDst->nChannels * 64000 / 8;
-
-			my_debug.OutPut(DEBUG_LEVEL_FUNC_CODE, "Suggest succeed");
-			Result = MMSYSERR_NOERROR;
-
-
+			Result = SuggestEncode(a_FormatSuggest, fdwSuggest);
 			break;
 		case PERSONAL_FORMAT:
-			my_debug.OutPut(DEBUG_LEVEL_FUNC_CODE, "Suggest for PERSONAL source");
-            //
-			//  if the destination format tag is restricted, verify that
-			//  it is within our capabilities...
-			//
-			//  this driver is able to decode to PCM
-			//
-			if (ACM_FORMATSUGGESTF_WFORMATTAG & fdwSuggest)
-            {
-                if (WAVE_FORMAT_PCM != a_FormatSuggest->pwfxDst->wFormatTag)
-                    return (ACMERR_NOTPOSSIBLE);
-            }
-            else
-			{
-                a_FormatSuggest->pwfxDst->wFormatTag = WAVE_FORMAT_PCM;
-            }
-
-
-            //
-			//  if the destination channel count is restricted, verify that
-			//  it is within our capabilities...
-			//
-			//  this driver is not able to change the number of channels
-			//
-			if (ACM_FORMATSUGGESTF_NCHANNELS & fdwSuggest)
-            {
-                if (a_FormatSuggest->pwfxSrc->nChannels != a_FormatSuggest->pwfxDst->nChannels)
-                    return (ACMERR_NOTPOSSIBLE);
-            }
-            else
-			{
-                a_FormatSuggest->pwfxDst->nChannels = a_FormatSuggest->pwfxSrc->nChannels;
-            }
-
-
-            //
-			//  if the destination samples per second is restricted, verify
-			//  that it is within our capabilities...
-			//
-			//  this driver is not able to change the sample rate
-			//
-			if (ACM_FORMATSUGGESTF_NSAMPLESPERSEC & fdwSuggest)
-            {
-                if (a_FormatSuggest->pwfxSrc->nSamplesPerSec != a_FormatSuggest->pwfxDst->nSamplesPerSec)
-                    return (ACMERR_NOTPOSSIBLE);
-            }
-            else
-			{
-                a_FormatSuggest->pwfxDst->nSamplesPerSec = a_FormatSuggest->pwfxSrc->nSamplesPerSec;
-            }
-
-
-            //
-			//  if the destination bits per sample is restricted, verify
-			//  that it is within our capabilities...
-			//
-			//  We prefer decoding to 16-bit PCM.
-			//
-			if (ACM_FORMATSUGGESTF_WBITSPERSAMPLE & fdwSuggest)
-            {
-                if ( (16 != a_FormatSuggest->pwfxDst->wBitsPerSample) && (8 != a_FormatSuggest->pwfxDst->wBitsPerSample) )
-                    return (ACMERR_NOTPOSSIBLE);
-            }
-            else
-			{
-                a_FormatSuggest->pwfxDst->wBitsPerSample = 16;
-            }
-
-			//			a_FormatSuggest->pwfxDst->nBlockAlign = FORMAT_BLOCK_ALIGN;
-			a_FormatSuggest->pwfxDst->nBlockAlign = a_FormatSuggest->pwfxDst->nChannels * a_FormatSuggest->pwfxDst->wBitsPerSample / 8;
-			
-			/// \todo this value must be a correct one !
-			a_FormatSuggest->pwfxDst->nAvgBytesPerSec = a_FormatSuggest->pwfxDst->nSamplesPerSec * a_FormatSuggest->pwfxDst->nChannels * a_FormatSuggest->pwfxDst->wBitsPerSample / 8;
-
-			my_debug.OutPut(DEBUG_LEVEL_FUNC_CODE, "Suggest succeed");
-			Result = MMSYSERR_NOERROR;
-
-
+			my_debug.OutPut(DEBUG_LEVEL_FUNC_CODE, "Suggest for PERSONAL source: the codec does not decode");
+			Result = ACMERR_NOTPOSSIBLE;
 			break;
 	}
 
-	my_debug.OutPut(DEBUG_LEVEL_FUNC_CODE, "Suggested destination format = 0x%04X, channels = %d, Samples/s = %d, AvgB/s = %d, BlockAlign = %d, b/sample = %d",
-				 a_FormatSuggest->pwfxDst->wFormatTag,
-				 a_FormatSuggest->pwfxDst->nChannels,
-				 a_FormatSuggest->pwfxDst->nSamplesPerSec,
-				 a_FormatSuggest->pwfxDst->nAvgBytesPerSec,
-				 a_FormatSuggest->pwfxDst->nBlockAlign,
-				 a_FormatSuggest->pwfxDst->wBitsPerSample);
+	LogFormat("Suggested destination format", a_FormatSuggest->pwfxDst);
 
 	return Result;
 }
 
 /*!
-	Create a stream instance for decoding/encoding
+	Opens a conversion stream.
 
-	\param a_StreamInstance contain information about the stream desired
+	\param a_StreamInstance the source and target formats of the stream
 */
 inline DWORD ACM::OnStreamOpen(LPACMDRVSTREAMINSTANCE a_StreamInstance)
 {
 	DWORD Result = ACMERR_NOTPOSSIBLE;
+
+	// dwDriver holds a stream only when this open creates one, so a close
+	// deletes nothing else
+	a_StreamInstance->dwDriver = 0;
+
+	// The settings as the settings file holds them now: the configuration
+	// dialog may have changed them in another program since this driver
+	// instance read them
+	my_EncodingProperties.ParamsRestore();
 
 	//
 	//  the most important condition to check before doing anything else
@@ -950,74 +901,47 @@ inline DWORD ACM::OnStreamOpen(LPACMDRVSTREAMINSTANCE a_StreamInstance)
 
 				my_debug.OutPut(DEBUG_LEVEL_FUNC_CODE, "Open stream for PERSONAL output (%05d samples %d channels %d bits/sample %d kbps)",a_StreamInstance->pwfxDst->nSamplesPerSec,a_StreamInstance->pwfxDst->nChannels,a_StreamInstance->pwfxDst->wBitsPerSample,8 * a_StreamInstance->pwfxDst->nAvgBytesPerSec);
 
-				/// \todo add the possibility to have channel resampling (mono to stereo / stereo to mono)
 				/// \todo support resampling ?
 				/// \todo only do the test on OutputFrequency in "Smart Output" mode
 				if (a_StreamInstance->pwfxDst->nSamplesPerSec != OutputFrequency ||
-//					a_StreamInstance->pwfxSrc->nSamplesPerSec != a_StreamInstance->pwfxDst->nSamplesPerSec ||
-					a_StreamInstance->pwfxSrc->nChannels != a_StreamInstance->pwfxDst->nChannels ||
+					a_StreamInstance->pwfxDst->nChannels != my_EncodingProperties.OutputChannels(a_StreamInstance->pwfxSrc->nChannels) ||
 					a_StreamInstance->pwfxSrc->wBitsPerSample != 16)
 				{
 					Result = ACMERR_NOTPOSSIBLE;
 				} else {
-					if ((a_StreamInstance->fdwOpen & ACM_STREAMOPENF_QUERY) == 0)
-					{
-						ACMStream * the_stream = ACMStream::Create();
-						a_StreamInstance->dwInstance = (DWORD) the_stream;
+					// The encoder starts here. A query starts it and
+					// closes it again, so a query fails for the same
+					// settings as an open.
+					ACMStream * the_stream = ACMStream::Create();
 
-						if (the_stream != NULL)
-						{
-							MPEGLAYER3WAVEFORMAT * casted = (MPEGLAYER3WAVEFORMAT *) a_StreamInstance->pwfxDst;
-							vbr_mode a_mode = (casted->fdwFlags-2 == 0)?vbr_abr:vbr_off;
-							if (the_stream->init(a_StreamInstance->pwfxDst->nSamplesPerSec,
-												 OutputFrequency,
-												 a_StreamInstance->pwfxDst->nChannels,
-												 a_StreamInstance->pwfxDst->nAvgBytesPerSec,
-												 a_mode))
-								Result = MMSYSERR_NOERROR;
-							else
-								ACMStream::Erase( the_stream );
-						}
-					}
-					else
+					if (the_stream != NULL)
 					{
-						Result = MMSYSERR_NOERROR;
+						MPEGLAYER3WAVEFORMAT * casted = (MPEGLAYER3WAVEFORMAT *) a_StreamInstance->pwfxDst;
+						vbr_mode a_mode = vbr_off;
+						if (IsVBRFormatFlags(casted->fdwFlags))
+							a_mode = vbr_mtrh;
+						else if (IsABRFormatFlags(casted->fdwFlags))
+							a_mode = vbr_abr;
+						if (the_stream->init(a_StreamInstance->pwfxSrc->nSamplesPerSec,
+											 OutputFrequency,
+											 a_StreamInstance->pwfxSrc->nChannels,
+											 a_StreamInstance->pwfxDst->nChannels,
+											 a_StreamInstance->pwfxDst->nAvgBytesPerSec,
+											 a_mode,
+											 VBRQualityOfFormatFlags(casted->fdwFlags))
+							&& the_stream->open(my_EncodingProperties))
+							Result = MMSYSERR_NOERROR;
+
+						if (Result == MMSYSERR_NOERROR && (a_StreamInstance->fdwOpen & ACM_STREAMOPENF_QUERY) == 0)
+							a_StreamInstance->dwDriver = (DWORD_PTR) the_stream;
+						else
+							ACMStream::Erase( the_stream );
 					}
 				}
 			}
 			break;
 		case PERSONAL_FORMAT:
 			my_debug.OutPut(DEBUG_LEVEL_FUNC_CODE, "Open stream for PERSONAL source (%05d samples %d channels %d bits/sample %d kbps)",a_StreamInstance->pwfxSrc->nSamplesPerSec,a_StreamInstance->pwfxSrc->nChannels,a_StreamInstance->pwfxSrc->wBitsPerSample,8 * a_StreamInstance->pwfxSrc->nAvgBytesPerSec);
-			if (a_StreamInstance->pwfxDst->wFormatTag == WAVE_FORMAT_PCM)
-			{
-#ifdef ENABLE_DECODING
-				if ((a_StreamInstance->fdwOpen & ACM_STREAMOPENF_QUERY) == 0)
-				{
-					/// \todo create the decoding stream
-					my_debug.OutPut(DEBUG_LEVEL_FUNC_CODE, "Open stream for PCM output (%05d samples %d channels %d bits/sample %d B/s)",a_StreamInstance->pwfxDst->nSamplesPerSec,a_StreamInstance->pwfxDst->nChannels,a_StreamInstance->pwfxDst->wBitsPerSample,a_StreamInstance->pwfxDst->nAvgBytesPerSec);
-
-					DecodeStream * the_stream = DecodeStream::Create();
-					a_StreamInstance->dwInstance = (DWORD) the_stream;
-
-					if (the_stream != NULL)
-					{
-						if (the_stream->init(a_StreamInstance->pwfxDst->nSamplesPerSec,
-											 a_StreamInstance->pwfxDst->nChannels,
-											 a_StreamInstance->pwfxDst->nAvgBytesPerSec,
-											 a_StreamInstance->pwfxSrc->nAvgBytesPerSec))
-							Result = MMSYSERR_NOERROR;
-						else
-							DecodeStream::Erase( the_stream );
-					}
-				}
-				else
-				{
-					/// \todo decoding verification
-					my_debug.OutPut(DEBUG_LEVEL_FUNC_CODE, "Open stream is valid");
-					Result = MMSYSERR_NOERROR;
-				}
-#endif // ENABLE_DECODING
-			}
 			break;
 	}
 
@@ -1033,30 +957,29 @@ inline DWORD ACM::OnStreamSize(LPACMDRVSTREAMINSTANCE a_StreamInstance, LPACMDRV
     {
 	case ACM_STREAMSIZEF_DESTINATION:
 		my_debug.OutPut(DEBUG_LEVEL_FUNC_CODE, "Get source buffer size for destination size = %d",the_StreamSize->cbDstLength);
+		if (WAVE_FORMAT_PCM == a_StreamInstance->pwfxSrc->wFormatTag &&
+			PERSONAL_FORMAT == a_StreamInstance->pwfxDst->wFormatTag)
+		{
+			ACMStream * the_stream = (ACMStream *) a_StreamInstance->dwDriver;
+			if (the_stream != NULL)
+			{
+				the_StreamSize->cbSrcLength = the_stream->GetInputSizeForOutput(the_StreamSize->cbDstLength);
+				if (the_StreamSize->cbSrcLength > 0)
+					Result = MMSYSERR_NOERROR;
+			}
+		}
 		break;
 	case ACM_STREAMSIZEF_SOURCE:
 		my_debug.OutPut(DEBUG_LEVEL_FUNC_CODE, "Get destination buffer size for source size = %d",the_StreamSize->cbSrcLength);
         if (WAVE_FORMAT_PCM == a_StreamInstance->pwfxSrc->wFormatTag &&
 			PERSONAL_FORMAT == a_StreamInstance->pwfxDst->wFormatTag)
         {
-			ACMStream * the_stream = (ACMStream *) a_StreamInstance->dwInstance;
+			ACMStream * the_stream = (ACMStream *) a_StreamInstance->dwDriver;
 			if (the_stream != NULL)
 			{
 				the_StreamSize->cbDstLength = the_stream->GetOutputSizeForInput(the_StreamSize->cbSrcLength);
 				Result = MMSYSERR_NOERROR;
 			}
-		}
-        else if (PERSONAL_FORMAT == a_StreamInstance->pwfxSrc->wFormatTag &&
-			 WAVE_FORMAT_PCM== a_StreamInstance->pwfxDst->wFormatTag)
-		{
-#ifdef ENABLE_DECODING
-			DecodeStream * the_stream = (DecodeStream *) a_StreamInstance->dwInstance;
-			if (the_stream != NULL)
-			{
-				the_StreamSize->cbDstLength = the_stream->GetOutputSizeForInput(the_StreamSize->cbSrcLength);
-				Result = MMSYSERR_NOERROR;
-			}
-#endif // ENABLE_DECODING
 		}
 		break;
 	default:
@@ -1071,18 +994,11 @@ inline DWORD ACM::OnStreamClose(LPACMDRVSTREAMINSTANCE a_StreamInstance)
 {
 	DWORD Result = ACMERR_NOTPOSSIBLE;
 
-	my_debug.OutPut(DEBUG_LEVEL_FUNC_CODE, "OnStreamClose the stream 0x%X",a_StreamInstance->dwInstance);
+	my_debug.OutPut(DEBUG_LEVEL_FUNC_CODE, "OnStreamClose the stream 0x%X",a_StreamInstance->dwDriver);
     if (WAVE_FORMAT_PCM == a_StreamInstance->pwfxSrc->wFormatTag &&
 		PERSONAL_FORMAT == a_StreamInstance->pwfxDst->wFormatTag)
     {
-	ACMStream::Erase( (ACMStream *) a_StreamInstance->dwInstance );
-	}
-    else if (PERSONAL_FORMAT == a_StreamInstance->pwfxSrc->wFormatTag &&
-		 WAVE_FORMAT_PCM== a_StreamInstance->pwfxDst->wFormatTag)
-    {
-#ifdef ENABLE_DECODING
-		DecodeStream::Erase( (DecodeStream *) a_StreamInstance->dwInstance );
-#endif // ENABLE_DECODING
+	ACMStream::Erase( (ACMStream *) a_StreamInstance->dwDriver );
 	}
 
 	// nothing to do yet
@@ -1091,10 +1007,14 @@ inline DWORD ACM::OnStreamClose(LPACMDRVSTREAMINSTANCE a_StreamInstance)
 	return Result;
 }
 
-inline DWORD ACM::OnStreamPrepareHeader(LPACMDRVSTREAMINSTANCE a_StreamInstance, LPACMSTREAMHEADER a_StreamHeader)
-{
-	DWORD Result = ACMERR_NOTPOSSIBLE;
+/*!
+	Prepares a stream header. The encoder needs nothing prepared.
 
+	\param a_StreamHeader the header to prepare
+	\return MMSYSERR_NOERROR
+*/
+inline DWORD ACM::OnStreamPrepareHeader(LPACMSTREAMHEADER a_StreamHeader)
+{
 	my_debug.OutPut(DEBUG_LEVEL_FUNC_CODE, "  prepare : Src : %d (0x%08X) / %d - Dst : %d (0x%08X) / %d"
 												, a_StreamHeader->cbSrcLength
 												, a_StreamHeader->pbSrc
@@ -1104,66 +1024,25 @@ inline DWORD ACM::OnStreamPrepareHeader(LPACMDRVSTREAMINSTANCE a_StreamInstance,
 												, a_StreamHeader->cbDstLengthUsed
 											  );
 
-	if (WAVE_FORMAT_PCM == a_StreamInstance->pwfxSrc->wFormatTag &&
-		PERSONAL_FORMAT == a_StreamInstance->pwfxDst->wFormatTag)
-	{
-		ACMStream * the_stream = (ACMStream *)a_StreamInstance->dwInstance;
-		
-		if (the_stream->open(my_EncodingProperties))
-			Result = MMSYSERR_NOERROR;
-	}
-	else if (PERSONAL_FORMAT == a_StreamInstance->pwfxSrc->wFormatTag &&
-		     WAVE_FORMAT_PCM == a_StreamInstance->pwfxDst->wFormatTag)
-	{
-#ifdef ENABLE_DECODING
-		DecodeStream * the_stream = (DecodeStream *)a_StreamInstance->dwInstance;
-		
-		if (the_stream->open())
-			Result = MMSYSERR_NOERROR;
-#endif // ENABLE_DECODING
-	}
-
-	return Result;
+	return MMSYSERR_NOERROR;
 }
 
-inline DWORD ACM::OnStreamUnPrepareHeader(LPACMDRVSTREAMINSTANCE a_StreamInstance, LPACMSTREAMHEADER a_StreamHeader)
-{
-	DWORD Result = ACMERR_NOTPOSSIBLE;
+/*!
+	Releases a stream header that OnStreamPrepareHeader() prepared.
 
+	\param a_StreamHeader the header to release
+	\return MMSYSERR_NOERROR
+*/
+inline DWORD ACM::OnStreamUnPrepareHeader(LPACMSTREAMHEADER a_StreamHeader)
+{
 	my_debug.OutPut(DEBUG_LEVEL_FUNC_CODE, "unprepare : Src : %d / %d - Dst : %d / %d"
 											, a_StreamHeader->cbSrcLength
 											, a_StreamHeader->cbSrcLengthUsed
 											, a_StreamHeader->cbDstLength
 											, a_StreamHeader->cbDstLengthUsed
 											);
-    if (WAVE_FORMAT_PCM == a_StreamInstance->pwfxSrc->wFormatTag &&
-		PERSONAL_FORMAT == a_StreamInstance->pwfxDst->wFormatTag)
-    {
-	ACMStream * the_stream = (ACMStream *)a_StreamInstance->dwInstance;
-	DWORD OutputSize = a_StreamHeader->cbDstLength;
-	
-	if (the_stream->close(a_StreamHeader->pbDst, &OutputSize) && (OutputSize <= a_StreamHeader->cbDstLength))
-	{
-		a_StreamHeader->cbDstLengthUsed = OutputSize;
-			Result = MMSYSERR_NOERROR;
-		}
-	}
-    else if (PERSONAL_FORMAT == a_StreamInstance->pwfxSrc->wFormatTag &&
-		 WAVE_FORMAT_PCM== a_StreamInstance->pwfxDst->wFormatTag)
-    {
-#ifdef ENABLE_DECODING
-		DecodeStream * the_stream = (DecodeStream *)a_StreamInstance->dwInstance;
-		DWORD OutputSize = a_StreamHeader->cbDstLength;
-		
-		if (the_stream->close(a_StreamHeader->pbDst, &OutputSize) && (OutputSize <= a_StreamHeader->cbDstLength))
-		{
-			a_StreamHeader->cbDstLengthUsed = OutputSize;
-			Result = MMSYSERR_NOERROR;
-	}
-#endif // ENABLE_DECODING
-	}
 
-	return Result;
+	return MMSYSERR_NOERROR;
 }
 
 inline DWORD ACM::OnStreamConvert(LPACMDRVSTREAMINSTANCE a_StreamInstance, LPACMDRVSTREAMHEADER a_StreamHeader)
@@ -1175,26 +1054,12 @@ inline DWORD ACM::OnStreamConvert(LPACMDRVSTREAMINSTANCE a_StreamInstance, LPACM
 	{
 		my_debug.OutPut(DEBUG_LEVEL_FUNC_CODE, "OnStreamConvert SRC = PCM (encode)");
 
-		ACMStream * the_stream = (ACMStream *) a_StreamInstance->dwInstance;
+		ACMStream * the_stream = (ACMStream *) a_StreamInstance->dwDriver;
 		if (the_stream != NULL)
 		{
 			if (the_stream->ConvertBuffer( a_StreamHeader ))
 				Result = MMSYSERR_NOERROR;
 		}
-	}
-	else if (PERSONAL_FORMAT == a_StreamInstance->pwfxSrc->wFormatTag &&
-		     WAVE_FORMAT_PCM == a_StreamInstance->pwfxDst->wFormatTag)
-	{
-		my_debug.OutPut(DEBUG_LEVEL_FUNC_CODE, "OnStreamConvert SRC = MP3 (decode)");
-
-#ifdef ENABLE_DECODING
-		DecodeStream * the_stream = (DecodeStream *) a_StreamInstance->dwInstance;
-		if (the_stream != NULL)
-		{
-			if (the_stream->ConvertBuffer( a_StreamHeader ))
-				Result = MMSYSERR_NOERROR;
-		}
-#endif // ENABLE_DECODING
 	}
 	else
 		my_debug.OutPut(DEBUG_LEVEL_FUNC_CODE, "OnStreamConvert unsupported conversion");
@@ -1203,51 +1068,150 @@ inline DWORD ACM::OnStreamConvert(LPACMDRVSTREAMINSTANCE a_StreamInstance, LPACM
 }
 
 
-void ACM::GetMP3FormatForIndex(const DWORD the_Index, WAVEFORMATEX & the_Format, unsigned short the_String[ACMFORMATDETAILS_FORMAT_CHARS]) const
+/*!
+	Tells whether the flags of an MPEG Layer-3 format describe an ABR stream:
+	only a format with the ABR bit of this codec's list does. Every padding
+	mode that Windows defines describes a CBR stream.
+
+	\param the_Flags the fdwFlags member of a MPEGLAYER3WAVEFORMAT
+	\return true for an ABR stream, false for a CBR stream
+*/
+bool ACM::IsABRFormatFlags(const DWORD the_Flags)
+{
+	return (the_Flags & FORMAT_FLAGS_ABR) != 0;
+}
+
+/*!
+	Tells whether the flags of an MPEG Layer-3 format describe a VBR stream
+	of this codec's list.
+
+	\param the_Flags the fdwFlags member of a MPEGLAYER3WAVEFORMAT
+	\return true for a VBR stream
+*/
+bool ACM::IsVBRFormatFlags(const DWORD the_Flags)
+{
+	return (the_Flags & FORMAT_FLAGS_VBR) != 0;
+}
+
+/*!
+	Returns the VBR quality level that the flags of a VBR format carry.
+
+	\param the_Flags the fdwFlags member of a MPEGLAYER3WAVEFORMAT whose
+	       IsVBRFormatFlags() is true
+	\return the level, 0 (the best) to AEncodeProperties::VBR_QUALITY_WORST.
+	        A larger value in the flags gives the worst level.
+*/
+unsigned int ACM::VBRQualityOfFormatFlags(const DWORD the_Flags)
+{
+	unsigned int const quality =
+		(unsigned int) ((the_Flags & FORMAT_FLAGS_VBR_QUALITY_MASK) >> FORMAT_FLAGS_VBR_QUALITY_SHIFT);
+
+	return quality <= AEncodeProperties::VBR_QUALITY_WORST ? quality : AEncodeProperties::VBR_QUALITY_WORST;
+}
+
+/*!
+	Fills a format structure with the MPEG Layer-3 format that this codec
+	writes for one set of encoding parameters, including the extra fields
+	at the end.
+
+	\param the_Format receives the format. It must have room for a whole
+	       MPEGLAYER3WAVEFORMAT.
+	\param the_Frequency the sample rate in Hz
+	\param the_Bitrate the bitrate in kbit/s
+	\param the_Channels the number of channels, 1 or 2
+	\param the_Mode the bitrate mode of the stream: vbr_off, vbr_abr or
+	       vbr_mtrh
+	\param the_Quality the VBR quality level of a vbr_mtrh format
+*/
+void ACM::FillMP3Format(WAVEFORMATEX & the_Format, const unsigned int the_Frequency, const unsigned int the_Bitrate, const unsigned int the_Channels, const vbr_mode the_Mode, const unsigned int the_Quality) const
 {
 	int Block_size;
-    char temp[ACMFORMATDETAILS_FORMAT_CHARS];
 
+	the_Format.wBitsPerSample = 0;
 
+	/// \todo handle more channel modes (mono, stereo, joint-stereo, dual-channel)
+
+	the_Format.nBlockAlign = 1;
+
+	the_Format.nSamplesPerSec = the_Frequency;
+	the_Format.nAvgBytesPerSec = the_Bitrate * 1000 / 8;
+	if (the_Frequency >= mpeg1_freq[SIZE_FREQ_MPEG1-1])
+		Block_size = 1152;
+	else
+		Block_size = 576;
+
+	// Both narrowings are into WAVEFORMATEX's 16-bit fields and both are
+	// bounded well inside it: the channel count is 1 or 2, and the block
+	// size is the byte length of one frame - at most 1152 samples at 320
+	// kbit/s and 32 kHz, under 1500 bytes.
+	the_Format.nChannels = (WORD) the_Channels;
+
+	the_Format.cbSize = MPEGLAYER3_WFX_EXTRA_BYTES;
+	MPEGLAYER3WAVEFORMAT * tmpFormat = (MPEGLAYER3WAVEFORMAT *) &the_Format;
+	tmpFormat->wID             = MPEGLAYER3_ID_MPEG;
+	if (the_Mode == vbr_abr)
+		tmpFormat->fdwFlags    = FORMAT_FLAGS_ABR;
+	else if (the_Mode == vbr_mtrh)
+		tmpFormat->fdwFlags    = FORMAT_FLAGS_VBR | ((DWORD) the_Quality << FORMAT_FLAGS_VBR_QUALITY_SHIFT);
+	else
+		tmpFormat->fdwFlags    = FORMAT_FLAGS_CBR;
+	tmpFormat->nBlockSize      = (WORD) (Block_size * the_Format.nAvgBytesPerSec / the_Format.nSamplesPerSec);
+	tmpFormat->nFramesPerBlock = 1;
+	tmpFormat->nCodecDelay     = 0; // 0x0571 on FHG
+}
+
+/*!
+	Writes the name of an MPEG Layer-3 format into a buffer, with the same
+	words as the format list.
+
+	\param the_Format the format to describe
+	\param the_String receives the name, at most
+	       ACMFORMATDETAILS_FORMAT_CHARS characters, including the terminating
+	       NUL
+*/
+void ACM::DescribeMP3Format(const WAVEFORMATEX & the_Format, WCHAR the_String[ACMFORMATDETAILS_FORMAT_CHARS]) const
+{
+	char temp[ACMFORMATDETAILS_FORMAT_CHARS];
+
+	// The bitrate mode is in the tail, which a structure that declares no
+	// extra bytes does not carry; such a format is described as constant.
+	bool is_abr = false;
+	bool is_vbr = false;
+	unsigned int quality = 0;
+	if (the_Format.cbSize >= MPEGLAYER3_WFX_EXTRA_BYTES)
+	{
+		const MPEGLAYER3WAVEFORMAT * tmpFormat = (const MPEGLAYER3WAVEFORMAT *) &the_Format;
+		is_abr = IsABRFormatFlags(tmpFormat->fdwFlags);
+		is_vbr = IsVBRFormatFlags(tmpFormat->fdwFlags);
+		quality = VBRQualityOfFormatFlags(tmpFormat->fdwFlags);
+	}
+
+	/// \todo : generate the string with the appropriate stereo mode
+	if (is_vbr)
+		snprintf( temp, sizeof temp, "%lu Hz, VBR quality %u (about %lu kbps), %s", the_Format.nSamplesPerSec, quality, the_Format.nAvgBytesPerSec * 8 / 1000, (the_Format.nChannels == 1)?"Mono":"Stereo");
+	else if (is_abr)
+		snprintf( temp, sizeof temp, "%lu Hz, ABR %lu kbps, %s", the_Format.nSamplesPerSec, the_Format.nAvgBytesPerSec * 8 / 1000, (the_Format.nChannels == 1)?"Mono":"Stereo");
+	else
+		snprintf( temp, sizeof temp, "%lu Hz, CBR %lu kbps, %s", the_Format.nSamplesPerSec, the_Format.nAvgBytesPerSec * 8 / 1000, (the_Format.nChannels == 1)?"Mono":"Stereo");
+
+	MultiByteToWideChar(CP_ACP, MB_PRECOMPOSED, temp, -1, the_String, ACMFORMATDETAILS_FORMAT_CHARS);
+}
+
+void ACM::GetMP3FormatForIndex(const DWORD the_Index, WAVEFORMATEX & the_Format, WCHAR the_String[ACMFORMATDETAILS_FORMAT_CHARS]) const
+{
 	if (the_Index < bitrate_table.size())
 	{
-	//	the_Format.wBitsPerSample = 16;
-		the_Format.wBitsPerSample = 0;
-	
-		/// \todo handle more channel modes (mono, stereo, joint-stereo, dual-channel)
-	//	the_Format.nChannels = SIZE_CHANNEL_MODE - int(the_Index % SIZE_CHANNEL_MODE);
-	
-		the_Format.nBlockAlign = 1;
+		FillMP3Format(the_Format,
+		              bitrate_table[the_Index].frequency,
+		              bitrate_table[the_Index].bitrate,
+		              bitrate_table[the_Index].channels,
+		              bitrate_table[the_Index].mode,
+		              bitrate_table[the_Index].quality);
+		DescribeMP3Format(the_Format, the_String);
+	}
+}
 
-		the_Format.nSamplesPerSec = bitrate_table[the_Index].frequency;
-		the_Format.nAvgBytesPerSec = bitrate_table[the_Index].bitrate * 1000 / 8;
-		if (bitrate_table[the_Index].frequency >= mpeg1_freq[SIZE_FREQ_MPEG1-1])
-			Block_size = 1152;
-		else
-			Block_size = 576;
-	
-		the_Format.nChannels = bitrate_table[the_Index].channels;
-
-		the_Format.cbSize = sizeof(MPEGLAYER3WAVEFORMAT) - sizeof(WAVEFORMATEX);
-		MPEGLAYER3WAVEFORMAT * tmpFormat = (MPEGLAYER3WAVEFORMAT *) &the_Format;
-		tmpFormat->wID             = 1;
-		// this is the only way I found to know if we do CBR or ABR
-		tmpFormat->fdwFlags        = 2 + ((bitrate_table[the_Index].mode == vbr_abr)?0:2);
-		tmpFormat->nBlockSize      = Block_size * the_Format.nAvgBytesPerSec / the_Format.nSamplesPerSec;
-		tmpFormat->nFramesPerBlock = 1;
-		tmpFormat->nCodecDelay     = 0; // 0x0571 on FHG
-	
-         /// \todo : generate the string with the appropriate stereo mode
-         if (bitrate_table[the_Index].mode == vbr_abr)
-             wsprintfA( temp, "%d Hz, %d kbps ABR, %s", the_Format.nSamplesPerSec, the_Format.nAvgBytesPerSec * 8 / 1000, (the_Format.nChannels == 1)?"Mono":"Stereo");
-         else
-             wsprintfA( temp, "%d Hz, %d kbps CBR, %s", the_Format.nSamplesPerSec, the_Format.nAvgBytesPerSec * 8 / 1000, (the_Format.nChannels == 1)?"Mono":"Stereo");
-
-         MultiByteToWideChar(CP_ACP, MB_PRECOMPOSED, temp, -1, the_String, ACMFORMATDETAILS_FORMAT_CHARS);
-     }
- }
-
-void ACM::GetPCMFormatForIndex(const DWORD the_Index, WAVEFORMATEX & the_Format, unsigned short the_String[ACMFORMATDETAILS_FORMAT_CHARS]) const
+void ACM::GetPCMFormatForIndex(const DWORD the_Index, WAVEFORMATEX & the_Format, WCHAR the_String[ACMFORMATDETAILS_FORMAT_CHARS]) const
 {
 	the_Format.nChannels = SIZE_CHANNEL_MODE - int(the_Index % SIZE_CHANNEL_MODE);
 	the_Format.wBitsPerSample = 16;
@@ -1275,126 +1239,230 @@ DWORD ACM::GetNumberEncodingFormats() const
 	return bitrate_table.size();
 }
 
-bool ACM::IsSmartOutput(const int frequency, const int bitrate, const int channels) const
+/**
+	\brief Tells whether a format stays in the list under the Smart filter.
+
+	\param the_Settings what decides the list.
+	\param frequency    the sample rate of the format, in Hz.
+	\param bitrate      its bitrate, in kbit/s.
+	\param channels     its channel count.
+	\return true without the filter, or with a compression ratio at or below
+	        its limit.
+*/
+bool ACM::IsSmartOutput(const FormatListSettings & the_Settings, const int frequency, const int bitrate,
+                        const int channels)
 {
 	double compression_ratio = double(frequency * 2 * channels) / double(bitrate * 100);
 
-//my_debug.OutPut(DEBUG_LEVEL_FUNC_DEBUG, "compression_ratio %f, freq %d, bitrate %d, channels %d", compression_ratio, frequency, bitrate, channels);
-
-	if(my_EncodingProperties.GetSmartOutputMode())
-		return (compression_ratio <= my_EncodingProperties.GetSmartRatio());
+	if (the_Settings.smart)
+		return (compression_ratio <= the_Settings.smart_ratio);
 	else return true;
+}
+
+/**
+	\brief Adds to a list one format for each sample rate and bitrate that
+	Smart Output allows.
+
+	\param the_Settings what decides the list.
+	\param freqs      the sample rates, in Hz.
+	\param nfreqs     the number of sample rates.
+	\param bitrates   the bitrates, in kbit/s.
+	\param nbitrates  the number of bitrates.
+	\param channels   the number of channels of the formats.
+	\param mode       the bitrate mode that the formats report.
+	\param the_List   receives the formats.
+*/
+void ACM::AddFormats(const FormatListSettings & the_Settings, const unsigned int * freqs, unsigned int nfreqs,
+                     const unsigned int * bitrates, unsigned int nbitrates, unsigned int channels,
+                     vbr_mode mode, std::vector<bitrate_item> & the_List)
+{
+	unsigned int freq, bitrate;
+
+	for (freq = 0; freq < nfreqs; freq++)
+	{
+		for (bitrate = 0; bitrate < nbitrates; bitrate++)
+		{
+			if (IsSmartOutput(the_Settings, freqs[freq], bitrates[bitrate], channels))
+			{
+				bitrate_item bitrate_table_tmp;
+
+				bitrate_table_tmp.frequency = freqs[freq];
+				bitrate_table_tmp.bitrate = bitrates[bitrate];
+				bitrate_table_tmp.channels = channels;
+				bitrate_table_tmp.mode = mode;
+				bitrate_table_tmp.quality = 0;
+				the_List.push_back(bitrate_table_tmp);
+			}
+		}
+	}
+}
+
+/**
+	\brief Adds to a list one VBR format for each sample rate and each VBR
+	quality level of the configured range that Smart Output allows, at the
+	level's typical bitrate.
+
+	\param the_Settings what decides the list.
+	\param freqs      the sample rates, in Hz.
+	\param nfreqs     the number of sample rates.
+	\param channels   the number of channels of the formats.
+	\param the_List   receives the formats.
+*/
+void ACM::AddVbrFormats(const FormatListSettings & the_Settings, const unsigned int * freqs, unsigned int nfreqs,
+                        unsigned int channels, std::vector<bitrate_item> & the_List)
+{
+	unsigned int freq, quality;
+	// Without bitrate limits the typical bitrates hold as they were measured
+	bool const limited = the_Settings.vbr_min != VBR_BITRATE_NO_LIMIT
+		|| the_Settings.vbr_max != VBR_BITRATE_NO_LIMIT;
+
+	for (freq = 0; freq < nfreqs; freq++)
+	{
+		unsigned int lowest = 0, highest = 0;
+
+		// A stream averages within the limits that LAME takes for its rate;
+		// a rate that LAME does not start with them is not offered
+		if (limited && !ACMStream::VbrBitrateBounds((int) freqs[freq], (int) channels, the_Settings.vbr_min,
+		                                            the_Settings.vbr_max, lowest, highest))
+			continue;
+		for (quality = the_Settings.vbr_best; quality <= the_Settings.vbr_worst; quality++)
+		{
+			unsigned int bitrate = VbrTypicalBitrate(freqs[freq], channels, quality);
+
+			if (limited && bitrate != 0 && bitrate < lowest)
+				bitrate = lowest;
+			else if (limited && bitrate > highest)
+				bitrate = highest;
+
+			if (bitrate != 0 && IsSmartOutput(the_Settings, freqs[freq], bitrate, channels))
+			{
+				bitrate_item bitrate_table_tmp;
+
+				bitrate_table_tmp.frequency = freqs[freq];
+				bitrate_table_tmp.bitrate = bitrate;
+				bitrate_table_tmp.channels = channels;
+				bitrate_table_tmp.mode = vbr_mtrh;
+				bitrate_table_tmp.quality = quality;
+				the_List.push_back(bitrate_table_tmp);
+			}
+		}
+	}
+}
+
+/**
+	\brief Returns the bitrates of an MPEG version that lie in the configured
+	       CBR range, in the order of the table.
+
+	\param the_Settings what decides the list.
+	\param bitrates  the bitrates of the MPEG version, in kbit/s.
+	\param nbitrates their count.
+	\return the bitrates in the range, in kbit/s.
+*/
+std::vector<unsigned int> ACM::CbrBitrates(const FormatListSettings & the_Settings, const unsigned int * bitrates,
+                                           unsigned int nbitrates)
+{
+	std::vector<unsigned int> list;
+
+	for (unsigned int i = 0; i < nbitrates; i++)
+	{
+		if (bitrates[i] >= the_Settings.cbr_min && bitrates[i] <= the_Settings.cbr_max)
+			list.push_back(bitrates[i]);
+	}
+	return list;
+}
+
+/**
+	\brief Returns the ABR bitrates of the configured range, highest first.
+
+	\param the_Settings what decides the list.
+	\param lowest  the lowest bitrate of the MPEG version, in kbit/s. Bitrates
+	               below it are left out.
+	\return the bitrates, in kbit/s.
+*/
+std::vector<unsigned int> ACM::AbrBitrates(const FormatListSettings & the_Settings, unsigned int lowest)
+{
+	std::vector<unsigned int> const ladder =
+		AEncodeProperties::AbrLadder(the_Settings.abr_min, the_Settings.abr_max, the_Settings.abr_step);
+	std::vector<unsigned int> list;
+
+	for (size_t i = 0; i < ladder.size(); i++)
+	{
+		if (ladder[i] >= lowest)
+			list.push_back(ladder[i]);
+	}
+	return list;
 }
 
 void ACM::BuildBitrateTable()
 {
 	my_debug.OutPut("entering BuildBitrateTable");
 
-	// fill the table
-	unsigned int channel,bitrate,freq;
-	
 	bitrate_table.clear();
+	BuildFormatList(my_EncodingProperties.GetFormatListSettings(), FAMILY_ALL, bitrate_table);
 
-	// CBR bitrates
-	for (channel = 0;channel < SIZE_CHANNEL_MODE;channel++)
+	my_debug.OutPut("leaving BuildBitrateTable");
+}
+
+/**
+	\brief Builds the formats that the settings offer, of the families asked
+	for, sorted by sample rate, bitrate and channels.
+
+	\param the_Settings what decides the list.
+	\param the_Families FAMILY_CBR, FAMILY_ABR and FAMILY_VBR, any of them
+	       together; a family that the settings do not offer stays out.
+	\param the_List     receives the formats, after those it holds.
+*/
+void ACM::BuildFormatList(const FormatListSettings & the_Settings, unsigned int the_Families,
+                          std::vector<bitrate_item> & the_List)
+{
+	unsigned int channel;
+
+	FillRateTables();
+
+	// CBR bitrates of the configured range. The MPEG-2 and MPEG-2.5 formats
+	// are entered with vbr_abr, which the host reads in fdwFlags.
+	if (the_Settings.cbr && (the_Families & FAMILY_CBR) != 0)
 	{
-		// MPEG I
-		for (freq = 0;freq < SIZE_FREQ_MPEG1;freq++)
-		{
-			for (bitrate = 0;bitrate < SIZE_BITRATE_MPEG1;bitrate++)
-			{
+		std::vector<unsigned int> const cbr1 = CbrBitrates(the_Settings, mpeg1_bitrate, SIZE_BITRATE_MPEG1);
+		std::vector<unsigned int> const cbr2 = CbrBitrates(the_Settings, mpeg2_bitrate, SIZE_BITRATE_MPEG2);
 
-				if (!my_EncodingProperties.GetSmartOutputMode() || IsSmartOutput(mpeg1_freq[freq], mpeg1_bitrate[bitrate], channel+1))
-				{
-					bitrate_item bitrate_table_tmp;
-					
-					bitrate_table_tmp.frequency = mpeg1_freq[freq];
-					bitrate_table_tmp.bitrate = mpeg1_bitrate[bitrate];
-					bitrate_table_tmp.channels = channel+1;
-					bitrate_table_tmp.mode = vbr_off;
-					bitrate_table.push_back(bitrate_table_tmp);
-				}
-			}
-		}
-		// MPEG II / II.5
-		for (freq = 0;freq < SIZE_FREQ_MPEG2;freq++)
+		for (channel = 1; channel <= SIZE_CHANNEL_MODE; channel++)
 		{
-			for (bitrate = 0;bitrate < SIZE_BITRATE_MPEG2;bitrate++)
-			{
-				if (!my_EncodingProperties.GetSmartOutputMode() || IsSmartOutput(mpeg2_freq[freq], mpeg2_bitrate[bitrate], channel+1))
-				{
-					bitrate_item bitrate_table_tmp;
-
-                                        bitrate_table_tmp.frequency = mpeg2_freq[freq];
-					bitrate_table_tmp.bitrate = mpeg2_bitrate[bitrate];
-					bitrate_table_tmp.channels = channel+1;
-					bitrate_table_tmp.mode = vbr_abr;
-					bitrate_table.push_back(bitrate_table_tmp);
-				}
-			}
+			if (!cbr1.empty())
+				AddFormats(the_Settings, mpeg1_freq, SIZE_FREQ_MPEG1, &cbr1[0], (unsigned int) cbr1.size(), channel,
+				           vbr_off, the_List);
+			if (!cbr2.empty())
+				AddFormats(the_Settings, mpeg2_freq, SIZE_FREQ_MPEG2, &cbr2[0], (unsigned int) cbr2.size(), channel,
+				           vbr_abr, the_List);
 		}
 	}
 
-	if (my_EncodingProperties.GetAbrOutputMode())
 	// ABR bitrates
+	if (the_Settings.abr && (the_Families & FAMILY_ABR) != 0)
 	{
-		for (channel = 0;channel < SIZE_CHANNEL_MODE;channel++)
+		std::vector<unsigned int> const abr1 = AbrBitrates(the_Settings, mpeg1_bitrate[SIZE_BITRATE_MPEG1-1]);
+		std::vector<unsigned int> const abr2 = AbrBitrates(the_Settings, mpeg2_bitrate[SIZE_BITRATE_MPEG2-1]);
+
+		for (channel = 1; channel <= SIZE_CHANNEL_MODE; channel++)
 		{
-			// MPEG I
-			for (freq = 0;freq < SIZE_FREQ_MPEG1;freq++)
-			{
-				for (bitrate = my_EncodingProperties.GetAbrBitrateMax();
-					   bitrate >= my_EncodingProperties.GetAbrBitrateMin(); 
-				     bitrate -= my_EncodingProperties.GetAbrBitrateStep())
-				{
-					if (bitrate >= mpeg1_bitrate[SIZE_BITRATE_MPEG1-1] && (!my_EncodingProperties.GetSmartOutputMode() || IsSmartOutput(mpeg1_freq[freq], bitrate, channel+1)))
-					{
-						bitrate_item bitrate_table_tmp;
-						
-						bitrate_table_tmp.frequency = mpeg1_freq[freq];
-						bitrate_table_tmp.bitrate = bitrate;
-						bitrate_table_tmp.channels = channel+1;
-						bitrate_table_tmp.mode = vbr_abr;
-						bitrate_table.push_back(bitrate_table_tmp);
-					}
-				}
-			}
-			// MPEG II / II.5
-			for (freq = 0;freq < SIZE_FREQ_MPEG2;freq++)
-			{
-				for (bitrate = my_EncodingProperties.GetAbrBitrateMax();
-					   bitrate >= my_EncodingProperties.GetAbrBitrateMin(); 
-				     bitrate -= my_EncodingProperties.GetAbrBitrateStep())
-				{
-					if (bitrate >= mpeg2_bitrate[SIZE_BITRATE_MPEG2-1] && (!my_EncodingProperties.GetSmartOutputMode() || IsSmartOutput(mpeg2_freq[freq], bitrate, channel+1)))
-					{
-						bitrate_item bitrate_table_tmp;
-						
-						bitrate_table_tmp.frequency = mpeg2_freq[freq];
-						bitrate_table_tmp.bitrate = bitrate;
-						bitrate_table_tmp.channels = channel+1;
-						bitrate_table_tmp.mode = vbr_abr;
-						bitrate_table.push_back(bitrate_table_tmp);
-					}
-				}
-			}
+			if (!abr1.empty())
+				AddFormats(the_Settings, mpeg1_freq, SIZE_FREQ_MPEG1, &abr1[0], (unsigned int) abr1.size(), channel,
+				           vbr_abr, the_List);
+			if (!abr2.empty())
+				AddFormats(the_Settings, mpeg2_freq, SIZE_FREQ_MPEG2, &abr2[0], (unsigned int) abr2.size(), channel,
+				           vbr_abr, the_List);
+		}
+	}
+
+	if (the_Settings.vbr && (the_Families & FAMILY_VBR) != 0)
+	{
+		for (channel = 1; channel <= SIZE_CHANNEL_MODE; channel++)
+		{
+			AddVbrFormats(the_Settings, mpeg1_freq, SIZE_FREQ_MPEG1, channel, the_List);
+			AddVbrFormats(the_Settings, mpeg2_freq, SIZE_FREQ_MPEG2, channel, the_List);
 		}
 	}
 
 	// sorting by frequency/bitrate/channel
-	std::sort(bitrate_table.begin(), bitrate_table.end());
-
-/*	{
-		// display test
-		int i=0;
-		for (i=0; i<bitrate_table.size();i++)
-		{
-			my_debug.OutPut("bitrate_table[%d].frequency = %d",i,bitrate_table[i].frequency);
-			my_debug.OutPut("bitrate_table[%d].bitrate = %d",i,bitrate_table[i].bitrate);
-			my_debug.OutPut("bitrate_table[%d].channel = %d",i,bitrate_table[i].channels);
-			my_debug.OutPut("bitrate_table[%d].ABR = %s\n",i,(bitrate_table[i].mode == vbr_abr)?"ABR":"CBR");
-		}
-	}*/
-
-	my_debug.OutPut("leaving BuildBitrateTable");
+	std::sort(the_List.begin(), the_List.end());
 }

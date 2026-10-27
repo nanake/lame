@@ -30,10 +30,12 @@
   </ImportGroup>
   <ImportGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'" Label="PropertySheets">
     <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+    <Import Project="vs_clients_config.props" />
     <Import Project="vs_lame_config.props" />
   </ImportGroup>
   <ImportGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'" Label="PropertySheets">
     <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+    <Import Project="vs_clients_config.props" />
     <Import Project="vs_lame_config.props" />
   </ImportGroup>
   <PropertyGroup Label="UserMacros" />
@@ -47,8 +49,8 @@
     <ClCompile>
       <InlineFunctionExpansion>AnySuitable</InlineFunctionExpansion>
       <AdditionalIncludeDirectories>../include;../ACM;../ACM/ddk;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-      <PreprocessorDefinitions>NDEBUG;_BLADEDLL;_WINDOWS;WIN32;LAME_ACM;%(PreprocessorDefinitions)</PreprocessorDefinitions>
-      <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
+      <PreprocessorDefinitions>NDEBUG;_WINDOWS;WIN32;LAME_ACM;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
       <TreatWChar_tAsBuiltInType>false</TreatWChar_tAsBuiltInType>
     </ClCompile>
     <ResourceCompile>
@@ -71,8 +73,8 @@ copy ..\ACM\lame_acm.xml $(TargetDir)*.*
     <ClCompile>
       <Optimization>Disabled</Optimization>
       <AdditionalIncludeDirectories>../include;../ACM;../ACM/ddk;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-      <PreprocessorDefinitions>_DEBUG;_BLADEDLL;_WINDOWS;WIN32;LAME_ACM;%(PreprocessorDefinitions)</PreprocessorDefinitions>
-      <RuntimeLibrary>MultiThreadedDebugDLL</RuntimeLibrary>
+      <PreprocessorDefinitions>_DEBUG;_WINDOWS;WIN32;LAME_ACM;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
       <TreatWChar_tAsBuiltInType>false</TreatWChar_tAsBuiltInType>
     </ClCompile>
     <ResourceCompile>
@@ -95,7 +97,8 @@ copy ..\ACM\lame_acm.xml $(TargetDir)*.*
     <ClCompile Include="..\ACM\ACM.cpp" />
     <ClCompile Include="..\ACM\ACMStream.cpp" />
     <ClCompile Include="..\ACM\AEncodeProperties.cpp" />
-    <ClCompile Include="..\ACM\DecodeStream.cpp" />
+    <ClCompile Include="..\ACM\DialogFont.cpp" />
+    <ClCompile Include="..\ACM\SettingText.cpp" />
     <ClCompile Include="..\ACM\main.cpp" />
   </ItemGroup>
   <ItemGroup>
@@ -109,7 +112,8 @@ copy ..\ACM\lame_acm.xml $(TargetDir)*.*
     <ClInclude Include="..\ACM\ACMStream.h" />
     <ClInclude Include="..\ACM\adebug.h" />
     <ClInclude Include="..\ACM\AEncodeProperties.h" />
-    <ClInclude Include="..\ACM\DecodeStream.h" />
+    <ClInclude Include="..\ACM\DialogFont.h" />
+    <ClInclude Include="..\ACM\SettingText.h" />
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="..\ACM\acm.rc" />
@@ -124,8 +128,8 @@ copy ..\ACM\lame_acm.xml $(TargetDir)*.*
     <ProjectReference Include="vs_lame_acm_tinyxml.vcxproj">
       <Project>{30219289-3b7f-4e02-bc34-c1dbd08cd848}</Project>
     </ProjectReference>
-    <ProjectReference Include="vs_libmp3lame.vcxproj">
-      <Project>{20536101-3b0e-43ef-94f9-080d595dac57}</Project>
+    <ProjectReference Include="vs_libmp3lame_nodec.vcxproj">
+      <Project>{e1ef883d-7969-4f80-a91e-f260807f2961}</Project>
     </ProjectReference>
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

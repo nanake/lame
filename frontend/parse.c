@@ -52,6 +52,7 @@ char   *strchr(), *strrchr();
 #endif
 
 #include "lame.h"
+#include "machine.h"
 
 #include "parse.h"
 #include "main.h"
@@ -88,7 +89,7 @@ static iconv_t os2_iconv_open (const char *tocode, const char *fromcode)
     if (!strncmp(to, "UTF-16", 6))
     {
         strcpy(to, "UCS-2");
-        memmove(to + 5, to + 6, strlen(to + 6));
+        memmove(to + 5, to + 6, strlen(to + 6) + 1);
     }
 
     p = strstr(to, "//");
@@ -98,7 +99,7 @@ static iconv_t os2_iconv_open (const char *tocode, const char *fromcode)
     if (!strncmp(from, "UTF-16", 6))
     {
         strcpy(from, "UCS-2");
-        memmove(from + 5, from + 6, strlen(from + 6));
+        memmove(from + 5, from + 6, strlen(from + 6) + 1);
     }
 
     p = strstr(from, "//");
@@ -112,7 +113,7 @@ static iconv_t os2_iconv_open (const char *tocode, const char *fromcode)
 #endif /* KLIBC iconv */
 #endif /* HAVE_ICONV */
 
-#if defined _ALLOW_INTERNAL_OPTIONS
+#if defined LAME_INTERNAL_OPTIONS
 #define INTERNAL_OPTS 1
 #else
 #define INTERNAL_OPTS 0
@@ -140,18 +141,8 @@ static int const internal_opts_enabled = INTERNAL_OPTS;
 /* GLOBAL VARIABLES.  set by parse_args() */
 /* we need to clean this up */
 
-ReaderConfig global_reader = { sf_unknown, 0, 0, 0, 0 };
-WriterConfig global_writer = { 0 };
-
-UiConfig global_ui_config = {0,0,0,0};
-
-DecoderConfig global_decoder;
-
-RawPCMConfig global_raw_pcm = 
-{ /* in_bitwidth */ 16
-, /* in_signed   */ -1
-, /* in_endian   */ ByteOrderLittleEndian
-};
+const FrontendConfig frontend_config_defaults = FRONTEND_CONFIG_DEFAULTS;
+FrontendConfig frontend_config = FRONTEND_CONFIG_DEFAULTS;
 
 
 
@@ -165,30 +156,14 @@ typedef enum TextEncoding
 
 #ifdef HAVE_ICONV
 #define ID3TAGS_EXTENDED
-/* search for Zero termination in multi-byte strings */
-static size_t
-strlenMultiByte(char const* str, size_t w)
-{    
-    size_t n = 0;
-    if (str != 0) {
-        size_t i;
-        for (n = 0; ; ++n) {
-            size_t x = 0;
-            for (i = 0; i < w; ++i) {
-                x += *str++ == 0 ? 1 : 0;
-            }
-            if (x == w) {
-                break;
-            }
-        }
-    }
-    return n;
-}
 
 static char*
 currentCharacterEncoding(void)
 {
-#ifdef HAVE_LANGINFO_H
+#if defined(_WIN32)
+    /* main.c hands on the command line and LAMEOPT as UTF-8. */
+    char* cur_code = "UTF-8";
+#elif defined(HAVE_LANGINFO_H)
     char* cur_code = nl_langinfo(CODESET);
 #else
     char* env_lang = getenv("LANG");
@@ -198,159 +173,120 @@ currentCharacterEncoding(void)
     return cur_code;
 }
 
-static size_t
-currCharCodeSize(void)
+/**
+ * @internal
+ * @brief Converts text from one character set to another.
+ *
+ * iconv() stops at the first character that it cannot convert. The function
+ * then returns the part that was converted, and prints a warning with the value
+ * and the number of bytes that were dropped.
+ *
+ * @param to        the target character set, as iconv_open() names it.
+ * @param from      the character set of the text.
+ * @param src       the text.
+ * @param srcbytes  the number of bytes of @a src to convert.
+ * @param room      the number of bytes that iconv() may write. The buffer is
+ *                  larger, so the result always ends with zero bytes.
+ * @param lead      the number of bytes at the start of the result that the
+ *                  caller fills in, for a byte-order mark.
+ * @return the converted text. An empty string if this system cannot convert
+ *         between the two character sets. NULL if no memory is left.
+ */
+static char *
+convert_text(char const *to, char const *from, char const *src,
+             size_t srcbytes, size_t room, size_t lead)
 {
-    size_t n = 1;
-    char dst[32];
-    char* src = "A";
-    char* cur_code = currentCharacterEncoding();
-    iconv_t xiconv = iconv_open(cur_code, "ISO_8859-1");
-    if (xiconv != (iconv_t)-1) {
-        for (n = 0; n < 32; ++n) {
-            char* i_ptr = src;
-            char* o_ptr = dst;
-            size_t srcln = 1;
-            size_t avail = n;
-            size_t rc = iconv(xiconv, &i_ptr, &srcln, &o_ptr, &avail);
-            if (rc != (size_t)-1) {
-                break;
-            }
-        }
-        iconv_close(xiconv);
-    }
-    return n;
-}
+    char   *dst = calloc(room + 4, 4);
+    iconv_t xiconv;
+    char   *i_ptr, *o_ptr;
+    size_t  srcln, avail, rc;
+    /*  The names carry a "//TRANSLIT" flag for iconv_open(), which is an
+        instruction rather than part of the encoding's name; the messages below
+        stop at it. <string.h> and strcspn() are not visible here on
+        pre-standard compilers, so the length is counted by hand. */
+    int     to_len = 0;
 
-#if 0
-static
-char* fromLatin1( char* src )
-{
-    char* dst = 0;
-    if (src != 0) {
-        size_t const l = strlen(src);
-        size_t const n = l*4;
-        dst = calloc(n+4, 4);
-        if (dst != 0) {
-            char* cur_code = currentCharacterEncoding();
-            iconv_t xiconv = iconv_open(cur_code, "ISO_8859-1");
-            if (xiconv != (iconv_t)-1) {
-                char* i_ptr = src;
-                char* o_ptr = dst;
-                size_t srcln = l;
-                size_t avail = n;                
-                iconv(xiconv, &i_ptr, &srcln, &o_ptr, &avail);
-                iconv_close(xiconv);
-            }
+    while (to[to_len] != '\0' && to[to_len] != '/') {
+        ++to_len;
+    }
+
+    if (dst == 0) {
+        return 0;
+    }
+    xiconv = iconv_open(to, from);
+    if (xiconv == (iconv_t) -1) {
+        if (frontend_config.ui_config.silent < 9) {
+            error_printf("Cannot convert text from %s to %.*s on this system;"
+                         " the value is left out of the tag.\n",
+                         from, to_len, to);
         }
+        return dst;
+    }
+    i_ptr = (char *) src;
+    o_ptr = &dst[lead];
+    srcln = srcbytes;
+    avail = room;
+    rc = iconv(xiconv, &i_ptr, &srcln, &o_ptr, &avail);
+    iconv_close(xiconv);
+    if (rc == (size_t) -1 && frontend_config.ui_config.silent < 9) {
+        /*  The value is echoed back because a run may set several tag fields,
+            and otherwise there is no way to tell which of them was cut. */
+        error_printf("Only part of '%s' could be written as %.*s;"
+                     " %lu byte(s) of it were dropped.\n",
+                     src, to_len, to, (unsigned long) srcln);
     }
     return dst;
 }
 
-static
-char* fromUtf16( char* src )
-{
-    char* dst = 0;
-    if (src != 0) {
-        size_t const l = strlenMultiByte(src, 2);
-        size_t const n = l*4;
-        dst = calloc(n+4, 4);
-        if (dst != 0) {
-            char* cur_code = currentCharacterEncoding();
-            iconv_t xiconv = iconv_open(cur_code, "UTF-16LE");
-            if (xiconv != (iconv_t)-1) {
-                char* i_ptr = (char*)src;
-                char* o_ptr = dst;
-                size_t srcln = l*2;
-                size_t avail = n;                
-                iconv(xiconv, &i_ptr, &srcln, &o_ptr, &avail);
-                iconv_close(xiconv);
-            }
-        }
-    }
-    return dst;
-}
-#endif
 
 static
 char* toLatin1( char* src )
 {
-    size_t w = currCharCodeSize();
-    char* dst = 0;
-    if (src != 0) {
-        size_t const l = strlenMultiByte(src, w);
-        size_t const n = l*4;
-        dst = calloc(n+4, 4);
-        if (dst != 0) {
-            char* cur_code = currentCharacterEncoding();
-            iconv_t xiconv = iconv_open("ISO_8859-1//TRANSLIT", cur_code);
-            if (xiconv != (iconv_t)-1) {
-                char* i_ptr = (char*)src;
-                char* o_ptr = dst;
-                size_t srcln = l*w;
-                size_t avail = n;
-                iconv(xiconv, &i_ptr, &srcln, &o_ptr, &avail);
-                iconv_close(xiconv);
-            }
-        }
+    if (src == 0) {
+        return 0;
     }
-    return dst;
+    {
+        size_t const l = strlen(src);
+        return convert_text("ISO_8859-1//TRANSLIT", currentCharacterEncoding(),
+                            src, l, l*4, 0);
+    }
 }
 
 
 static
 char* toUtf8( char* src )
 {
-    size_t w = currCharCodeSize();
-    char* dst = 0;
-    if (src != 0) {
-        /* XXX: size calculation for UTF-16, a bit too much for UTF-8, but not too small */
-        size_t const l = strlenMultiByte(src, w);
-        size_t const n = (l+1)*4;
-        dst = calloc(n+4, 4);
-        if (dst != 0) {
-            char* cur_code = currentCharacterEncoding();
-            iconv_t xiconv = iconv_open("UTF-8//TRANSLIT", cur_code);
-            if (xiconv != (iconv_t)-1) {
-                char* i_ptr = (char*)src;
-                char* o_ptr = &dst[0];
-                size_t srcln = l*w;
-                size_t avail = n;
-                iconv(xiconv, &i_ptr, &srcln, &o_ptr, &avail);
-                iconv_close(xiconv);
-            }
-        }
+    if (src == 0) {
+        return 0;
     }
-    return dst;
-
+    {
+        /* XXX: size calculation for UTF-16, a bit too much for UTF-8, but not too small */
+        size_t const l = strlen(src);
+        return convert_text("UTF-8//TRANSLIT", currentCharacterEncoding(),
+                            src, l, (l+1)*4, 0);
+    }
 }
 
 
 static
 char* toUtf16( char* src )
 {
-    size_t w = currCharCodeSize();
-    char* dst = 0;
-    if (src != 0) {
-        size_t const l = strlenMultiByte(src, w);
-        size_t const n = (l+1)*4;
-        dst = calloc(n+4, 4);
+    if (src == 0) {
+        return 0;
+    }
+    {
+        size_t const l = strlen(src);
+        /* Two bytes are reserved at the front for the byte-order mark, which
+           is written afterwards so that it survives a conversion that could
+           not start at all. */
+        char *dst = convert_text("UTF-16LE//TRANSLIT", currentCharacterEncoding(),
+                                 src, l, (l+1)*4, 2);
         if (dst != 0) {
-            char* cur_code = currentCharacterEncoding();
-            iconv_t xiconv = iconv_open("UTF-16LE//TRANSLIT", cur_code);
             dst[0] = 0xff;
             dst[1] = 0xfe;
-            if (xiconv != (iconv_t)-1) {
-                char* i_ptr = (char*)src;
-                char* o_ptr = &dst[2];
-                size_t srcln = l*w;
-                size_t avail = n;
-                iconv(xiconv, &i_ptr, &srcln, &o_ptr, &avail);
-                iconv_close(xiconv);
-            }
         }
+        return dst;
     }
-    return dst;
 }
 #endif
 
@@ -367,55 +303,107 @@ unsigned short* toUtf16(char const* s)
     return utf8ToUtf16(s);
 }
 
+/* The text is UTF-8 already: main.c converts the command line. */
 char* toUtf8(char const* s)
 {
-    return local8BitToUtf8(s);
+    return s == 0 ? 0 : strdup(s);
 }
 #endif
 
-static int evaluateArgument(char const* token, char const* arg, char* _EndPtr)
+static int evaluateArgument(char const* token, char const* arg, char* end_ptr)
 {
-    if (arg != 0 && arg != _EndPtr)
+    if (arg != 0 && arg != end_ptr)
         return 1;
     error_printf("WARNING: argument missing for '%s'\n", token);
     return 0;
 }
 
+/* No option means anything beyond this magnitude, and the callers scale what
+   they read by up to a thousand before converting it to an int - so a
+   thousand times this has to fit in one. */
+#define MAX_NUMERIC_ARGUMENT 1.e6
+
+/* Set when an option's value was refused; parse_args_() fails at the end. */
+static int unusable_number = 0;
+
+/**
+ * @internal
+ * @brief Prints an error for an option value that no option can use, and
+ *        marks the parse as failed.
+ *
+ * @param token  the option, for the message.
+ * @param arg    the value as given.
+ */
+static void
+refuse_number(char const* token, char const* arg)
+{
+    error_printf("Error: '%s' is not a usable value for '%s'\n", arg, token);
+    unusable_number = 1;
+}
+
 static int getDoubleValue(char const* token, char const* arg, double* ptr)
 {
-    char *_EndPtr=0;
-    double d = strtod(arg, &_EndPtr);
+    char *end_ptr=0;
+    double d = strtod(arg, &end_ptr);
+    if (!double_is_finite(d) || d > MAX_NUMERIC_ARGUMENT || d < -MAX_NUMERIC_ARGUMENT) {
+        refuse_number(token, arg);
+        d = 0;
+    }
     if (ptr != 0) {
         *ptr = d;
     }
-    return evaluateArgument(token, arg, _EndPtr);
+    return evaluateArgument(token, arg, end_ptr);
 }
 
 static int getIntValue(char const* token, char const* arg, int* ptr)
 {
-    char *_EndPtr=0;
-    long d = strtol(arg, &_EndPtr, 10);
+    char *end_ptr=0;
+    long d = strtol(arg, &end_ptr, 10);
+    if (d > (long) MAX_NUMERIC_ARGUMENT || d < -(long) MAX_NUMERIC_ARGUMENT) {
+        refuse_number(token, arg);
+        d = 0;
+    }
     if (ptr != 0) {
         *ptr = (int)d;
     }
-    return evaluateArgument(token, arg, _EndPtr);
+    return evaluateArgument(token, arg, end_ptr);
 }
 
 #ifdef ID3TAGS_EXTENDED
+/**
+ * @internal
+ * @brief Returns the ID3v2 text frame that a tag option sets.
+ * @param type  the letter of the option: a, t, l, g, n or y.
+ * @return the four-character frame identifier. NULL for the comment (c), a
+ *         user frame (v) and any other letter.
+ */
+static char const *
+id3v2_text_frame(int type)
+{
+    switch (type)
+    {
+        case 'a': return "TPE1";
+        case 't': return "TIT2";
+        case 'l': return "TALB";
+        case 'g': return "TCON";
+        case 'n': return "TRCK";
+        case 'y': return "TYER";
+    }
+    return NULL;
+}
+
 /* Set an ID3v2 tag field from UTF-16 data. The data pointer is genuinely
    UTF-16 here, so the UTF-16 id3tag_* setters are used throughout. */
 static int
 set_id3v2tag_utf16(lame_global_flags* gfp, int type, unsigned short const* str)
 {
+    char const *const id = id3v2_text_frame(type);
+
+    if (id != NULL)
+        return id3tag_set_textinfo_utf16(gfp, id, str);
     switch (type)
     {
-        case 'a': return id3tag_set_textinfo_utf16(gfp, "TPE1", str);
-        case 't': return id3tag_set_textinfo_utf16(gfp, "TIT2", str);
-        case 'l': return id3tag_set_textinfo_utf16(gfp, "TALB", str);
-        case 'g': return id3tag_set_textinfo_utf16(gfp, "TCON", str);
         case 'c': return id3tag_set_comment_utf16(gfp, 0, 0, str);
-        case 'n': return id3tag_set_textinfo_utf16(gfp, "TRCK", str);
-        case 'y': return id3tag_set_textinfo_utf16(gfp, "TYER", str);
         case 'v': return id3tag_set_fieldvalue_utf16(gfp, str);
     }
     return -3;
@@ -428,15 +416,13 @@ set_id3v2tag_utf16(lame_global_flags* gfp, int type, unsigned short const* str)
 static int
 set_id3v2tag_utf8(lame_global_flags* gfp, int type, char const* str)
 {
+    char const *const id = id3v2_text_frame(type);
+
+    if (id != NULL)
+        return id3tag_set_textinfo_utf8(gfp, id, str);
     switch (type)
     {
-        case 'a': return id3tag_set_textinfo_utf8(gfp, "TPE1", str);
-        case 't': return id3tag_set_textinfo_utf8(gfp, "TIT2", str);
-        case 'l': return id3tag_set_textinfo_utf8(gfp, "TALB", str);
-        case 'g': return id3tag_set_textinfo_utf8(gfp, "TCON", str);
         case 'c': return id3tag_set_comment_utf8(gfp, 0, 0, str);
-        case 'n': return id3tag_set_textinfo_utf8(gfp, "TRCK", str);
-        case 'y': return id3tag_set_textinfo_utf8(gfp, "TYER", str);
         case 'v': return id3tag_set_fieldvalue_utf8(gfp, str);
     }
     return -3;
@@ -524,7 +510,7 @@ lame_version_print(FILE * const fp)
         else
             fprintf(fp, "LAME version %s (%s)\n\n", v, u);
     else {
-        int const n_white_spaces = (int)((lenu+2) > lw ? 0 : lw-2-lenu);
+        int const n_white_spaces = (int)(lw - 2 - lenu);
         /* text too long, wrap url into next line, right aligned */
         if (lenb > 0)
             fprintf(fp, "LAME %s version %s\n%*s(%s)\n\n", b, v, n_white_spaces, "", u);
@@ -737,7 +723,7 @@ help_developer_switches(FILE * const fp)
             );
     fprintf(fp,
             "    --athaa-type n  ATH auto adjust: 0 'no' else 'loudness based'\n"
-/** OBSOLETE "    --athaa-loudapprox n   n=1 total energy or n=2 equal loudness curve\n"*/
+/*  OBSOLETE "    --athaa-loudapprox n   n=1 total energy or n=2 equal loudness curve\n"*/
             "    --athaa-sensitivity x  activation offset in -/+ dB for ATH auto-adjustment\n"
             "\n");
     fprintf(fp,
@@ -762,7 +748,9 @@ help_developer_switches(FILE * const fp)
             "    -Z [n]          always do calculate short block maskings\n");
     fprintf(fp,
             "  Noise Shaping related:\n"
-            "(1) --substep n     use pseudo substep noise shaping method types 0-2\n"
+            "(1) --substep n     pseudo substep noise shaping. n is 0 to 7, the sum of\n"
+            "                    1 (apply it), 2 (half steps from the start) and\n"
+            "                    4 (short blocks too)\n"
             "(1) -X n[,m]        selects between different noise measurements\n"
             "                    n for long block, m for short. if m is omitted, m = n\n"
             " 1: CBR, ABR and VBR-old encoding modes only\n"
@@ -791,10 +779,10 @@ vector_choices(char *buf, size_t size)
         return "";
     buf[0] = '\0';
     strncat(buf, "auto, none", size - 1);
-    used = strnlen(buf, size);
+    used = lame_strnlen(buf, size);
     for (i = 0; i < n; ++i) {
         const char *const name = lame_get_vector_routines_name(i);
-        size_t const len = strnlen(name, size);
+        size_t const len = lame_strnlen(name, size);
 
         if (used + 2 + len + 1 > size)
             break;
@@ -875,6 +863,8 @@ long_help(const lame_global_flags * gfp, FILE * const fp, const char *ProgramNam
             "    --replaygain-accurate   compute RG more accurately and find the peak sample\n"
 #endif
             "    --noreplaygain  disable ReplayGain analysis\n"
+            "    --replaygain-id3v2  also write ReplayGain to the ID3v2 tag, as the\n"
+            "                    REPLAYGAIN_TRACK_GAIN and REPLAYGAIN_TRACK_PEAK frames\n"
 #ifdef HAVE_MPG123
             "    --clipdetect    enable --replaygain-accurate and print a message whether\n"
             "                    clipping occurs and how far the waveform is from full scale\n"
@@ -882,6 +872,8 @@ long_help(const lame_global_flags * gfp, FILE * const fp, const char *ProgramNam
         );
     fprintf(fp,
             "    --flush         flush output stream as soon as possible\n"
+            "    --preserve-modtime  give the output file the date and time of the\n"
+            "                    input file\n"
             "    --freeformat    produce a free format bitstream\n"
             "    --decode        input=mp3 file, output=wav\n"
             "    -t              disable writing wav header when using --decode\n");
@@ -1030,6 +1022,59 @@ display_bitrates(FILE * const fp)
     return 0;
 }
 
+/**
+ * @internal
+ * @brief Calls lame_init_params(), and prints the table of valid bitrates
+ *        when it rejects the bitrate.
+ * @param gfp  the encoder instance.
+ * @return the result of lame_init_params(). -1 is the result that the table
+ *         goes with.
+ */
+int
+frontend_init_params(lame_global_flags * gfp)
+{
+    int const ret = lame_init_params(gfp);
+
+    if (ret == -1) {
+        display_bitrates(stderr);
+    }
+    return ret;
+}
+
+/**
+ * @internal
+ * @brief Returns the message for a negative result of an encode or flush call.
+ *
+ * The codes are the ones that lame_encode_buffer() and lame_encode_flush()
+ * document.
+ *
+ * @param code  the result of the call.
+ * @return the message, without a line break.
+ */
+const char *
+frontend_encode_error_text(int code)
+{
+    switch (code) {
+    case -1:
+        return "the output buffer is too small";
+    case -2:
+        return "the encoder is out of memory";
+    case -3:
+        return "the encoder is not set up";
+    case -4:
+        return "the psychoacoustic model failed";
+    case -6:
+        return "the ReplayGain analysis of the resampled input failed";
+    case LAME_BADINPUTDATA:
+        return "the input holds a sample that is not a number, is infinite, "
+            "or is more than 4096 times full scale";
+    case LAME_INTERNALERROR:
+        return "the encoder could not fit a frame into its bits";
+    default:
+        return "the encoder failed";
+    }
+}
+
 
 /*  note: for presets it would be better to externalize them in a file.
     suggestion:  lame --preset <file-name> ...
@@ -1115,10 +1160,34 @@ presets_longinfo_dm(FILE * msgfp)
 }
 
 
+/** The size of the name of a --preset alias, terminator included. */
+#define PRESET_ALIAS_SIZE 8
+
+/** @internal @brief A --preset alias for an ABR bitrate. */
+typedef struct {
+    char    name[PRESET_ALIAS_SIZE]; /**< the alias */
+    int     kbps;             /**< the ABR bitrate */
+    int     mono;             /**< 1 when the alias also selects mono */
+} preset_alias;
+
+/** The aliases of --preset that select an ABR bitrate. */
+static const preset_alias preset_aliases[] = {
+    { "phone", 16, 1 },
+    { "phon+", 24, 1 }, { "lw", 24, 1 }, { "mw-eu", 24, 1 }, { "sw", 24, 1 },
+    { "mw-us", 40, 1 },
+    { "voice", 56, 1 },
+    { "fm", 112, 0 }, { "radio", 112, 0 }, { "tape", 112, 0 },
+    { "hifi", 160, 0 },
+    { "cd", 192, 0 },
+    { "studio", 256, 0 }
+};
+
 static int
 presets_set(lame_t gfp, int fast, int cbr, const char *preset_name, const char *ProgramName)
 {
     int     mono = 0;
+    int     kbps = atoi(preset_name);
+    size_t  i;
 
     if ((strcmp(preset_name, "help") == 0) && (fast < 1)
         && (cbr < 1)) {
@@ -1128,39 +1197,12 @@ presets_set(lame_t gfp, int fast, int cbr, const char *preset_name, const char *
     }
 
     /*aliases for compatibility with old presets */
-
-    if (strcmp(preset_name, "phone") == 0) {
-        preset_name = "16";
-        mono = 1;
-    }
-    if ((strcmp(preset_name, "phon+") == 0) ||
-        (strcmp(preset_name, "lw") == 0) ||
-        (strcmp(preset_name, "mw-eu") == 0) || (strcmp(preset_name, "sw") == 0)) {
-        preset_name = "24";
-        mono = 1;
-    }
-    if (strcmp(preset_name, "mw-us") == 0) {
-        preset_name = "40";
-        mono = 1;
-    }
-    if (strcmp(preset_name, "voice") == 0) {
-        preset_name = "56";
-        mono = 1;
-    }
-    if (strcmp(preset_name, "fm") == 0) {
-        preset_name = "112";
-    }
-    if ((strcmp(preset_name, "radio") == 0) || (strcmp(preset_name, "tape") == 0)) {
-        preset_name = "112";
-    }
-    if (strcmp(preset_name, "hifi") == 0) {
-        preset_name = "160";
-    }
-    if (strcmp(preset_name, "cd") == 0) {
-        preset_name = "192";
-    }
-    if (strcmp(preset_name, "studio") == 0) {
-        preset_name = "256";
+    for (i = 0; i < dimension_of(preset_aliases); ++i) {
+        if (strncmp(preset_name, preset_aliases[i].name, PRESET_ALIAS_SIZE) == 0) {
+            kbps = preset_aliases[i].kbps;
+            mono = preset_aliases[i].mono;
+            break;
+        }
     }
 
     if (strcmp(preset_name, "medium") == 0) {
@@ -1189,9 +1231,9 @@ presets_set(lame_t gfp, int fast, int cbr, const char *preset_name, const char *
     }
 
     /* Generic ABR Preset */
-    if (((atoi(preset_name)) > 0) && (fast < 1)) {
-        if ((atoi(preset_name)) >= 8 && (atoi(preset_name)) <= 320) {
-            lame_set_preset(gfp, atoi(preset_name));
+    if (kbps > 0 && fast < 1) {
+        if (kbps >= 8 && kbps <= 320) {
+            lame_set_preset(gfp, kbps);
 
             if (cbr == 1)
                 lame_set_VBR(gfp, vbr_off);
@@ -1207,7 +1249,7 @@ presets_set(lame_t gfp, int fast, int cbr, const char *preset_name, const char *
             lame_version_print(Console_IO.Error_fp);
             error_printf("Error: The bitrate specified is out of the valid range for this preset\n"
                          "\n"
-                         "When using this mode you must enter a value between \"32\" and \"320\"\n"
+                         "When using this mode you must enter a value between \"8\" and \"320\"\n"
                          "\n" "For further information try: \"%s --preset help\"\n", ProgramName);
             return -1;
         }
@@ -1239,9 +1281,8 @@ presets_set(lame_t gfp, int fast, int cbr, const char *preset_name, const char *
 }
 
 static void
-genre_list_handler(int num, const char *name, void *cookie)
+genre_list_handler(int num, const char *name, LAME_UNUSED void *cookie)
 {
-    (void) cookie;
     console_printf("%3d %s\n", num, name);
 }
 
@@ -1269,8 +1310,8 @@ local_strcasecmp(const char *s1, const char *s2)
     unsigned char c2;
 
     do {
-        c1 = (unsigned char) tolower(*s1);
-        c2 = (unsigned char) tolower(*s2);
+        c1 = (unsigned char) tolower((unsigned char) *s1);
+        c2 = (unsigned char) tolower((unsigned char) *s2);
         if (!c1) {
             break;
         }
@@ -1279,6 +1320,37 @@ local_strcasecmp(const char *s1, const char *s2)
     } while (c1 == c2);
     return c1 - c2;
 }
+
+#if !defined(HAVE_MPG123)
+/** @internal @brief The options that need the decoder, without the two dashes. */
+static char const *const decoder_options[] = {
+    "replaygain-accurate", "clipdetect", "mp1input", "mp2input", "mp3input"
+};
+
+/**
+ * @internal
+ * @brief Whether an option needs the decoder, which this build does not have.
+ * @param token  the option, without the two dashes.
+ * @return 1 when it does, 0 when it does not.
+ */
+static int
+is_decoder_option(char const *token)
+{
+    size_t  i;
+
+    for (i = 0; i < dimension_of(decoder_options); ++i)
+        if (0 == local_strcasecmp(token, decoder_options[i]))
+            return 1;
+    return 0;
+}
+
+/** @internal @brief Reports that an input or an option needs the missing decoder. */
+static void
+report_missing_decoder(void)
+{
+    error_printf("Error: libmp3lame not compiled with mpg123 *decoding* support \n");
+}
+#endif
 
 static int
 local_strncasecmp(const char *s1, const char *s2, int n)
@@ -1291,8 +1363,8 @@ local_strncasecmp(const char *s1, const char *s2, int n)
         if (cnt == n) {
             break;
         }
-        c1 = (unsigned char) tolower(*s1);
-        c2 = (unsigned char) tolower(*s2);
+        c1 = (unsigned char) tolower((unsigned char) *s1);
+        c2 = (unsigned char) tolower((unsigned char) *s2);
         if (!c1) {
             break;
         }
@@ -1304,37 +1376,6 @@ local_strncasecmp(const char *s1, const char *s2, int n)
 }
 
 
-
-/* LAME is a simple frontend which just uses the file extension */
-/* to determine the file type.  Trying to analyze the file */
-/* contents is well beyond the scope of LAME and should not be added. */
-static int
-filename_to_type(const char *FileName)
-{
-    size_t  len = strlen(FileName);
-
-    if (len < 4)
-        return sf_unknown;
-
-    FileName += len - 4;
-    if (0 == local_strcasecmp(FileName, ".mpg"))
-        return sf_mp123;
-    if (0 == local_strcasecmp(FileName, ".mp1"))
-        return sf_mp123;
-    if (0 == local_strcasecmp(FileName, ".mp2"))
-        return sf_mp123;
-    if (0 == local_strcasecmp(FileName, ".mp3"))
-        return sf_mp123;
-    if (0 == local_strcasecmp(FileName, ".wav"))
-        return sf_wave;
-    if (0 == local_strcasecmp(FileName, ".aif"))
-        return sf_aiff;
-    if (0 == local_strcasecmp(FileName, ".raw"))
-        return sf_raw;
-    if (0 == local_strcasecmp(FileName, ".ogg"))
-        return sf_ogg;
-    return sf_unknown;
-}
 
 static int
 resample_rate(double freq)
@@ -1376,6 +1417,43 @@ resample_rate(double freq)
 #define SLASH '/'
 #endif
 
+/**
+ * @internal
+ * @brief Tells whether a character is a directory separator of a path.
+ *
+ * On Windows and OS/2 both @c \\ and @c / separate; elsewhere @c / does.
+ *
+ * @param c  the character.
+ * @return 1 if @p c is a separator, else 0.
+ */
+static int
+is_slash(char c)
+{
+#if defined(_WIN32) || defined(__OS2__)
+    return c == '\\' || c == '/';
+#else
+    return c == '/';
+#endif
+}
+
+/**
+ * @internal
+ * @brief Tells whether a character ends a part of a path: a separator, or on
+ *        Windows the colon after a drive letter.
+ *
+ * @param c  the character.
+ * @return 1 if @p c ends a part, else 0.
+ */
+static int
+is_path_separator(char c)
+{
+#ifdef _WIN32
+    if (c == COLON)
+        return 1;
+#endif
+    return is_slash(c);
+}
+
 static
 size_t scanPath(char const* s, char const** a, char const** b)
 {
@@ -1383,14 +1461,8 @@ size_t scanPath(char const* s, char const** a, char const** b)
     char const* s2 = s;
     if (s != 0) {
         for (; *s; ++s) {
-            switch (*s) {
-            case SLASH:
-#ifdef _WIN32
-            case COLON:
-#endif
+            if (is_path_separator(*s))
                 s2 = s;
-                break;
-            }
         }
 #ifdef _WIN32
         if (*s2 == COLON) {
@@ -1414,26 +1486,15 @@ size_t scanBasename(char const* s, char const** a, char const** b)
     char const* s2 = s;
     if (s != 0) {
         for (; *s; ++s) {
-            switch (*s) {
-            case SLASH:
-#ifdef _WIN32
-            case COLON:
-#endif
+            if (is_path_separator(*s))
                 s1 = s2 = s;
-                break;
-            case '.':
+            else if (*s == '.')
                 s2 = s;
-                break;
-            }
         }
         if (s2 == s1) {
             s2 = s;
         }
-        if (*s1 == SLASH 
-#ifdef _WIN32
-          || *s1 == COLON
-#endif
-           ) {
+        if (is_path_separator(*s1)) {
             ++s1;
         }
     }
@@ -1446,20 +1507,65 @@ size_t scanBasename(char const* s, char const** a, char const** b)
     return s2-s1;
 }
 
+/**
+ * @internal
+ * @brief The file name suffixes that the frontends know, with the input
+ *        format that each one hints at.
+ *
+ * generateOutPath() replaces any of these suffixes with the suffix of the
+ * output. frontend_classify_suffix() takes the input format from them. A
+ * format of @c sf_unknown means that the suffix is known but does not say
+ * how to read the file.
+ */
+static const struct {
+    const char *suffix;         /**< the suffix, with its dot */
+    sound_file_format format;   /**< the input format it hints at */
+} known_suffixes[] = {
+    { ".wav", sf_wave }, { ".wave", sf_wave },
+    { ".aif", sf_aiff }, { ".aiff", sf_aiff }, { ".aifc", sf_aiff },
+    { ".raw", sf_raw }, { ".pcm", sf_unknown },
+    { ".mp1", sf_mp123 }, { ".mp2", sf_mp123 }, { ".mp3", sf_mp123 }, { ".mpg", sf_mp123 },
+    { ".mpa", sf_unknown },
+    { ".ogg", sf_ogg },
+    { ".cda", sf_unknown }, { ".au", sf_unknown }, { ".snd", sf_unknown },
+    { ".flac", sf_unknown }, { ".wv", sf_unknown }, { ".ofr", sf_unknown },
+    { ".tak", sf_unknown }, { ".mp4", sf_unknown }, { ".m4a", sf_unknown },
+    { ".w64", sf_unknown }
+};
+
+/**
+ * @internal
+ * @brief Returns the input format that the suffix of a file name hints at.
+ *
+ * The frontends use only the suffix. The header parsers of init_infile()
+ * still decide the format of a file that has one.
+ *
+ * @param path  the file name.
+ * @return the format, or @c sf_unknown when the suffix is not known or does
+ *         not hint at a format.
+ */
+sound_file_format
+frontend_classify_suffix(const char *path)
+{
+    char const *suffix;
+    size_t  i;
+
+    if (path == NULL)
+        return sf_unknown;
+    (void) scanBasename(path, NULL, &suffix);
+    for (i = 0; i < dimension_of(known_suffixes); ++i) {
+        if (local_strcasecmp(suffix, known_suffixes[i].suffix) == 0)
+            return known_suffixes[i].format;
+    }
+    return sf_unknown;
+}
+
 static 
 int isCommonSuffix(char const* s_ext)
 {
-    char const* suffixes[] = 
-    { ".WAV", ".RAW", ".MP1", ".MP2"
-    , ".MP3", ".MPG", ".MPA", ".CDA"
-    , ".OGG", ".AIF", ".AIFF", ".AU"
-    , ".SND", ".FLAC", ".WV", ".OFR"
-    , ".TAK", ".MP4", ".M4A", ".PCM"
-    , ".W64"
-    };
     size_t i;
-    for (i = 0; i < dimension_of(suffixes); ++i) {
-        if (local_strcasecmp(s_ext, suffixes[i]) == 0) {
+    for (i = 0; i < dimension_of(known_suffixes); ++i) {
+        if (local_strcasecmp(s_ext, known_suffixes[i].suffix) == 0) {
             return 1;
         }
     }
@@ -1467,10 +1573,26 @@ int isCommonSuffix(char const* s_ext)
 }
 
 
-int generateOutPath(char const* inPath, char const* outDir, char const* s_ext, char* outPath)
+/**
+ * @internal
+ * @brief Builds the name of an output file from the name of its input file.
+ *
+ * The name is the output directory, or the directory of the input file if
+ * there is none, then the base name of the input file, then its suffix, then
+ * @p s_ext. A suffix in #known_suffixes is left out, except when there is no
+ * output directory and the suffix is @p s_ext.
+ *
+ * @param inPath        the name of the input file.
+ * @param outDir        the output directory, or NULL or "" for none.
+ * @param s_ext         the suffix of the output file, with its dot.
+ * @param outPath       receives the name, NUL-terminated.
+ * @param outPath_size  the size of @p outPath, in bytes.
+ * @return 0 on success. 1 if the name does not fit into @p outPath. Then the
+ *         function prints an error, and @p outPath holds a part of the name.
+ */
+int generateOutPath(char const* inPath, char const* outDir, char const* s_ext, char* outPath,
+                    size_t outPath_size)
 {
-    size_t const max_path = PATH_MAX;
-#if 1
     size_t i = 0;
     int out_dir_used = 0;
 
@@ -1478,13 +1600,13 @@ int generateOutPath(char const* inPath, char const* outDir, char const* s_ext, c
         out_dir_used = 1;
         while (*outDir) {
             outPath[i++] = *outDir++;
-            if (i >= max_path) {
+            if (i >= outPath_size) {
                 goto err_generateOutPath;
             }
         }
-        if (i > 0 && outPath[i-1] != SLASH) {
+        if (i > 0 && !is_slash(outPath[i-1])) {
             outPath[i++] = SLASH;
-            if (i >= max_path) {
+            if (i >= outPath_size) {
                 goto err_generateOutPath;
             }
         }
@@ -1494,7 +1616,7 @@ int generateOutPath(char const* inPath, char const* outDir, char const* s_ext, c
         char const* pa;
         char const* pb;
         size_t j, n = scanPath(inPath, &pa, &pb);
-        if (i+n >= max_path) {
+        if (i+n >= outPath_size) {
             goto err_generateOutPath;
         }
         for (j = 0; j < n; ++j) {
@@ -1502,7 +1624,7 @@ int generateOutPath(char const* inPath, char const* outDir, char const* s_ext, c
         }
         if (n > 0) {
             outPath[i++] = SLASH;
-            if (i >= max_path) {
+            if (i >= outPath_size) {
                 goto err_generateOutPath;
             }
         }
@@ -1513,7 +1635,7 @@ int generateOutPath(char const* inPath, char const* outDir, char const* s_ext, c
         char const* na;
         char const* nb;
         size_t j, n = scanBasename(inPath, &na, &nb);
-        if (i+n >= max_path) {
+        if (i+n >= outPath_size) {
             goto err_generateOutPath;
         }
         for (j = 0; j < n; ++j) {
@@ -1531,29 +1653,24 @@ int generateOutPath(char const* inPath, char const* outDir, char const* s_ext, c
         if (replace_suffix == 0) {
             while (*nb) {
                 outPath[i++] = *nb++;
-                if (i >= max_path) {
+                if (i >= outPath_size) {
                     goto err_generateOutPath;
                 }
             }
             outPath[i] = 0;
         }
     }
-    if (i+5 >= max_path) {
-        goto err_generateOutPath;
+    {
+        size_t const ext_n = lame_strnlen(s_ext, outPath_size);
+        if (ext_n >= outPath_size - i) {
+            goto err_generateOutPath;
+        }
+        snprintf(outPath + i, outPath_size - i, "%s", s_ext);
     }
-    while (*s_ext) {
-        outPath[i++] = *s_ext++;
-    }
-    outPath[i] = 0;
     return 0;
 err_generateOutPath:
     error_printf( "error: output file name too long\n" );
     return 1;
-#else
-    strncpy(outPath, inPath, PATH_MAX + 1 - 4);
-    strncat(outPath, s_ext, 4);
-    return 0;
-#endif
 }
 
 
@@ -1571,24 +1688,31 @@ set_id3_albumart(lame_t gfp, char const* file_name)
         ret = 1;
     }
     else {
-        size_t size;
         char *albumart = 0;
+        long end = -1;
 
-        fseek(fpi, 0, SEEK_END);
-        size = ftell(fpi);
-        fseek(fpi, 0, SEEK_SET);
-        albumart = (char *)malloc(size);
-        if (!albumart) {
-            ret = 2;            
+        /* A pipe, or a file too large for a long, has no size to read. */
+        if (fseek(fpi, 0, SEEK_END) == 0)
+            end = ftell(fpi);
+        if (end < 0 || fseek(fpi, 0, SEEK_SET) != 0) {
+            ret = 5;
         }
         else {
-            if (fread(albumart, 1, size, fpi) != size) {
-                ret = 3;
+            size_t const size = (size_t) end;
+
+            albumart = (char *)malloc(size);
+            if (!albumart) {
+                ret = 2;
             }
             else {
-                ret = id3tag_set_albumart(gfp, albumart, size) ? 4 : 0;
+                if (fread(albumart, 1, size, fpi) != size) {
+                    ret = 3;
+                }
+                else {
+                    ret = id3tag_set_albumart(gfp, albumart, size) ? 4 : 0;
+                }
+                free(albumart);
             }
-            free(albumart);
         }
         fclose(fpi);
     }
@@ -1597,6 +1721,7 @@ set_id3_albumart(lame_t gfp, char const* file_name)
     case 2: error_printf("Insufficient memory for reading the albumart.\n"); break;
     case 3: error_printf("Read error: '%s'.\n", file_name); break;
     case 4: error_printf("Unsupported image: '%s'.\nSpecify JPEG/PNG/GIF image\n", file_name); break;
+    case 5: error_printf("Cannot read the album art from '%s': its size is not known.\n", file_name); break;
     default: break;
     }
     return ret;
@@ -1669,39 +1794,20 @@ set_vector_routines(lame_global_flags * gfp, const char *name)
     return -1;
 }
 
-/* Ugly, NOT final version */
-
-#define T_IF(str)          if ( 0 == local_strcasecmp (token,str) ) {
-#define T_ELIF(str)        } else if ( 0 == local_strcasecmp (token,str) ) {
-#define T_ELIF2(str1,str2) } else if ( 0 == local_strcasecmp (token,str1)  ||  0 == local_strcasecmp (token,str2) ) {
-#define T_ELSE             } else {
-#define T_END              }
-
-#define T_ELIF_INTERNAL(str) \
-                           } else if (dev_only_without_arg(str,token,&argIgnored)) {
-
-#define T_ELIF_INTERNAL_WITH_ARG(str) \
-                           } else if (dev_only_with_arg(str,token,nextArg,&argIgnored,&argUsed)) {
-
-
 /**
- * Copy a positional input/output filename argument into a fixed PATH_MAX+1
- * byte buffer, always null-terminating the result.
+ * Copies an input or output file name from the command line into a buffer of
+ * PATH_MAX+1 bytes. The copy always ends with a NUL.
  *
- * A source of PATH_MAX bytes or longer is rejected rather than copied, so the
- * destination is never left unterminated for a later unbounded string scan.
- *
- * @param src  NUL-terminated source filename.
- * @param dst  destination buffer of at least PATH_MAX+1 bytes; on success it
- *             holds a null-terminated copy of @p src, on failure it is left
- *             unchanged.
- * @return 0 on success, or -1 if @p src is PATH_MAX bytes or longer (an error
- *         naming the offending file is printed).
+ * @param src  the file name, NUL-terminated.
+ * @param dst  a buffer of at least PATH_MAX+1 bytes. On success, it contains a
+ *             NUL-terminated copy of @p src. On failure, it is not changed.
+ * @return 0 on success. -1 if @p src is PATH_MAX bytes or longer. Then the
+ *         function prints an error with the file name.
  */
 static int
 set_path_arg(char const *const src, char *const dst)
 {
-    int const arg_n = (int)strnlen(src, PATH_MAX);
+    int const arg_n = (int)lame_strnlen(src, PATH_MAX);
     if (arg_n >= PATH_MAX) {
         error_printf("input/output file name too long (limit %d): %s\n",
                      PATH_MAX, src);
@@ -1713,27 +1819,1198 @@ set_path_arg(char const *const src, char *const dst)
 }
 
 
+/**
+ * @internal
+ * @brief The settings of one parse_args_() run that an option leaves for a later
+ *        option or for the checks after the last one.
+ */
+typedef struct {
+    int     input_file;        /**< 1 when an input file name was given */
+    int     autoconvert;       /**< -a: the stereo input is encoded as mono */
+    int     nogap;             /**< --nogap: the file names are nogap inputs */
+    int     nogap_tags;        /**< 1 to write VBR tags in nogap mode */
+    int     count_nogap;       /**< the number of nogap input files */
+    int     noreplaygain;      /**< the user switched ReplayGain off */
+    int     vector_selected;   /**< --vector was given; it wins over --noasm */
+    int     noasm_none;        /**< --noasm sse was given; nothing may raise it */
+    int     id3tag_mode;       /**< which ID3 versions are written, ID3TAG_MODE */
+    int     ignore_tag_errors; /**< errors in tag values are ignored */
+    enum TextEncoding id3_tenc; /**< the text encoding of the tag options */
+} parse_state;
+
+/** @internal @brief What an option handler did with the option it was given. */
+typedef enum {
+    OPT_NOT_MINE,               /**< the option belongs to another handler */
+    OPT_DONE,                   /**< the option is set; the parse goes on */
+    OPT_STOP_OK,                /**< the parse stops without an error */
+    OPT_STOP_ERROR              /**< the parse stops with an error */
+} option_result;
+
+/** @internal @brief An option without an argument that sets an int setting. */
+typedef struct {
+    char const *name;           /**< the option, without the two dashes */
+    int    *field;              /**< the setting */
+    int     value;              /**< the value the option gives it */
+} int_flag_option;
+
+/**
+ * @internal
+ * @brief Sets the setting of the row of @p table that is named @p token.
+ *
+ * @param table  the rows.
+ * @param n      the number of rows.
+ * @param token  the option, without the two dashes.
+ * @return 1 when a row has that name, 0 otherwise.
+ */
+static int
+set_int_flag(int_flag_option const *table, size_t n, char const *token)
+{
+    size_t  k;
+
+    for (k = 0; k < n; ++k) {
+        if (0 == local_strcasecmp(token, table[k].name)) {
+            *table[k].field = table[k].value;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/** The input and output options that set one int setting. */
+static int_flag_option const io_flags[] = {
+    { "signed", &frontend_config.raw_pcm.in_signed, 1 },
+    { "unsigned", &frontend_config.raw_pcm.in_signed, 0 },
+    { "flush", &frontend_config.writer.flush_write, 1 },
+    { "preserve-modtime", &frontend_config.writer.preserve_modtime, 1 },
+    { "replaygain-id3v2", &frontend_config.writer.replaygain_id3v2, 1 },
+    { "swap-channel", &frontend_config.reader.swap_channel, 1 },
+    { "ignorelength", &frontend_config.reader.ignorewavlength, 1 }
+};
+
+/** The options for the messages on the screen that set one int setting. */
+static int_flag_option const info_flags[] = {
+    { "nohist", &frontend_config.ui_config.brhist, 0 },
+    /* on a scale from 1 to 10 be very silent */
+    { "quiet", &frontend_config.ui_config.silent, 10 },
+    { "silent", &frontend_config.ui_config.silent, 9 },
+    { "brief", &frontend_config.ui_config.silent, -5 },  /* print few info on screen */
+    { "verbose", &frontend_config.ui_config.silent, -10 } /* print a lot on screen */
+};
+
+/** @internal @brief An ID3 option that sets one text field of the tag. */
+typedef struct {
+    char const *name;           /**< the option, without the two dashes */
+    int     field;              /**< the field, as the letter id3_tag() takes */
+} tag_text_option;
+
+/** The ID3 options that set one text field. */
+static tag_text_option const tag_text_options[] = {
+    { "tt", 't' }, { "ta", 'a' }, { "tl", 'l' }, { "ty", 'y' }, { "tc", 'c' }
+};
+
+/** @internal @brief A developer option without an argument that calls one setter. */
+typedef struct {
+    char const *name;           /**< the option, without the two dashes */
+    int     (CDECL * setter) (lame_global_flags *, int); /**< the setter, NULL in a build without
+                                                      the developer options */
+    int     value;              /**< the value the option passes */
+} dev_flag_option;
+
+#if (INTERNAL_OPTS!=0)
+# define DEV_SETTER(f) f
+#else
+# define DEV_SETTER(f) NULL
+#endif
+
+/** The developer options without an argument that call one setter with a constant. */
+static dev_flag_option const dev_flags[] = {
+    { "noshort", lame_set_no_short_blocks, 1 },
+    { "short", lame_set_no_short_blocks, 0 },
+    { "allshort", lame_set_force_short_blocks, 1 },
+    { "notemp", lame_set_useTemporal, 0 },
+    { "no-preset-tune", DEV_SETTER(lame_set_preset_notune), 0 },
+    { "sfscale", DEV_SETTER(lame_set_sfscale), 1 },
+    { "noath", lame_set_noATH, 1 },
+    { "athonly", lame_set_ATHonly, 1 },
+    { "athshort", lame_set_ATHshort, 1 }
+};
+
+/**
+ * @internal
+ * @brief Parses the options that choose how the audio is encoded.
+ *
+ * @param gfp          the encoder instance.
+ * @param st           the state of the parse.
+ * @param token        the option, without the two dashes.
+ * @param nextArg      the next word of the command line, or "".
+ * @param argUsed      receives how many words after the option it uses.
+ * @return OPT_NOT_MINE for an option of another group, else what the parse does next.
+ */
+static option_result
+parse_encoding_options(lame_t gfp, parse_state * st, char const *token, char *nextArg, int *argUsed)
+{
+    double  double_value = 0;
+    int     int_value = 0;
+
+    if (0 == local_strcasecmp(token, "resample")) {
+        *argUsed = getDoubleValue(token, nextArg, &double_value);
+        if (*argUsed)
+            (void) lame_set_out_samplerate(gfp, resample_rate(double_value));
+        return OPT_DONE;
+    }
+    if (0 == local_strcasecmp(token, "vbr-old")) {
+        lame_set_VBR(gfp, vbr_rh);
+        return OPT_DONE;
+    }
+    if (0 == local_strcasecmp(token, "vbr-new")) {
+        lame_set_VBR(gfp, vbr_mt);
+        return OPT_DONE;
+    }
+    if (0 == local_strcasecmp(token, "vbr-mtrh")) {
+        lame_set_VBR(gfp, vbr_mtrh);
+        return OPT_DONE;
+    }
+    if (0 == local_strcasecmp(token, "cbr")) {
+        lame_set_VBR(gfp, vbr_off);
+        return OPT_DONE;
+    }
+    if (0 == local_strcasecmp(token, "abr")) {
+        /* values larger than 8000 are bps (like Fraunhofer), so it's strange to get 320000 bps MP3 when specifying 8000 bps MP3 */
+        *argUsed = getIntValue(token, nextArg, &int_value);
+        if (*argUsed) {
+            if (int_value >= 8000) {
+                int_value = (int_value + 500) / 1000;
+            }
+            if (int_value > 320) {
+                int_value = 320;
+            }
+            if (int_value < 8) {
+                int_value = 8;
+            }
+            lame_set_VBR(gfp, vbr_abr);
+            lame_set_VBR_mean_bitrate_kbps(gfp, int_value);
+        }
+        return OPT_DONE;
+    }
+    if (0 == local_strcasecmp(token, "r3mix")) {
+        lame_set_preset(gfp, R3MIX);
+        return OPT_DONE;
+    }
+    if (0 == local_strcasecmp(token, "nores")) {
+        lame_set_disable_reservoir(gfp, 1);
+        return OPT_DONE;
+    }
+    if (0 == local_strcasecmp(token, "strictly-enforce-ISO")) {
+        lame_set_strict_ISO(gfp, MDB_STRICT_ISO);
+        return OPT_DONE;
+    }
+    if (0 == local_strcasecmp(token, "buffer-constraint")) {
+        *argUsed = 1;
+        if (strcmp(nextArg, "default") == 0)
+            (void) lame_set_strict_ISO(gfp, MDB_DEFAULT);
+        else if (strcmp(nextArg, "strict") == 0)
+            (void) lame_set_strict_ISO(gfp, MDB_STRICT_ISO);
+        else if (strcmp(nextArg, "maximum") == 0)
+            (void) lame_set_strict_ISO(gfp, MDB_MAXIMUM);
+        else {
+            error_printf("unknown buffer constraint '%s'\n", nextArg);
+            return OPT_STOP_ERROR;
+        }
+        return OPT_DONE;
+    }
+    if (0 == local_strcasecmp(token, "scale")) {
+        *argUsed = getDoubleValue(token, nextArg, &double_value);
+        if (*argUsed && lame_set_scale(gfp, (float) double_value) != 0)
+            refuse_number(token, nextArg);
+        return OPT_DONE;
+    }
+    if (0 == local_strcasecmp(token, "scale-l")) {
+        *argUsed = getDoubleValue(token, nextArg, &double_value);
+        if (*argUsed && lame_set_scale_left(gfp, (float) double_value) != 0)
+            refuse_number(token, nextArg);
+        return OPT_DONE;
+    }
+    if (0 == local_strcasecmp(token, "scale-r")) {
+        *argUsed = getDoubleValue(token, nextArg, &double_value);
+        if (*argUsed && lame_set_scale_right(gfp, (float) double_value) != 0)
+            refuse_number(token, nextArg);
+        return OPT_DONE;
+    }
+    if (0 == local_strcasecmp(token, "gain")) {
+        *argUsed = getDoubleValue(token, nextArg, &double_value);
+        if (*argUsed) {
+            double gain = double_value;
+            gain = gain > -20.f ? gain : -20.f;
+            gain = gain < 12.f ? gain : 12.f;
+            gain = pow(10.f, gain*0.05);
+            (void) lame_set_scale(gfp, (float) gain);
+        }
+        return OPT_DONE;
+    }
+    if (0 == local_strcasecmp(token, "vector")) {
+        *argUsed = 1;
+        if (set_vector_routines(gfp, nextArg) != 0)
+            return OPT_STOP_ERROR;
+        st->vector_selected = 1;
+        return OPT_DONE;
+    }
+    if (0 == local_strcasecmp(token, "noasm")) {
+        *argUsed = 1;
+        if (local_strcasecmp(nextArg, "sse") == 0) {
+            error_printf("WARNING: --noasm sse is deprecated,"
+                         " use --vector none instead\n");
+            if (!st->vector_selected) {
+                (void) lame_set_vector_routines(gfp, "none");
+                st->noasm_none = 1;
+            }
+        }
+        else if (local_strcasecmp(nextArg, "avx2") == 0) {
+            error_printf("WARNING: --noasm avx2 is deprecated,"
+                         " use --vector sse2 instead\n");
+            /* The option could be repeated to turn off more than
+               one tier, so a second mapping may only lower the
+               selection: "sse" already asked for none. */
+            if (!st->vector_selected && !st->noasm_none)
+                (void) lame_set_vector_routines(gfp, "sse2");
+        }
+        else {
+            error_printf("WARNING: --noasm %s is deprecated and selects nothing;"
+                         " see --vector\n", nextArg);
+        }
+        return OPT_DONE;
+    }
+    if (0 == local_strcasecmp(token, "freeformat")) {
+        lame_set_free_format(gfp, 1);
+        return OPT_DONE;
+    }
+    if (0 == local_strcasecmp(token, "replaygain-fast")) {
+        lame_set_findReplayGain(gfp, 1);
+        return OPT_DONE;
+    }
+#ifdef HAVE_MPG123
+    if (0 == local_strcasecmp(token, "replaygain-accurate")) {
+        lame_set_decode_on_the_fly(gfp, 1);
+        lame_set_findReplayGain(gfp, 1);
+        return OPT_DONE;
+    }
+#endif
+    if (0 == local_strcasecmp(token, "noreplaygain")) {
+        st->noreplaygain = 1;
+        lame_set_findReplayGain(gfp, 0);
+        return OPT_DONE;
+    }
+#ifdef HAVE_MPG123
+    if (0 == local_strcasecmp(token, "clipdetect")) {
+        frontend_config.ui_config.print_clipping_info = 1;
+        lame_set_decode_on_the_fly(gfp, 1);
+        return OPT_DONE;
+    }
+#endif
+    if (0 == local_strcasecmp(token, "comp")) {
+        *argUsed = getDoubleValue(token, nextArg, &double_value);
+        if (*argUsed) {
+            if (double_value < 1.0) {
+                error_printf("Must specify compression ratio >= 1.0\n");
+                return OPT_STOP_ERROR;
+            }
+            else {
+                lame_set_compression_ratio(gfp, (float) double_value);
+            }
+        }
+        return OPT_DONE;
+    }
+    if (0 == local_strcasecmp(token, "athaa-sensitivity")) {
+        *argUsed = getDoubleValue(token, nextArg, &double_value);
+        if (*argUsed)
+            lame_set_athaa_sensitivity(gfp, (float) double_value);
+        return OPT_DONE;
+    }
+    return OPT_NOT_MINE;
+}
+
+/**
+ * @internal
+ * @brief Parses the lowpass and highpass filter options.
+ *
+ * A frequency from 0.001 to 50000 is accepted. A value below 50 for --lowpass,
+ * and below 16 for the other three options, is in kHz; a larger one is in Hz.
+ * A negative --lowpass or --highpass switches that filter off.
+ *
+ * @param gfp          the encoder instance.
+ * @param token        the option, without the two dashes.
+ * @param nextArg      the next word of the command line, or "".
+ * @param argUsed      receives how many words after the option it uses.
+ * @return OPT_NOT_MINE for an option of another group, else what the parse does next.
+ */
+static option_result
+parse_filter_options(lame_t gfp, char const *token, char *nextArg, int *argUsed)
+{
+    double  double_value = 0;
+
+    if (0 == local_strcasecmp(token, "lowpass")) {
+        *argUsed = getDoubleValue(token, nextArg, &double_value);
+        if (*argUsed) {
+            if (double_value < 0) {
+                lame_set_lowpassfreq(gfp, -1);
+            }
+            else {
+                if (double_value < 0.001 || double_value > 50000.) {
+                    error_printf("Must specify lowpass with --lowpass freq, freq >= 0.001 kHz\n");
+                    return OPT_STOP_ERROR;
+                }
+                lame_set_lowpassfreq(gfp, (int) (double_value * (double_value < 50. ? 1.e3 : 1.e0) + 0.5));
+            }
+        }
+        return OPT_DONE;
+    }
+    if (0 == local_strcasecmp(token, "lowpass-width")) {
+        *argUsed = getDoubleValue(token, nextArg, &double_value);
+        if (*argUsed) {
+            if (double_value < 0.001 || double_value > 50000.) {
+                error_printf
+                    ("Must specify lowpass width with --lowpass-width freq, freq >= 0.001 kHz\n");
+                return OPT_STOP_ERROR;
+            }
+            lame_set_lowpasswidth(gfp, (int) (double_value * (double_value < 16. ? 1.e3 : 1.e0) + 0.5));
+        }
+        return OPT_DONE;
+    }
+    if (0 == local_strcasecmp(token, "highpass")) {
+        *argUsed = getDoubleValue(token, nextArg, &double_value);
+        if (*argUsed) {
+            if (double_value < 0.0) {
+                lame_set_highpassfreq(gfp, -1);
+            }
+            else {
+                if (double_value < 0.001 || double_value > 50000.) {
+                    error_printf("Must specify highpass with --highpass freq, freq >= 0.001 kHz\n");
+                    return OPT_STOP_ERROR;
+                }
+                lame_set_highpassfreq(gfp, (int) (double_value * (double_value < 16. ? 1.e3 : 1.e0) + 0.5));
+            }
+        }
+        return OPT_DONE;
+    }
+    if (0 == local_strcasecmp(token, "highpass-width")) {
+        *argUsed = getDoubleValue(token, nextArg, &double_value);
+        if (*argUsed) {
+            if (double_value < 0.001 || double_value > 50000.) {
+                error_printf
+                    ("Must specify highpass width with --highpass-width freq, freq >= 0.001 kHz\n");
+                return OPT_STOP_ERROR;
+            }
+            lame_set_highpasswidth(gfp, (int) (double_value * (double_value < 16. ? 1.e3 : 1.e0) + 0.5));
+        }
+        return OPT_DONE;
+    }
+    return OPT_NOT_MINE;
+}
+
+/**
+ * @internal
+ * @brief Parses the options for the input and output files.
+ *
+ * @param gfp          the encoder instance.
+ * @param st           the state of the parse.
+ * @param token        the option, without the two dashes.
+ * @param nextArg      the next word of the command line, or "".
+ * @param outDir       receives the output directory, PATH_MAX+1 bytes.
+ * @param ProgramName  the name of the program, for messages.
+ * @param argUsed      receives how many words after the option it uses.
+ * @return OPT_NOT_MINE for an option of another group, else what the parse does next.
+ */
+static option_result
+parse_io_options(lame_t gfp, parse_state * st, char const *token, char *nextArg, char *const outDir,
+                 char const *ProgramName, int *argUsed)
+{
+    int     int_value = 0;
+
+    if (set_int_flag(io_flags, dimension_of(io_flags), token))
+        return OPT_DONE;
+    if (0 == local_strcasecmp(token, "bitwidth")) {
+        *argUsed = getIntValue(token, nextArg, &int_value);
+        if (*argUsed)
+            frontend_config.raw_pcm.in_bitwidth = int_value;
+        return OPT_DONE;
+    }
+    if (0 == local_strcasecmp(token, "little-endian")) {
+        frontend_config.raw_pcm.in_endian = ByteOrderLittleEndian;
+        return OPT_DONE;
+    }
+    if (0 == local_strcasecmp(token, "big-endian")) {
+        frontend_config.raw_pcm.in_endian = ByteOrderBigEndian;
+        return OPT_DONE;
+    }
+#ifdef HAVE_MPG123
+    if (0 == local_strcasecmp(token, "mp1input")) {
+        frontend_config.reader.input_format = sf_mp1;
+        return OPT_DONE;
+    }
+    if (0 == local_strcasecmp(token, "mp2input")) {
+        frontend_config.reader.input_format = sf_mp2;
+        return OPT_DONE;
+    }
+    if (0 == local_strcasecmp(token, "mp3input")) {
+        frontend_config.reader.input_format = sf_mp3;
+        return OPT_DONE;
+    }
+#endif
+    if (0 == local_strcasecmp(token, "decode")) {
+        (void) lame_set_decode_only(gfp, 1);
+        return OPT_DONE;
+    }
+    if (0 == local_strcasecmp(token, "decode-mp3delay")) {
+        *argUsed = getIntValue(token, nextArg, &int_value);
+        if (*argUsed) {
+            frontend_config.decoder.mp3_delay = int_value;
+            frontend_config.decoder.mp3_delay_set = 1;
+        }
+        return OPT_DONE;
+    }
+    if (0 == local_strcasecmp(token, "nogaptags")) {
+        st->nogap_tags = 1;
+        return OPT_DONE;
+    }
+    if (0 == local_strcasecmp(token, "nogapout")) {
+        int const arg_n = (int)lame_strnlen(nextArg, PATH_MAX);
+        if (arg_n >= PATH_MAX) {
+            error_printf("%s: %s argument length (%d) exceeds limit (%d)\n", ProgramName, token, arg_n, PATH_MAX);
+            return OPT_STOP_ERROR;
+        }
+        strncpy(outDir, nextArg, PATH_MAX);
+        outDir[PATH_MAX] = '\0';
+        *argUsed = 1;
+        return OPT_DONE;
+    }
+    if (0 == local_strcasecmp(token, "out-dir")) {
+        int const arg_n = (int)lame_strnlen(nextArg, PATH_MAX);
+        if (arg_n >= PATH_MAX) {
+            error_printf("%s: %s argument length (%d) exceeds limit (%d)\n", ProgramName, token, arg_n, PATH_MAX);
+            return OPT_STOP_ERROR;
+        }
+        strncpy(outDir, nextArg, PATH_MAX);
+        outDir[PATH_MAX] = '\0';
+        *argUsed = 1;
+        return OPT_DONE;
+    }
+    if (0 == local_strcasecmp(token, "nogap")) {
+        st->nogap = 1;
+        return OPT_DONE;
+    }
+    return OPT_NOT_MINE;
+}
+
+/**
+ * @internal
+ * @brief Parses the ID3 tag options.
+ *
+ * @param gfp          the encoder instance.
+ * @param st           the state of the parse.
+ * @param token        the option, without the two dashes.
+ * @param nextArg      the next word of the command line, or "".
+ * @param argUsed      receives how many words after the option it uses.
+ * @return OPT_NOT_MINE for an option of another group, else what the parse does next.
+ */
+static option_result
+parse_id3_options(lame_t gfp, parse_state * st, char const *token, char *nextArg, int *argUsed)
+{
+    size_t  k;
+    int     int_value = 0;
+
+#ifdef ID3TAGS_EXTENDED
+    if (0 == local_strcasecmp(token, "id3v2-utf16") || 0 == local_strcasecmp(token, "id3v2-ucs2")) {
+        /* id3v2-ucs2 for compatibility only */
+        st->id3_tenc = TENC_UTF16;
+        id3tag_add_v2(gfp);
+        return OPT_DONE;
+    }
+    if (0 == local_strcasecmp(token, "id3v2-utf8")) {
+        st->id3_tenc = TENC_UTF8;
+        id3tag_add_v2_4_UTF8(gfp);
+        return OPT_DONE;
+    }
+    if (0 == local_strcasecmp(token, "id3v2-latin1")) {
+        st->id3_tenc = TENC_LATIN1;
+        id3tag_add_v2(gfp);
+        return OPT_DONE;
+    }
+#endif
+    for (k = 0; k < dimension_of(tag_text_options); ++k) {
+        if (0 == local_strcasecmp(token, tag_text_options[k].name)) {
+            *argUsed = 1;
+            id3_tag(gfp, tag_text_options[k].field, st->id3_tenc, nextArg);
+            return OPT_DONE;
+        }
+    }
+    if (0 == local_strcasecmp(token, "tn")) {
+        int ret = id3_tag(gfp, 'n', st->id3_tenc, nextArg);
+        *argUsed = 1;
+        if (ret != 0) {
+            if (0 == st->ignore_tag_errors) {
+                if (st->id3tag_mode == ID3TAG_MODE_V1_ONLY) {
+                    if (frontend_config.ui_config.silent < 9) {
+                        error_printf("The track number has to be between 1 and 255 for ID3v1.\n");
+                    }
+                    return OPT_STOP_ERROR;
+                }
+                else if (st->id3tag_mode == ID3TAG_MODE_V2_ONLY) {
+                    /* an ID3v2 tag takes any track number */
+                }
+                else {
+                    if (frontend_config.ui_config.silent < 9) {
+                        error_printf("The track number has to be between 1 and 255 for ID3v1, ignored for ID3v1.\n");
+                    }
+                }
+            }
+        }
+        return OPT_DONE;
+    }
+    if (0 == local_strcasecmp(token, "tg")) {
+        int ret = 0;
+        *argUsed = 1;
+        if (nextArg != 0 && strlen(nextArg) > 0) {
+            ret = id3_tag(gfp, 'g', st->id3_tenc, nextArg);
+        }
+        if (ret != 0) {
+            if (0 == st->ignore_tag_errors) {
+                if (ret == -1) {
+                    error_printf("Unknown ID3v1 genre number: '%s'.\n", nextArg);
+                    return OPT_STOP_ERROR;
+                }
+                else if (ret == -2) {
+                    if (st->id3tag_mode == ID3TAG_MODE_V1_ONLY) {
+                        error_printf("Unknown ID3v1 genre: '%s'.\n", nextArg);
+                        return OPT_STOP_ERROR;
+                    }
+                    else if (st->id3tag_mode == ID3TAG_MODE_V2_ONLY) {
+                        /* an ID3v2 tag keeps the genre as text */
+                    }
+                    else {
+                        if (frontend_config.ui_config.silent < 9) {
+                            error_printf("Unknown ID3v1 genre: '%s'.  Setting ID3v1 genre to 'Other'\n", nextArg);
+                        }
+                    }
+                }
+                else {
+                    if (frontend_config.ui_config.silent < 10)
+                        error_printf("Internal error.\n");
+                    return OPT_STOP_ERROR;
+                }
+            }
+        }
+        return OPT_DONE;
+    }
+    if (0 == local_strcasecmp(token, "tv")) {
+        *argUsed = 1;
+        if (id3_tag(gfp, 'v', st->id3_tenc, nextArg)) {
+            if (frontend_config.ui_config.silent < 9) {
+                error_printf("Invalid field value: '%s'. Ignored\n", nextArg);
+            }
+        }
+        return OPT_DONE;
+    }
+    if (0 == local_strcasecmp(token, "ti")) {
+        *argUsed = 1;
+        if (set_id3_albumart(gfp, nextArg) != 0) {
+            if (! st->ignore_tag_errors) {
+                return OPT_STOP_ERROR;
+            }
+        }
+        return OPT_DONE;
+    }
+    if (0 == local_strcasecmp(token, "ignore-tag-errors")) {
+        st->ignore_tag_errors = 1;
+        return OPT_DONE;
+    }
+    if (0 == local_strcasecmp(token, "add-id3v2")) {
+        id3tag_add_v2(gfp);
+        return OPT_DONE;
+    }
+    if (0 == local_strcasecmp(token, "id3v1-only")) {
+        id3tag_v1_only(gfp);
+        st->id3tag_mode = ID3TAG_MODE_V1_ONLY;
+        return OPT_DONE;
+    }
+    if (0 == local_strcasecmp(token, "id3v2-only")) {
+        id3tag_v2_only(gfp);
+        st->id3tag_mode = ID3TAG_MODE_V2_ONLY;
+        return OPT_DONE;
+    }
+    if (0 == local_strcasecmp(token, "space-id3v1")) {
+        id3tag_space_v1(gfp);
+        return OPT_DONE;
+    }
+    if (0 == local_strcasecmp(token, "pad-id3v2")) {
+        id3tag_pad_v2(gfp);
+        frontend_config.writer.id3v2_padding = 128;
+        return OPT_DONE;
+    }
+    if (0 == local_strcasecmp(token, "pad-id3v2-size")) {
+        *argUsed = getIntValue(token, nextArg, &int_value);
+        if (*argUsed) {
+            int_value = int_value <= LAME_MAXID3V2PADDING ? int_value : LAME_MAXID3V2PADDING;
+            int_value = int_value >= 0      ? int_value : 0;
+            id3tag_set_pad(gfp, int_value);
+            frontend_config.writer.id3v2_padding = int_value;
+        }
+        return OPT_DONE;
+    }
+    if (0 == local_strcasecmp(token, "genre-list")) {
+        id3tag_genre_list(genre_list_handler, NULL);
+        return OPT_STOP_OK;
+    }
+    return OPT_NOT_MINE;
+}
+
+/**
+ * @internal
+ * @brief Parses the options for the messages on the screen and for help.
+ *
+ * @param gfp          the encoder instance.
+ * @param token        the option, without the two dashes.
+ * @param nextArg      the next word of the command line, or "".
+ * @param ProgramName  the name of the program, for messages.
+ * @param argUsed      receives how many words after the option it uses.
+ * @return OPT_NOT_MINE for an option of another group, else what the parse does next.
+ */
+static option_result
+parse_info_options(lame_t gfp, char const *token, char *nextArg, char const *ProgramName,
+                   int *argUsed)
+{
+    double  double_value = 0;
+
+    if (set_int_flag(info_flags, dimension_of(info_flags), token))
+        return OPT_DONE;
+#if defined(__OS2__) || defined(WIN32)
+    if (0 == local_strcasecmp(token, "priority")) {
+        int     int_value = 0;
+
+        *argUsed = getIntValue(token, nextArg, &int_value);
+        if (*argUsed)
+            setProcessPriority(int_value);
+        return OPT_DONE;
+    }
+#endif
+    /* some more GNU-ish options could be added
+     * brief         => few messages on screen (name, status report)
+     * o/output file => specifies output filename
+     * O             => stdout
+     * i/input file  => specifies input filename
+     * I             => stdin
+     */
+    if (0 == local_strcasecmp(token, "version") || 0 == local_strcasecmp(token, "license")) {
+        print_license(stdout);
+        return OPT_STOP_OK;
+    }
+    if (0 == local_strcasecmp(token, "help") || 0 == local_strcasecmp(token, "usage")) {
+        if (0 == local_strncasecmp(nextArg, "id3", 3)) {
+            help_id3tag(stdout);
+        }
+        else if (0 == local_strncasecmp(nextArg, "dev", 3)) {
+            help_developer_switches(stdout);
+        }
+        else {
+            short_help(gfp, stdout, ProgramName);
+        }
+        return OPT_STOP_OK;
+    }
+    if (0 == local_strcasecmp(token, "longhelp")) {
+        long_help(gfp, stdout, ProgramName, 0 /* lessmode=NO */ );
+        return OPT_STOP_OK;
+    }
+    if (0 == local_strcasecmp(token, "?")) {
+#ifdef __unix__
+        FILE   *fp = popen("less -Mqc", "w");
+        long_help(gfp, fp, ProgramName, 0 /* lessmode=NO */ );
+        pclose(fp);
+#else
+        long_help(gfp, stdout, ProgramName, 1 /* lessmode=YES */ );
+#endif
+        return OPT_STOP_OK;
+    }
+    if (0 == local_strcasecmp(token, "disptime")) {
+        *argUsed = getDoubleValue(token, nextArg, &double_value);
+        if (*argUsed)
+            frontend_config.ui_config.update_interval = (float) double_value;
+        return OPT_DONE;
+    }
+    return OPT_NOT_MINE;
+}
+
+/**
+ * @internal
+ * @brief Parses --preset and --alt-preset, which read one or more words.
+ *
+ * @param gfp          the encoder instance.
+ * @param token        the option, without the two dashes.
+ * @param nextArg      the next word of the command line, or "".
+ * @param ProgramName  the name of the program, for messages.
+ * @param argc         the number of words of the command line.
+ * @param argv         the words of the command line.
+ * @param i            the position of the option in @p argv.
+ * @param argUsed      receives how many words after the option it uses.
+ * @return OPT_NOT_MINE for another option, else what the parse does next.
+ */
+static option_result
+parse_preset_option(lame_t gfp, char const *token, char *nextArg, char const *ProgramName, int argc,
+                    char **argv, int i, int *argUsed)
+{
+    if (0 == local_strcasecmp(token, "preset") || 0 == local_strcasecmp(token, "alt-preset")) {
+        int     fast = 0, cbr = 0;
+
+        *argUsed = 1;
+        while ((strcmp(nextArg, "fast") == 0) || (strcmp(nextArg, "cbr") == 0)) {
+
+            if ((strcmp(nextArg, "fast") == 0) && (fast < 1))
+                fast = 1;
+            if ((strcmp(nextArg, "cbr") == 0) && (cbr < 1))
+                cbr = 1;
+
+            (*argUsed)++;
+            nextArg = i + *argUsed < argc ? argv[i + *argUsed] : "";
+        }
+
+        {
+            int const ret = presets_set(gfp, fast, cbr, nextArg, ProgramName);
+            if (ret < 0)
+                return ret == -2 ? OPT_STOP_OK : OPT_STOP_ERROR;
+        }
+        return OPT_DONE;
+    }
+    return OPT_NOT_MINE;
+}
+
+/**
+ * @internal
+ * @brief Parses the developer options. A build without them ignores them
+ *        with a warning.
+ *
+ * @param gfp          the encoder instance.
+ * @param token        the option, without the two dashes.
+ * @param nextArg      the next word of the command line, or "".
+ * @param argUsed      receives how many words after the option it uses.
+ * @return OPT_NOT_MINE for an option of another group, else what the parse does next.
+ */
+static option_result
+parse_developer_options(lame_t gfp, char const *token, char *nextArg, int *argUsed)
+{
+    double  double_value = 0;
+    int     int_value = 0;
+    int     argIgnored = 0;
+    size_t  row;
+
+    for (row = 0; row < dimension_of(dev_flags); ++row) {
+        if (dev_only_without_arg(dev_flags[row].name, token, &argIgnored)) {
+            (void) dev_flags[row].setter(gfp, dev_flags[row].value);
+            return OPT_DONE;
+        }
+    }
+    if (dev_only_with_arg("interch", token, nextArg, &argIgnored, argUsed)) {
+        *argUsed = getDoubleValue(token, nextArg, &double_value);
+        if (*argUsed)
+            (void) lame_set_interChRatio(gfp, (float) double_value);
+        return OPT_DONE;
+    }
+    if (dev_only_with_arg("temporal-masking", token, nextArg, &argIgnored, argUsed)) {
+        *argUsed = getIntValue(token, nextArg, &int_value);
+        if (*argUsed)
+            (void) lame_set_useTemporal(gfp, int_value ? 1 : 0);
+        return OPT_DONE;
+    }
+    if (dev_only_without_arg("nspsytune", token, &argIgnored)) {
+        ;
+        return OPT_DONE;
+    }
+    if (dev_only_without_arg("nssafejoint", token, &argIgnored)) {
+        lame_set_exp_nspsytune(gfp, lame_get_exp_nspsytune(gfp) | 2);
+        return OPT_DONE;
+    }
+    if (dev_only_with_arg("nsmsfix", token, nextArg, &argIgnored, argUsed)) {
+        *argUsed = getDoubleValue(token, nextArg, &double_value);
+        if (*argUsed)
+            (void) lame_set_msfix(gfp, double_value);
+        return OPT_DONE;
+    }
+    if (dev_only_with_arg("ns-bass", token, nextArg, &argIgnored, argUsed)) {
+        *argUsed = getDoubleValue(token, nextArg, &double_value);
+        if (*argUsed) {
+            int     k = (int) (double_value * 4);
+            if (k < -32)
+                k = -32;
+            if (k > 31)
+                k = 31;
+            if (k < 0)
+                k += 64;
+            lame_set_exp_nspsytune(gfp, lame_get_exp_nspsytune(gfp) | (k << 2));
+        }
+        return OPT_DONE;
+    }
+    if (dev_only_with_arg("ns-alto", token, nextArg, &argIgnored, argUsed)) {
+        *argUsed = getDoubleValue(token, nextArg, &double_value);
+        if (*argUsed) {
+            int     k = (int) (double_value * 4);
+            if (k < -32)
+                k = -32;
+            if (k > 31)
+                k = 31;
+            if (k < 0)
+                k += 64;
+            lame_set_exp_nspsytune(gfp, lame_get_exp_nspsytune(gfp) | (k << 8));
+        }
+        return OPT_DONE;
+    }
+    if (dev_only_with_arg("ns-treble", token, nextArg, &argIgnored, argUsed)) {
+        *argUsed = getDoubleValue(token, nextArg, &double_value);
+        if (*argUsed) {
+            int     k = (int) (double_value * 4);
+            if (k < -32)
+                k = -32;
+            if (k > 31)
+                k = 31;
+            if (k < 0)
+                k += 64;
+            lame_set_exp_nspsytune(gfp, lame_get_exp_nspsytune(gfp) | (k << 14));
+        }
+        return OPT_DONE;
+    }
+    if (dev_only_with_arg("ns-sfb21", token, nextArg, &argIgnored, argUsed)) {
+        /*  to be compatible with Naoki's original code,
+         *  ns-sfb21 specifies how to change ns-treble for sfb21 */
+        *argUsed = getDoubleValue(token, nextArg, &double_value);
+        if (*argUsed) {
+            int     k = (int) (double_value * 4);
+            if (k < -32)
+                k = -32;
+            if (k > 31)
+                k = 31;
+            if (k < 0)
+                k += 64;
+            lame_set_exp_nspsytune(gfp, lame_get_exp_nspsytune(gfp) | (k << 20));
+        }
+        return OPT_DONE;
+    }
+    if (dev_only_with_arg("tune", token, nextArg, &argIgnored, argUsed)) { /*without helptext */
+        *argUsed = getDoubleValue(token, nextArg, &double_value);
+        if (*argUsed)
+            lame_set_tune(gfp, (float) double_value);
+        return OPT_DONE;
+    }
+    if (dev_only_with_arg("shortthreshold", token, nextArg, &argIgnored, argUsed)) {
+        float   x, y;
+        int     n = sscanf(nextArg, "%f,%f", &x, &y);
+        if (n == 1) {
+            y = x;
+        }
+        (void) lame_set_short_threshold(gfp, x, y);
+        return OPT_DONE;
+    }
+    if (dev_only_with_arg("maskingadjust", token, nextArg, &argIgnored, argUsed)) {
+        /*without helptext */
+        *argUsed = getDoubleValue(token, nextArg, &double_value);
+        if (*argUsed)
+            (void) lame_set_maskingadjust(gfp, (float) double_value);
+        return OPT_DONE;
+    }
+    if (dev_only_with_arg("maskingadjustshort", token, nextArg, &argIgnored, argUsed)) {
+        /*without helptext */
+        *argUsed = getDoubleValue(token, nextArg, &double_value);
+        if (*argUsed)
+            (void) lame_set_maskingadjust_short(gfp, (float) double_value);
+        return OPT_DONE;
+    }
+    if (dev_only_with_arg("athcurve", token, nextArg, &argIgnored, argUsed)) { /*without helptext */
+        *argUsed = getDoubleValue(token, nextArg, &double_value);
+        if (*argUsed)
+            (void) lame_set_ATHcurve(gfp, (float) double_value);
+        return OPT_DONE;
+    }
+    if (dev_only_with_arg("substep", token, nextArg, &argIgnored, argUsed)) {
+        *argUsed = getIntValue(token, nextArg, &int_value);
+        if (*argUsed)
+            (void) lame_set_substep(gfp, int_value);
+        return OPT_DONE;
+    }
+    if (dev_only_with_arg("sbgain", token, nextArg, &argIgnored, argUsed)) { /*without helptext */
+        *argUsed = getIntValue(token, nextArg, &int_value);
+        if (*argUsed)
+            (void) lame_set_subblock_gain(gfp, int_value);
+        return OPT_DONE;
+    }
+    if (dev_only_with_arg("athlower", token, nextArg, &argIgnored, argUsed)) {
+        *argUsed = getDoubleValue(token, nextArg, &double_value);
+        if (*argUsed)
+            (void) lame_set_ATHlower(gfp, (float) double_value);
+        return OPT_DONE;
+    }
+    if (dev_only_with_arg("athtype", token, nextArg, &argIgnored, argUsed)) {
+        *argUsed = getIntValue(token, nextArg, &int_value);
+        if (*argUsed)
+            (void) lame_set_ATHtype(gfp, int_value);
+        return OPT_DONE;
+    }
+    if (dev_only_with_arg("athaa-type", token, nextArg, &argIgnored, argUsed)) {
+        /*  switch for developing, no DOCU */
+        /* once was 1:Gaby, 2:Robert, 3:Jon, else:off */
+        *argUsed = getIntValue(token, nextArg, &int_value);
+        if (*argUsed)
+            (void) lame_set_athaa_type(gfp, int_value); /* now: 0:off else:Jon */
+        return OPT_DONE;
+    }
+    if (dev_only_with_arg("debug-file", token, nextArg, &argIgnored, argUsed)) {
+        /* switch for developing, no DOCU */
+        /* file name to print debug info into */
+        set_debug_file(nextArg);
+        return OPT_DONE;
+    }
+    return argIgnored ? OPT_DONE : OPT_NOT_MINE;
+}
+
+/**
+ * @internal
+ * @brief Parses one word of single-letter options, such as -h or -b128.
+ *
+ * @param gfp          the encoder instance.
+ * @param st           the state of the parse.
+ * @param token        the word, without the dash.
+ * @param nextArg      the next word of the command line, or "".
+ * @param ProgramName  the name of the program, for messages.
+ * @param i            the position of the word in the command line. It moves
+ *                     on when an option uses the next word.
+ * @return what the parse does next.
+ */
+static option_result
+parse_short_options(lame_t gfp, parse_state * st, char const *token, char const *nextArg,
+                    char const *ProgramName, int *i)
+{
+    char    c;
+    int     argUsed = 0;
+
+    while ((c = *token++) != '\0') {
+        double double_value = 0;
+        int int_value = 0;
+        char const *arg = *token ? token : nextArg;
+        switch (c) {
+        case 'm':
+            argUsed = 1;
+
+            switch (*arg) {
+            case 's':
+                (void) lame_set_mode(gfp, STEREO);
+                break;
+            case 'd':
+                (void) lame_set_mode(gfp, DUAL_CHANNEL);
+                break;
+            case 'f':
+                lame_set_force_ms(gfp, 1);
+                (void) lame_set_mode(gfp, JOINT_STEREO);
+                break;
+            case 'j':
+                lame_set_force_ms(gfp, 0);
+                (void) lame_set_mode(gfp, JOINT_STEREO);
+                break;
+            case 'm':
+                (void) lame_set_mode(gfp, MONO);
+                break;
+            case 'l':
+                (void) lame_set_mode(gfp, MONO);
+                (void) lame_set_scale_left(gfp, 2);
+                (void) lame_set_scale_right(gfp, 0);
+                break;
+            case 'r':
+                (void) lame_set_mode(gfp, MONO);
+                (void) lame_set_scale_left(gfp, 0);
+                (void) lame_set_scale_right(gfp, 2);
+                break;
+            case 'a': /* same as 'j' ??? */
+                lame_set_force_ms(gfp, 0);
+                (void) lame_set_mode(gfp, JOINT_STEREO);
+                break;
+            default:
+                error_printf("%s: -m mode must be s/d/f/j/m/l/r not %s\n", ProgramName,
+                             arg);
+                return OPT_STOP_ERROR;
+            }
+            break;
+
+        case 'V':
+            argUsed = getDoubleValue("V", arg, &double_value);
+            if (argUsed) {
+                /* vbr_default is set in lame.h; -v below does the same */
+                if (lame_get_VBR(gfp) == vbr_off)
+                    lame_set_VBR(gfp, vbr_default);
+                lame_set_VBR_quality(gfp, (float) double_value);
+            }
+            break;
+        case 'v':
+            if (lame_get_VBR(gfp) == vbr_off)
+                lame_set_VBR(gfp, vbr_default);
+            break;
+
+        case 'q':
+            argUsed = getIntValue("q", arg, &int_value);
+            if (argUsed) 
+                (void) lame_set_quality(gfp, int_value);
+            break;
+        case 'f':
+            (void) lame_set_quality(gfp, 7);
+            break;
+        case 'h':
+            (void) lame_set_quality(gfp, 2);
+            break;
+
+        case 's':
+            argUsed = getDoubleValue("s", arg, &double_value);
+            if (argUsed) {
+                double_value = (int) (double_value * (double_value <= 192 ? 1.e3 : 1.e0) + 0.5);
+                frontend_config.reader.input_samplerate = (int)double_value;
+                (void) lame_set_in_samplerate(gfp, (int)double_value);
+            }
+            break;
+        case 'b':
+            argUsed = getIntValue("b", arg, &int_value);
+            if (argUsed) {
+                lame_set_brate(gfp, int_value);
+                lame_set_VBR_min_bitrate_kbps(gfp, lame_get_brate(gfp));
+            }
+            break;
+        case 'B':
+            argUsed = getIntValue("B", arg, &int_value);
+            if (argUsed) {
+                lame_set_VBR_max_bitrate_kbps(gfp, int_value);
+            }
+            break;
+        case 'F':
+            lame_set_VBR_hard_min(gfp, 1);
+            break;
+        case 't': /* dont write VBR tag */
+            (void) lame_set_bWriteVbrTag(gfp, 0);
+            frontend_config.decoder.disable_wav_header = 1;
+            break;
+        case 'T': /* do write VBR tag */
+            (void) lame_set_bWriteVbrTag(gfp, 1);
+            st->nogap_tags = 1;
+            frontend_config.decoder.disable_wav_header = 0;
+            break;
+        case 'r': /* force raw pcm input file */
+#if defined(LIBSNDFILE)
+            error_printf
+                ("WARNING: libsndfile may ignore -r and perform fseek's on the input.\n"
+                 "Compile without libsndfile if this is a problem.\n");
+#endif
+            frontend_config.reader.input_format = sf_raw;
+            break;
+        case 'x': /* force byte swapping */
+            frontend_config.reader.swapbytes = 1;
+            break;
+        case 'p': /* (jo) error_protection: add crc16 information to stream */
+            lame_set_error_protection(gfp, 1);
+            break;
+        case 'a': /* autoconvert input file from stereo to mono - for mono mp3 encoding */
+            st->autoconvert = 1;
+            (void) lame_set_mode(gfp, MONO);
+            break;
+        case 'd':   /*(void) lame_set_allow_diff_short( gfp, 1 ); */
+        case 'k':   /*lame_set_lowpassfreq(gfp, -1);
+                      lame_set_highpassfreq(gfp, -1); */
+            error_printf("WARNING: -%c is obsolete.\n", c);
+            break;
+        case 'S':
+            frontend_config.ui_config.silent = 5;
+            break;
+        case 'X':
+            /*  experimental switch -X:
+                the differnt types of quant compare are tough
+                to communicate to endusers, so they shouldn't
+                bother to toy around with them
+             */
+            {
+                int     x, y;
+                int     n = sscanf(arg, "%d,%d", &x, &y);
+                if (n == 1) {
+                    y = x;
+                }
+                argUsed = 1;
+                if (internal_opts_enabled) {
+                    lame_set_quant_comp(gfp, x);
+                    lame_set_quant_comp_short(gfp, y);
+                }
+            }
+            break;
+        case 'Y':
+            lame_set_experimentalY(gfp, 1);
+            break;
+        case 'Z':
+            /*  experimental switch -Z:
+             */
+            {
+                int     n = 1;
+                argUsed = sscanf(arg, "%d", &n);
+                /*if (internal_opts_enabled)*/
+                {
+                    lame_set_experimentalZ(gfp, n);
+                }
+            }
+            break;
+        case 'e':
+            argUsed = 1;
+
+            switch (*arg) {
+            case 'n':
+                lame_set_emphasis(gfp, 0);
+                break;
+            case '5':
+                lame_set_emphasis(gfp, 1);
+                break;
+            case 'c':
+                lame_set_emphasis(gfp, 3);
+                break;
+            default:
+                error_printf("%s: -e emp must be n/5/c not %s\n", ProgramName, arg);
+                return OPT_STOP_ERROR;
+            }
+            break;
+        case 'c':
+            lame_set_copyright(gfp, 1);
+            break;
+        case 'o':
+            lame_set_original(gfp, 0);
+            break;
+
+        case '?':
+            long_help(gfp, stdout, ProgramName, 0 /* LESSMODE=NO */ );
+            return OPT_STOP_OK;
+
+        default:
+            error_printf("%s: unrecognized option -%c\n", ProgramName, c);
+            return OPT_STOP_ERROR;
+        }
+        if (argUsed) {
+            if (arg == token)
+                token = ""; /* no more from token */
+            else
+                ++*i; /* skip arg we used */
+            arg = "";
+            argUsed = 0;
+        }
+    }
+    return OPT_DONE;
+}
+
 static int
 parse_args_(lame_global_flags * gfp, int argc, char **argv,
-           char *const inPath, char *const outPath, char **nogap_inPath, int *num_nogap)
+           char *const inPath, char *const outPath, char *const outDir,
+           char **nogap_inPath, int *num_nogap)
 {
-    char    outDir[PATH_MAX+1] = "";
-    int     input_file = 0;  /* set to 1 if we parse an input file name  */
+    parse_state st;
     int     i;
-    int     autoconvert = 0;
-    int     nogap = 0;
-    int     nogap_tags = 0;  /* set to 1 to use VBR tags in NOGAP mode */
     const char *ProgramName = argv[0];
-    int     count_nogap = 0;
-    int     noreplaygain = 0; /* is RG explicitly disabled by the user */
-    int     vector_selected = 0; /* --vector was given; it wins over --noasm */
-    int     noasm_none = 0;  /* --noasm sse was given; nothing may raise it */
-    int     id3tag_mode = ID3TAG_MODE_DEFAULT;
-    int     ignore_tag_errors = 0;  /* Ignore errors in values passed for tags */
+
+    memset(&st, 0, sizeof(st));
+    st.id3tag_mode = ID3TAG_MODE_DEFAULT;
 #ifdef ID3TAGS_EXTENDED
-    enum TextEncoding id3_tenc = TENC_UTF16;
+    st.id3_tenc = TENC_UTF16;
 #else
-    enum TextEncoding id3_tenc = TENC_LATIN1;
+    st.id3_tenc = TENC_LATIN1;
 #endif
 
 #if defined(HAVE_ICONV) && defined(HAVE_LANGINFO_H)
@@ -1741,937 +3018,74 @@ parse_args_(lame_global_flags * gfp, int argc, char **argv,
 #endif
     inPath[0] = '\0';
     outPath[0] = '\0';
-    /* turn on display options. user settings may turn them off below */
-    global_ui_config.silent = 0; /* default */
-    global_ui_config.brhist = 1;
-    global_decoder.mp3_delay = 0;
-    global_decoder.mp3_delay_set = 0;
-    global_decoder.disable_wav_header = 0;
-    global_ui_config.print_clipping_info = 0;
+    outDir[0] = '\0';
+    frontend_config = frontend_config_defaults;
     id3tag_init(gfp);
+    unusable_number = 0;
 
     /* process args */
     for (i = 0; ++i < argc;) {
         char   *token;
         int     argUsed;
-        int     argIgnored=0;
 
         token = argv[i];
         if (*token++ == '-') {
             char   *nextArg = i + 1 < argc ? argv[i + 1] : "";
             argUsed = 0;
             if (!*token) { /* The user wants to use stdin and/or stdout. */
-                input_file = 1;
+                st.input_file = 1;
                 if (inPath[0] == '\0')
                     strncpy(inPath, argv[i], PATH_MAX + 1);
                 else if (outPath[0] == '\0')
                     strncpy(outPath, argv[i], PATH_MAX + 1);
             }
             if (*token == '-') { /* GNU style */
-                double  double_value = 0;
-                int     int_value = 0;
+                option_result result;
+
                 token++;
-
-                T_IF("resample")
-                    argUsed = getDoubleValue(token, nextArg, &double_value);
-                    if (argUsed) 
-                        (void) lame_set_out_samplerate(gfp, resample_rate(double_value));
-
-                T_ELIF("vbr-old")
-                    lame_set_VBR(gfp, vbr_rh);
-
-                T_ELIF("vbr-new")
-                    lame_set_VBR(gfp, vbr_mt);
-
-                T_ELIF("vbr-mtrh")
-                    lame_set_VBR(gfp, vbr_mtrh);
-
-                T_ELIF("cbr")
-                    lame_set_VBR(gfp, vbr_off);
-
-                T_ELIF("abr")
-                    /* values larger than 8000 are bps (like Fraunhofer), so it's strange to get 320000 bps MP3 when specifying 8000 bps MP3 */
-                    argUsed = getIntValue(token, nextArg, &int_value);
-                    if (argUsed) {
-                        if (int_value >= 8000) {
-                            int_value = (int_value + 500) / 1000;
-                        }
-                        if (int_value > 320) {
-                            int_value = 320;
-                        }
-                        if (int_value < 8) {
-                            int_value = 8;
-                        }
-                        lame_set_VBR(gfp, vbr_abr);
-                        lame_set_VBR_mean_bitrate_kbps(gfp, int_value);
+                result = parse_encoding_options(gfp, &st, token, nextArg, &argUsed);
+                if (result == OPT_NOT_MINE)
+                    result = parse_filter_options(gfp, token, nextArg, &argUsed);
+                if (result == OPT_NOT_MINE)
+                    result = parse_io_options(gfp, &st, token, nextArg, outDir, ProgramName,
+                                              &argUsed);
+                if (result == OPT_NOT_MINE)
+                    result = parse_id3_options(gfp, &st, token, nextArg, &argUsed);
+                if (result == OPT_NOT_MINE)
+                    result = parse_info_options(gfp, token, nextArg, ProgramName, &argUsed);
+                if (result == OPT_NOT_MINE)
+                    result = parse_preset_option(gfp, token, nextArg, ProgramName, argc, argv, i,
+                                                 &argUsed);
+                if (result == OPT_NOT_MINE)
+                    result = parse_developer_options(gfp, token, nextArg, &argUsed);
+                if (result == OPT_NOT_MINE) {
+#if !defined(HAVE_MPG123)
+                    if (is_decoder_option(token)) {
+                        report_missing_decoder();
+                        return -1;
                     }
-
-                T_ELIF("r3mix")
-                    lame_set_preset(gfp, R3MIX);
-
-                T_ELIF("bitwidth")
-                    argUsed = getIntValue(token, nextArg, &int_value);
-                    if (argUsed) 
-                        global_raw_pcm.in_bitwidth = int_value;
-                
-                T_ELIF("signed")
-                    global_raw_pcm.in_signed = 1;
-
-                T_ELIF("unsigned")
-                    global_raw_pcm.in_signed = 0;
-
-                T_ELIF("little-endian")
-                    global_raw_pcm.in_endian = ByteOrderLittleEndian;
-
-                T_ELIF("big-endian")
-                    global_raw_pcm.in_endian = ByteOrderBigEndian;
-
-#ifdef HAVE_MPG123
-                T_ELIF("mp1input")
-                    global_reader.input_format = sf_mp1;
-
-                T_ELIF("mp2input")
-                    global_reader.input_format = sf_mp2;
-
-                T_ELIF("mp3input")
-                    global_reader.input_format = sf_mp3;
 #endif
-
-                T_ELIF("decode")
-                    (void) lame_set_decode_only(gfp, 1);
-
-                T_ELIF("flush")
-                    global_writer.flush_write = 1;
-
-                T_ELIF("decode-mp3delay")
-                    argUsed = getIntValue(token, nextArg, &int_value);
-                    if (argUsed) {
-                        global_decoder.mp3_delay = int_value;
-                        global_decoder.mp3_delay_set = 1;
-                    }
-
-                T_ELIF("nores")
-                    lame_set_disable_reservoir(gfp, 1);
-
-                T_ELIF("strictly-enforce-ISO")
-                    lame_set_strict_ISO(gfp, MDB_STRICT_ISO);
-
-                T_ELIF("buffer-constraint")
-                  argUsed = 1;
-                if (strcmp(nextArg, "default") == 0)
-                  (void) lame_set_strict_ISO(gfp, MDB_DEFAULT);
-                else if (strcmp(nextArg, "strict") == 0)
-                  (void) lame_set_strict_ISO(gfp, MDB_STRICT_ISO);
-                else if (strcmp(nextArg, "maximum") == 0)
-                  (void) lame_set_strict_ISO(gfp, MDB_MAXIMUM);
-                else {
-                    error_printf("unknown buffer constraint '%s'\n", nextArg);
+                    error_printf("%s: unrecognized option --%s\n", ProgramName, token);
                     return -1;
                 }
-
-                T_ELIF("scale")
-                    argUsed = getDoubleValue(token, nextArg, &double_value);
-                    if (argUsed)
-                        (void) lame_set_scale(gfp, (float) double_value);
-
-                T_ELIF("scale-l")
-                    argUsed = getDoubleValue(token, nextArg, &double_value);
-                    if (argUsed)
-                        (void) lame_set_scale_left(gfp, (float) double_value);
-
-                T_ELIF("scale-r")
-                    argUsed = getDoubleValue(token, nextArg, &double_value);
-                    if (argUsed)
-                        (void) lame_set_scale_right(gfp, (float) double_value);
-
-                T_ELIF("gain")
-                    argUsed = getDoubleValue(token, nextArg, &double_value);
-                    if (argUsed) {
-                        double gain = double_value;
-                        gain = gain > -20.f ? gain : -20.f;
-                        gain = gain < 12.f ? gain : 12.f;
-                        gain = pow(10.f, gain*0.05);
-                        (void) lame_set_scale(gfp, (float) gain);
-                    }
-
-                T_ELIF("vector")
-                    argUsed = 1;
-                    if (set_vector_routines(gfp, nextArg) != 0)
-                        return -1;
-                    vector_selected = 1;
-
-                T_ELIF("noasm")
-                    argUsed = 1;
-                    if (local_strcasecmp(nextArg, "sse") == 0) {
-                        error_printf("WARNING: --noasm sse is deprecated,"
-                                     " use --vector none instead\n");
-                        if (!vector_selected) {
-                            (void) lame_set_vector_routines(gfp, "none");
-                            noasm_none = 1;
-                        }
-                    }
-                    else if (local_strcasecmp(nextArg, "avx2") == 0) {
-                        error_printf("WARNING: --noasm avx2 is deprecated,"
-                                     " use --vector sse2 instead\n");
-                        /* The option could be repeated to turn off more than
-                           one tier, so a second mapping may only lower the
-                           selection: "sse" already asked for none. */
-                        if (!vector_selected && !noasm_none)
-                            (void) lame_set_vector_routines(gfp, "sse2");
-                    }
-                    else {
-                        error_printf("WARNING: --noasm %s is deprecated and selects nothing;"
-                                     " see --vector\n", nextArg);
-                    }
-
-                T_ELIF("freeformat")
-                    lame_set_free_format(gfp, 1);
-
-                T_ELIF("replaygain-fast")
-                    lame_set_findReplayGain(gfp, 1);
-
-#ifdef HAVE_MPG123
-                T_ELIF("replaygain-accurate")
-                    lame_set_decode_on_the_fly(gfp, 1);
-                lame_set_findReplayGain(gfp, 1);
-#endif
-
-                T_ELIF("noreplaygain")
-                    noreplaygain = 1;
-                lame_set_findReplayGain(gfp, 0);
-
-
-#ifdef HAVE_MPG123
-                T_ELIF("clipdetect")
-                    global_ui_config.print_clipping_info = 1;
-                    lame_set_decode_on_the_fly(gfp, 1);
-#endif
-
-                T_ELIF("nohist")
-                    global_ui_config.brhist = 0;
-
-#if defined(__OS2__) || defined(WIN32)
-                T_ELIF("priority")
-                    argUsed = getIntValue(token, nextArg, &int_value);
-                    if (argUsed)
-                        setProcessPriority(int_value);
-#endif
-
-                /* options for ID3 tag */
-#ifdef ID3TAGS_EXTENDED
-                T_ELIF2("id3v2-utf16","id3v2-ucs2") /* id3v2-ucs2 for compatibility only */
-                    id3_tenc = TENC_UTF16;
-                    id3tag_add_v2(gfp);
-
-                T_ELIF("id3v2-utf8")
-                    id3_tenc = TENC_UTF8;
-                    id3tag_add_v2_4_UTF8(gfp);
-
-                T_ELIF("id3v2-latin1")
-                    id3_tenc = TENC_LATIN1;
-                    id3tag_add_v2(gfp);
-#endif
-
-                T_ELIF("tt")
-                    argUsed = 1;
-                    id3_tag(gfp, 't', id3_tenc, nextArg);
-
-                T_ELIF("ta")
-                    argUsed = 1;
-                    id3_tag(gfp, 'a', id3_tenc, nextArg);
-
-                T_ELIF("tl")
-                    argUsed = 1;
-                    id3_tag(gfp, 'l', id3_tenc, nextArg);
-
-                T_ELIF("ty")
-                    argUsed = 1;
-                    id3_tag(gfp, 'y', id3_tenc, nextArg);
-
-                T_ELIF("tc")
-                    argUsed = 1;
-                    id3_tag(gfp, 'c', id3_tenc, nextArg);
-
-                T_ELIF("tn")
-                    int ret = id3_tag(gfp, 'n', id3_tenc, nextArg);
-                    argUsed = 1;
-                    if (ret != 0) {
-                        if (0 == ignore_tag_errors) {
-                            if (id3tag_mode == ID3TAG_MODE_V1_ONLY) {
-                                if (global_ui_config.silent < 9) {
-                                    error_printf("The track number has to be between 1 and 255 for ID3v1.\n");
-                                }
-                                return -1;
-                            }
-                            else if (id3tag_mode == ID3TAG_MODE_V2_ONLY) {
-                                /* track will be stored as-is in ID3v2 case, so no problem here */
-                            }
-                            else {
-                                if (global_ui_config.silent < 9) {
-                                    error_printf("The track number has to be between 1 and 255 for ID3v1, ignored for ID3v1.\n");
-                                }
-                            }
-                        }
-                    }
-
-                T_ELIF("tg")
-                    int ret = 0;
-                    argUsed = 1;
-                    if (nextArg != 0 && strlen(nextArg) > 0) {
-                        ret = id3_tag(gfp, 'g', id3_tenc, nextArg);
-                    }
-                    if (ret != 0) {
-                        if (0 == ignore_tag_errors) {
-                            if (ret == -1) {
-                                error_printf("Unknown ID3v1 genre number: '%s'.\n", nextArg);
-                                return -1;
-                            }
-                            else if (ret == -2) {
-                                if (id3tag_mode == ID3TAG_MODE_V1_ONLY) {
-                                    error_printf("Unknown ID3v1 genre: '%s'.\n", nextArg);
-                                    return -1;
-                                }
-                                else if (id3tag_mode == ID3TAG_MODE_V2_ONLY) {
-                                    /* genre will be stored as-is in ID3v2 case, so no problem here */
-                                }
-                                else {
-                                    if (global_ui_config.silent < 9) {
-                                        error_printf("Unknown ID3v1 genre: '%s'.  Setting ID3v1 genre to 'Other'\n", nextArg);
-                                    }
-                                }
-                            }
-                            else {
-                                if (global_ui_config.silent < 10)
-                                    error_printf("Internal error.\n");
-                                return -1;
-                            }
-                        }
-                    }
-
-                T_ELIF("tv")
-                    argUsed = 1;
-                    if (id3_tag(gfp, 'v', id3_tenc, nextArg)) {
-                        if (global_ui_config.silent < 9) {
-                            error_printf("Invalid field value: '%s'. Ignored\n", nextArg);
-                        }
-                    }
-
-                T_ELIF("ti")
-                    argUsed = 1;
-                    if (set_id3_albumart(gfp, nextArg) != 0) {
-                        if (! ignore_tag_errors) {
-                            return -1;
-                        }
-                    }
-
-                T_ELIF("ignore-tag-errors")
-                    ignore_tag_errors = 1;
-
-                T_ELIF("add-id3v2")
-                    id3tag_add_v2(gfp);
-
-                T_ELIF("id3v1-only")
-                    id3tag_v1_only(gfp);
-                    id3tag_mode = ID3TAG_MODE_V1_ONLY;
-
-                T_ELIF("id3v2-only")
-                    id3tag_v2_only(gfp);
-                    id3tag_mode = ID3TAG_MODE_V2_ONLY;
-
-                T_ELIF("space-id3v1")
-                    id3tag_space_v1(gfp);
-
-                T_ELIF("pad-id3v2")
-                    id3tag_pad_v2(gfp);
-
-                T_ELIF("pad-id3v2-size")
-                    argUsed = getIntValue(token, nextArg, &int_value);
-                    if (argUsed) {
-                        int_value = int_value <= 128000 ? int_value : 128000;
-                        int_value = int_value >= 0      ? int_value : 0;
-                        id3tag_set_pad(gfp, int_value);
-                    }
-
-                T_ELIF("genre-list")
-                    id3tag_genre_list(genre_list_handler, NULL);
-                    return -2;
-
-
-                T_ELIF("lowpass")
-                    argUsed = getDoubleValue(token, nextArg, &double_value);
-                    if (argUsed) {
-                        if (double_value < 0) {
-                            lame_set_lowpassfreq(gfp, -1);
-                        }
-                        else {
-                            /* useful are 0.001 kHz...50 kHz, 50 Hz...50000 Hz */
-                            if (double_value < 0.001 || double_value > 50000.) {
-                                error_printf("Must specify lowpass with --lowpass freq, freq >= 0.001 kHz\n");
-                                return -1;
-                            }
-                            lame_set_lowpassfreq(gfp, (int) (double_value * (double_value < 50. ? 1.e3 : 1.e0) + 0.5));
-                        }
-                    }
-                
-                T_ELIF("lowpass-width")
-                    argUsed = getDoubleValue(token, nextArg, &double_value);
-                    if (argUsed) {
-                        /* useful are 0.001 kHz...16 kHz, 16 Hz...50000 Hz */
-                        if (double_value < 0.001 || double_value > 50000.) {
-                            error_printf
-                                ("Must specify lowpass width with --lowpass-width freq, freq >= 0.001 kHz\n");
-                            return -1;
-                        }
-                        lame_set_lowpasswidth(gfp, (int) (double_value * (double_value < 16. ? 1.e3 : 1.e0) + 0.5));
-                    }
-
-                T_ELIF("highpass")
-                    argUsed = getDoubleValue(token, nextArg, &double_value);
-                    if (argUsed) {
-                        if (double_value < 0.0) {
-                            lame_set_highpassfreq(gfp, -1);
-                        }
-                        else {
-                            /* useful are 0.001 kHz...16 kHz, 16 Hz...50000 Hz */
-                            if (double_value < 0.001 || double_value > 50000.) {
-                                error_printf("Must specify highpass with --highpass freq, freq >= 0.001 kHz\n");
-                                return -1;
-                            }
-                            lame_set_highpassfreq(gfp, (int) (double_value * (double_value < 16. ? 1.e3 : 1.e0) + 0.5));
-                        }
-                    }
-                    
-                T_ELIF("highpass-width")
-                    argUsed = getDoubleValue(token, nextArg, &double_value);
-                    if (argUsed) {
-                        /* useful are 0.001 kHz...16 kHz, 16 Hz...50000 Hz */
-                        if (double_value < 0.001 || double_value > 50000.) {
-                            error_printf
-                                ("Must specify highpass width with --highpass-width freq, freq >= 0.001 kHz\n");
-                            return -1;
-                        }
-                        lame_set_highpasswidth(gfp, (int) double_value);
-                    }
-
-                T_ELIF("comp")
-                    argUsed = getDoubleValue(token, nextArg, &double_value);
-                    if (argUsed) {
-                        if (double_value < 1.0) {
-                            error_printf("Must specify compression ratio >= 1.0\n");
-                            return -1;
-                        }
-                        else {
-                            lame_set_compression_ratio(gfp, (float) double_value);
-                        }
-                    }
-    
-                /* some more GNU-ish options could be added
-                 * brief         => few messages on screen (name, status report)
-                 * o/output file => specifies output filename
-                 * O             => stdout
-                 * i/input file  => specifies input filename
-                 * I             => stdin
-                 */
-                T_ELIF("quiet")
-                    global_ui_config.silent = 10; /* on a scale from 1 to 10 be very silent */
-
-                T_ELIF("silent")
-                    global_ui_config.silent = 9;
-
-                T_ELIF("brief")
-                    global_ui_config.silent = -5; /* print few info on screen */
-
-                T_ELIF("verbose")
-                    global_ui_config.silent = -10; /* print a lot on screen */
-                
-                T_ELIF2("version", "license")
-                    print_license(stdout);
-                return -2;
-
-                T_ELIF2("help", "usage")
-                    if (0 == local_strncasecmp(nextArg, "id3", 3)) {
-                        help_id3tag(stdout);
-                    }
-                    else if (0 == local_strncasecmp(nextArg, "dev", 3)) {
-                        help_developer_switches(stdout);
-                    }
-                    else {
-                        short_help(gfp, stdout, ProgramName);
-                    }
-                return -2;
-
-                T_ELIF("longhelp")
-                    long_help(gfp, stdout, ProgramName, 0 /* lessmode=NO */ );
-                return -2;
-
-                T_ELIF("?")
-#ifdef __unix__
-                    FILE   *fp = popen("less -Mqc", "w");
-                    long_help(gfp, fp, ProgramName, 0 /* lessmode=NO */ );
-                    pclose(fp);
-#else
-                    long_help(gfp, stdout, ProgramName, 1 /* lessmode=YES */ );
-#endif
-                return -2;
-
-                T_ELIF2("preset", "alt-preset")
-                    argUsed = 1;
-                {
-                    int     fast = 0, cbr = 0;
-
-                    while ((strcmp(nextArg, "fast") == 0) || (strcmp(nextArg, "cbr") == 0)) {
-
-                        if ((strcmp(nextArg, "fast") == 0) && (fast < 1))
-                            fast = 1;
-                        if ((strcmp(nextArg, "cbr") == 0) && (cbr < 1))
-                            cbr = 1;
-
-                        argUsed++;
-                        nextArg = i + argUsed < argc ? argv[i + argUsed] : "";
-                    }
-
-                    {
-                        int const ret = presets_set(gfp, fast, cbr, nextArg, ProgramName);
-                        if (ret < 0)
-                            return ret;
-                    }
-                }
-
-                T_ELIF("disptime")
-                    argUsed = getDoubleValue(token, nextArg, &double_value);
-                    if (argUsed)
-                        global_ui_config.update_interval = (float) double_value;
-
-                T_ELIF("nogaptags")
-                    nogap_tags = 1;
-
-                T_ELIF("nogapout")
-                    int const arg_n = (int)strnlen(nextArg, PATH_MAX);
-                    if (arg_n >= PATH_MAX) {
-                        error_printf("%s: %s argument length (%d) exceeds limit (%d)\n", ProgramName, token, arg_n, PATH_MAX);
-                        return -1;
-                    }
-                    strncpy(outPath, nextArg, PATH_MAX);
-                    outPath[PATH_MAX] = '\0';
-                    argUsed = 1;
-
-                T_ELIF("out-dir")
-                    int const arg_n = (int)strnlen(nextArg, PATH_MAX);
-                    if (arg_n >= PATH_MAX) {
-                        error_printf("%s: %s argument length (%d) exceeds limit (%d)\n", ProgramName, token, arg_n, PATH_MAX);
-                        return -1;
-                    }
-                    strncpy(outDir, nextArg, PATH_MAX);
-                    outDir[PATH_MAX] = '\0';
-                    argUsed = 1;
-
-                T_ELIF("nogap")
-                    nogap = 1;
-
-                T_ELIF("swap-channel")
-                    global_reader.swap_channel = 1;
-
-                T_ELIF("ignorelength")
-                    global_reader.ignorewavlength = 1;
-
-                T_ELIF ("athaa-sensitivity")
-                    argUsed = getDoubleValue(token, nextArg, &double_value);
-                    if (argUsed)
-                        lame_set_athaa_sensitivity(gfp, (float) double_value);
-
-                /* ---------------- lots of dead switches ---------------- */
-
-                T_ELIF_INTERNAL("noshort")
-                    (void) lame_set_no_short_blocks(gfp, 1);
-
-                T_ELIF_INTERNAL("short")
-                    (void) lame_set_no_short_blocks(gfp, 0);
-
-                T_ELIF_INTERNAL("allshort")
-                    (void) lame_set_force_short_blocks(gfp, 1);
-
-                T_ELIF_INTERNAL("notemp")
-                    (void) lame_set_useTemporal(gfp, 0);
-
-                T_ELIF_INTERNAL_WITH_ARG("interch")
-                    argUsed = getDoubleValue(token, nextArg, &double_value);
-                    if (argUsed)
-                        (void) lame_set_interChRatio(gfp, (float) double_value);
-
-                T_ELIF_INTERNAL_WITH_ARG("temporal-masking")
-                    argUsed = getIntValue(token, nextArg, &int_value);
-                    if (argUsed) 
-                        (void) lame_set_useTemporal(gfp, int_value ? 1 : 0);
-
-                T_ELIF_INTERNAL("nspsytune")
-                    ;
-
-                T_ELIF_INTERNAL("nssafejoint")
-                    lame_set_exp_nspsytune(gfp, lame_get_exp_nspsytune(gfp) | 2);
-
-                T_ELIF_INTERNAL_WITH_ARG("nsmsfix")
-                    argUsed = getDoubleValue(token, nextArg, &double_value);
-                    if (argUsed)
-                        (void) lame_set_msfix(gfp, double_value);
-
-                T_ELIF_INTERNAL_WITH_ARG("ns-bass")
-                    argUsed = getDoubleValue(token, nextArg, &double_value);
-                    if (argUsed) {
-                        int     k = (int) (double_value * 4);
-                        if (k < -32)
-                            k = -32;
-                        if (k > 31)
-                            k = 31;
-                        if (k < 0)
-                            k += 64;
-                        lame_set_exp_nspsytune(gfp, lame_get_exp_nspsytune(gfp) | (k << 2));
-                    }
-
-                T_ELIF_INTERNAL_WITH_ARG("ns-alto")
-                    argUsed = getDoubleValue(token, nextArg, &double_value);
-                    if (argUsed) {
-                        int     k = (int) (double_value * 4);
-                        if (k < -32)
-                            k = -32;
-                        if (k > 31)
-                            k = 31;
-                        if (k < 0)
-                            k += 64;
-                        lame_set_exp_nspsytune(gfp, lame_get_exp_nspsytune(gfp) | (k << 8));
-                    }
-
-                T_ELIF_INTERNAL_WITH_ARG("ns-treble")
-                    argUsed = getDoubleValue(token, nextArg, &double_value);
-                    if (argUsed) {
-                        int     k = (int) (double_value * 4);
-                        if (k < -32)
-                            k = -32;
-                        if (k > 31)
-                            k = 31;
-                        if (k < 0)
-                            k += 64;
-                        lame_set_exp_nspsytune(gfp, lame_get_exp_nspsytune(gfp) | (k << 14));
-                    }
-
-                T_ELIF_INTERNAL_WITH_ARG("ns-sfb21")
-                    /*  to be compatible with Naoki's original code,
-                     *  ns-sfb21 specifies how to change ns-treble for sfb21 */
-                    argUsed = getDoubleValue(token, nextArg, &double_value);
-                    if (argUsed) {
-                        int     k = (int) (double_value * 4);
-                        if (k < -32)
-                            k = -32;
-                        if (k > 31)
-                            k = 31;
-                        if (k < 0)
-                            k += 64;
-                        lame_set_exp_nspsytune(gfp, lame_get_exp_nspsytune(gfp) | (k << 20));
-                    }
-
-                T_ELIF_INTERNAL_WITH_ARG("tune") /*without helptext */
-                    argUsed = getDoubleValue(token, nextArg, &double_value);
-                    if (argUsed)
-                        lame_set_tune(gfp, (float) double_value);
-
-                T_ELIF_INTERNAL_WITH_ARG("shortthreshold")
-                {
-                    float   x, y;
-                    int     n = sscanf(nextArg, "%f,%f", &x, &y);
-                    if (n == 1) {
-                        y = x;
-                    }
-                    (void) lame_set_short_threshold(gfp, x, y);
-                }
-                T_ELIF_INTERNAL_WITH_ARG("maskingadjust") /*without helptext */
-                    argUsed = getDoubleValue(token, nextArg, &double_value);
-                    if (argUsed)
-                        (void) lame_set_maskingadjust(gfp, (float) double_value);
-
-                T_ELIF_INTERNAL_WITH_ARG("maskingadjustshort") /*without helptext */
-                    argUsed = getDoubleValue(token, nextArg, &double_value);
-                    if (argUsed)
-                        (void) lame_set_maskingadjust_short(gfp, (float) double_value);
-
-                T_ELIF_INTERNAL_WITH_ARG("athcurve") /*without helptext */
-                    argUsed = getDoubleValue(token, nextArg, &double_value);
-                    if (argUsed)
-                        (void) lame_set_ATHcurve(gfp, (float) double_value);
-
-                T_ELIF_INTERNAL("no-preset-tune") /*without helptext */
-                    (void) lame_set_preset_notune(gfp, 0);
-
-                T_ELIF_INTERNAL_WITH_ARG("substep")
-                    argUsed = getIntValue(token, nextArg, &int_value);
-                    if (argUsed)
-                        (void) lame_set_substep(gfp, int_value);
-
-                T_ELIF_INTERNAL_WITH_ARG("sbgain") /*without helptext */
-                    argUsed = getIntValue(token, nextArg, &int_value);
-                    if (argUsed) 
-                        (void) lame_set_subblock_gain(gfp, int_value);
-
-                T_ELIF_INTERNAL("sfscale") /*without helptext */
-                    (void) lame_set_sfscale(gfp, 1);
-
-                T_ELIF_INTERNAL("noath")
-                    (void) lame_set_noATH(gfp, 1);
-
-                T_ELIF_INTERNAL("athonly")
-                    (void) lame_set_ATHonly(gfp, 1);
-
-                T_ELIF_INTERNAL("athshort")
-                    (void) lame_set_ATHshort(gfp, 1);
-
-                T_ELIF_INTERNAL_WITH_ARG("athlower")
-                    argUsed = getDoubleValue(token, nextArg, &double_value);
-                    if (argUsed)
-                        (void) lame_set_ATHlower(gfp, (float) double_value);
-
-                T_ELIF_INTERNAL_WITH_ARG("athtype")
-                    argUsed = getIntValue(token, nextArg, &int_value);
-                    if (argUsed)
-                        (void) lame_set_ATHtype(gfp, int_value);
-
-                T_ELIF_INTERNAL_WITH_ARG("athaa-type") /*  switch for developing, no DOCU */
-                    /* once was 1:Gaby, 2:Robert, 3:Jon, else:off */
-                    argUsed = getIntValue(token, nextArg, &int_value);
-                    if (argUsed)
-                        (void) lame_set_athaa_type(gfp, int_value); /* now: 0:off else:Jon */
-
-                T_ELIF_INTERNAL_WITH_ARG("debug-file") /* switch for developing, no DOCU */
-                    /* file name to print debug info into */
-                    set_debug_file(nextArg);
-
-                T_ELSE {
-                    if (!argIgnored) {
-                        error_printf("%s: unrecognized option --%s\n", ProgramName, token);
-                        return -1;
-                    }
-                    argIgnored = 0;
-                }
-                T_END   i += argUsed;
-
+                if (result != OPT_DONE)
+                    return result == OPT_STOP_OK ? -2 : -1;
+                i += argUsed;
             }
             else {
-                char    c;
-                while ((c = *token++) != '\0') {
-                    double double_value = 0;
-                    int int_value = 0;
-                    char const *arg = *token ? token : nextArg;
-                    switch (c) {
-                    case 'm':
-                        argUsed = 1;
-
-                        switch (*arg) {
-                        case 's':
-                            (void) lame_set_mode(gfp, STEREO);
-                            break;
-                        case 'd':
-                            (void) lame_set_mode(gfp, DUAL_CHANNEL);
-                            break;
-                        case 'f':
-                            lame_set_force_ms(gfp, 1);
-                            (void) lame_set_mode(gfp, JOINT_STEREO);
-                            break;
-                        case 'j':
-                            lame_set_force_ms(gfp, 0);
-                            (void) lame_set_mode(gfp, JOINT_STEREO);
-                            break;
-                        case 'm':
-                            (void) lame_set_mode(gfp, MONO);
-                            break;
-                        case 'l':
-                            (void) lame_set_mode(gfp, MONO);
-                            (void) lame_set_scale_left(gfp, 2);
-                            (void) lame_set_scale_right(gfp, 0);
-                            break;
-                        case 'r':
-                            (void) lame_set_mode(gfp, MONO);
-                            (void) lame_set_scale_left(gfp, 0);
-                            (void) lame_set_scale_right(gfp, 2);
-                            break;
-                        case 'a': /* same as 'j' ??? */
-                            lame_set_force_ms(gfp, 0);
-                            (void) lame_set_mode(gfp, JOINT_STEREO);
-                            break;
-                        default:
-                            error_printf("%s: -m mode must be s/d/f/j/m/l/r not %s\n", ProgramName,
-                                         arg);
-                            return -1;
-                        }
-                        break;
-
-                    case 'V':
-                        argUsed = getDoubleValue("V", arg, &double_value);
-                        if (argUsed) {
-                            /* to change VBR default look in lame.h */
-                            if (lame_get_VBR(gfp) == vbr_off)
-                                lame_set_VBR(gfp, vbr_default);
-                            lame_set_VBR_quality(gfp, (float) double_value);
-                        }
-                        break;
-                    case 'v':
-                        /* to change VBR default look in lame.h */
-                        if (lame_get_VBR(gfp) == vbr_off)
-                            lame_set_VBR(gfp, vbr_default);
-                        break;
-
-                    case 'q':
-                        argUsed = getIntValue("q", arg, &int_value);
-                        if (argUsed) 
-                            (void) lame_set_quality(gfp, int_value);
-                        break;
-                    case 'f':
-                        (void) lame_set_quality(gfp, 7);
-                        break;
-                    case 'h':
-                        (void) lame_set_quality(gfp, 2);
-                        break;
-
-                    case 's':
-                        argUsed = getDoubleValue("s", arg, &double_value);
-                        if (argUsed) {
-                            double_value = (int) (double_value * (double_value <= 192 ? 1.e3 : 1.e0) + 0.5);
-                            global_reader.input_samplerate = (int)double_value;
-                            (void) lame_set_in_samplerate(gfp, (int)double_value);
-                        }
-                        break;
-                    case 'b':
-                        argUsed = getIntValue("b", arg, &int_value);
-                        if (argUsed) {
-                            lame_set_brate(gfp, int_value);
-                            lame_set_VBR_min_bitrate_kbps(gfp, lame_get_brate(gfp));
-                        }
-                        break;
-                    case 'B':
-                        argUsed = getIntValue("B", arg, &int_value);
-                        if (argUsed) {
-                            lame_set_VBR_max_bitrate_kbps(gfp, int_value);
-                        }
-                        break;
-                    case 'F':
-                        lame_set_VBR_hard_min(gfp, 1);
-                        break;
-                    case 't': /* dont write VBR tag */
-                        (void) lame_set_bWriteVbrTag(gfp, 0);
-                        global_decoder.disable_wav_header = 1;
-                        break;
-                    case 'T': /* do write VBR tag */
-                        (void) lame_set_bWriteVbrTag(gfp, 1);
-                        nogap_tags = 1;
-                        global_decoder.disable_wav_header = 0;
-                        break;
-                    case 'r': /* force raw pcm input file */
-#if defined(LIBSNDFILE)
-                        error_printf
-                            ("WARNING: libsndfile may ignore -r and perform fseek's on the input.\n"
-                             "Compile without libsndfile if this is a problem.\n");
-#endif
-                        global_reader.input_format = sf_raw;
-                        break;
-                    case 'x': /* force byte swapping */
-                        global_reader.swapbytes = 1;
-                        break;
-                    case 'p': /* (jo) error_protection: add crc16 information to stream */
-                        lame_set_error_protection(gfp, 1);
-                        break;
-                    case 'a': /* autoconvert input file from stereo to mono - for mono mp3 encoding */
-                        autoconvert = 1;
-                        (void) lame_set_mode(gfp, MONO);
-                        break;
-                    case 'd':   /*(void) lame_set_allow_diff_short( gfp, 1 ); */
-                    case 'k':   /*lame_set_lowpassfreq(gfp, -1);
-                                  lame_set_highpassfreq(gfp, -1); */
-                        error_printf("WARNING: -%c is obsolete.\n", c);
-                        break;
-                    case 'S':
-                        global_ui_config.silent = 5;
-                        break;
-                    case 'X':
-                        /*  experimental switch -X:
-                            the differnt types of quant compare are tough
-                            to communicate to endusers, so they shouldn't
-                            bother to toy around with them
-                         */
-                        {
-                            int     x, y;
-                            int     n = sscanf(arg, "%d,%d", &x, &y);
-                            if (n == 1) {
-                                y = x;
-                            }
-                            argUsed = 1;
-                            if (internal_opts_enabled) {
-                                lame_set_quant_comp(gfp, x);
-                                lame_set_quant_comp_short(gfp, y);
-                            }
-                        }
-                        break;
-                    case 'Y':
-                        lame_set_experimentalY(gfp, 1);
-                        break;
-                    case 'Z':
-                        /*  experimental switch -Z:
-                         */
-                        {
-                            int     n = 1;
-                            argUsed = sscanf(arg, "%d", &n);
-                            /*if (internal_opts_enabled)*/
-                            {
-                                lame_set_experimentalZ(gfp, n);
-                            }
-                        }
-                        break;
-                    case 'e':
-                        argUsed = 1;
-
-                        switch (*arg) {
-                        case 'n':
-                            lame_set_emphasis(gfp, 0);
-                            break;
-                        case '5':
-                            lame_set_emphasis(gfp, 1);
-                            break;
-                        case 'c':
-                            lame_set_emphasis(gfp, 3);
-                            break;
-                        default:
-                            error_printf("%s: -e emp must be n/5/c not %s\n", ProgramName, arg);
-                            return -1;
-                        }
-                        break;
-                    case 'c':
-                        lame_set_copyright(gfp, 1);
-                        break;
-                    case 'o':
-                        lame_set_original(gfp, 0);
-                        break;
-
-                    case '?':
-                        long_help(gfp, stdout, ProgramName, 0 /* LESSMODE=NO */ );
-                        return -2;
-
-                    default:
-                        error_printf("%s: unrecognized option -%c\n", ProgramName, c);
-                        return -1;
-                    }
-                    if (argUsed) {
-                        if (arg == token)
-                            token = ""; /* no more from token */
-                        else
-                            ++i; /* skip arg we used */
-                        arg = "";
-                        argUsed = 0;
-                    }
-                }
+                option_result const result =
+                    parse_short_options(gfp, &st, token, nextArg, ProgramName, &i);
+                if (result != OPT_DONE)
+                    return result == OPT_STOP_OK ? -2 : -1;
             }
         }
         else {
-            if (nogap) {
-                if ((num_nogap != NULL) && (count_nogap < *num_nogap)) {
-                    if (set_path_arg(argv[i], nogap_inPath[count_nogap]) < 0)
+            if (st.nogap) {
+                if ((num_nogap != NULL) && (st.count_nogap < *num_nogap)) {
+                    if (set_path_arg(argv[i], nogap_inPath[st.count_nogap]) < 0)
                         return -1;
-                    ++count_nogap;
-                    input_file = 1;
+                    ++st.count_nogap;
+                    st.input_file = 1;
                 }
                 else {
                     /* sorry, calling program did not allocate enough space */
@@ -2690,7 +3104,7 @@ parse_args_(lame_global_flags * gfp, int argc, char **argv,
                 if (inPath[0] == '\0') {
                     if (set_path_arg(argv[i], inPath) < 0)
                         return -1;
-                    input_file = 1;
+                    st.input_file = 1;
                 }
                 else {
                     if (outPath[0] == '\0') {
@@ -2706,19 +3120,28 @@ parse_args_(lame_global_flags * gfp, int argc, char **argv,
         }
     }                   /* loop over args */
 
-    if (!input_file) {
+    if (unusable_number)
+        return -1;
+
+    if (!st.input_file) {
         usage(Console_IO.Console_fp, ProgramName);
         return -1;
     }
 
-    if (lame_get_decode_only(gfp) && count_nogap > 0) {
+    if (lame_get_decode_only(gfp) && st.count_nogap > 0) {
         error_printf("combination of nogap and decode not supported!\n");
         return -1;
     }
 
+    /* With --decode, -x swaps the bytes of the output, not of the input */
+    if (lame_get_decode_only(gfp)) {
+        frontend_config.decoder.swapbytes = frontend_config.reader.swapbytes;
+        frontend_config.reader.swapbytes = 0;
+    }
+
     if (inPath[0] == '-') {
-        if (global_ui_config.silent == 0) { /* user didn't overrule default behaviour */
-            global_ui_config.silent = 1;
+        if (frontend_config.ui_config.silent == 0) { /* user didn't overrule default behaviour */
+            frontend_config.ui_config.silent = 1;
         }
     }
 #ifdef WIN32
@@ -2726,29 +3149,26 @@ parse_args_(lame_global_flags * gfp, int argc, char **argv,
         dosToLongFileName(inPath);
 #endif
 
-    if (outPath[0] == '\0') { /* no explicit output dir or file */
-        if (count_nogap > 0) { /* in case of nogap encode */
-            strncpy(outPath, outDir, PATH_MAX);
-            outPath[PATH_MAX] = '\0'; /* whatever someone set via --out-dir <path> argument */
-        }
-        else if (inPath[0] == '-') {
+    /* With nogap the caller names each output file from outDir. */
+    if (outPath[0] == '\0' && st.count_nogap == 0) { /* no explicit output file */
+        if (inPath[0] == '-') {
             /* if input is stdin, default output is stdout */
             strcpy(outPath, "-");
         }
         else {
             char const* s_ext = lame_get_decode_only(gfp) ? ".wav" : ".mp3";
-            if (generateOutPath(inPath, outDir, s_ext, outPath) != 0) {
+            if (generateOutPath(inPath, outDir, s_ext, outPath, PATH_MAX + 1) != 0) {
                 return -1;
             }
         }
     }
 
     /* RG is enabled by default */
-    if (!noreplaygain)
+    if (!st.noreplaygain)
         lame_set_findReplayGain(gfp, 1);
 
     /* disable VBR tags with nogap unless the VBR tags are forced */
-    if (nogap && lame_get_bWriteVbrTag(gfp) && nogap_tags == 0) {
+    if (st.nogap && lame_get_bWriteVbrTag(gfp) && st.nogap_tags == 0) {
         console_printf("Note: Disabling VBR Xing/Info tag since it interferes with --nogap\n");
         lame_set_bWriteVbrTag(gfp, 0);
     }
@@ -2759,18 +3179,18 @@ parse_args_(lame_global_flags * gfp, int argc, char **argv,
     }
 
     /* if user did not explicitly specify input is mp3, check file name */
-    if (global_reader.input_format == sf_unknown)
-        global_reader.input_format = filename_to_type(inPath);
+    if (frontend_config.reader.input_format == sf_unknown)
+        frontend_config.reader.input_format = frontend_classify_suffix(inPath);
 
 #if !defined(HAVE_MPG123)
-    if (is_mpeg_file_format(global_reader.input_format)) {
-        error_printf("Error: libmp3lame not compiled with mpg123 *decoding* support \n");
+    if (is_mpeg_file_format(frontend_config.reader.input_format)) {
+        report_missing_decoder();
         return -1;
     }
 #endif
 
     /* default guess for number of channels */
-    if (autoconvert)
+    if (st.autoconvert)
         (void) lame_set_num_channels(gfp, 2);
     else if (MONO == lame_get_mode(gfp))
         (void) lame_set_num_channels(gfp, 1);
@@ -2787,7 +3207,7 @@ parse_args_(lame_global_flags * gfp, int argc, char **argv,
         }
     }
     if (num_nogap != NULL)
-        *num_nogap = count_nogap;
+        *num_nogap = st.count_nogap;
     return 0;
 }
 
@@ -2799,7 +3219,7 @@ string_to_argv(char* str, char** argv, int N)
     argv[argc++] = "lhama";
     for (;;) {
         int     quoted = 0;
-        while (isspace(*str)) { /* skip blanks */
+        while (isspace((unsigned char) *str)) { /* skip blanks */
             ++str;
         }
         if (*str == '\"') { /* is quoted argument ? */
@@ -2822,7 +3242,7 @@ string_to_argv(char* str, char** argv, int N)
                 }
             }
             else {
-                if (isspace(*str)) { /* parameter separator reached */
+                if (isspace((unsigned char) *str)) { /* parameter separator reached */
                     *str++ = '\0';
                     break;
                 }
@@ -2869,12 +3289,17 @@ dump_argv(int argc, char** argv)
 #endif
 
 
-int parse_args(lame_t gfp, int argc, char **argv, char *const inPath, char *const outPath, char **nogap_inPath, int *num_nogap)
+int parse_args(lame_t gfp, int argc, char **argv, char *const inPath, char *const outPath,
+               char *const outDir, char **nogap_inPath, int *num_nogap)
 {
     char  **str_argv, *str;
     int     str_argc, ret;
     size_t  n;
 
+    if (argc < 1) { /* not even a program name */
+        error_printf("the argument list is empty\n");
+        return -1;
+    }
     str = lame_getenv("LAMEOPT");
     /* Size the merged argument vector to actually fit: at worst every byte of
        LAMEOPT begins a new token, the real argv contributes argc entries, plus
@@ -2892,7 +3317,7 @@ int parse_args(lame_t gfp, int argc, char **argv, char *const inPath, char *cons
 #ifdef DEBUG
     dump_argv(str_argc, str_argv);
 #endif
-    ret = parse_args_(gfp, str_argc, str_argv, inPath, outPath, nogap_inPath, num_nogap);
+    ret = parse_args_(gfp, str_argc, str_argv, inPath, outPath, outDir, nogap_inPath, num_nogap);
     free(str_argv);
     free(str);
     return ret;

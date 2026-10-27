@@ -26,7 +26,7 @@ dnl check system
 AC_CANONICAL_HOST
 
 dnl automake
-AM_INIT_AUTOMAKE
+AM_INIT_AUTOMAKE([subdir-objects])
 AC_CONFIG_HEADERS([config.h])
 AH_TOP([
 #ifndef LAME_CONFIG_H
@@ -45,6 +45,14 @@ AC_ARG_WITH([dot],
   [AC_PATH_PROG([DOT], [dot])])
 AC_SUBST([DOT])
 
+dnl for libmp3lame/Makefile.am's vcsrevision.h - the revision of the working
+dnl copy an alpha or beta build comes from, asked of whichever of the two is
+dnl present at build time; a tree that is not a working copy carries none
+AC_PATH_PROG([SVNVERSION], [svnversion])
+AC_PATH_PROG([GIT], [git])
+AC_DEFINE([HAVE_VCSREVISION_H], [1],
+  [Define to 1 if the build generates libmp3lame/vcsrevision.h.])
+
 dnl check environment
 AC_SEARCH_LIBS([strerror],[cposix])
 AC_USE_SYSTEM_EXTENSIONS
@@ -58,6 +66,43 @@ dnl libtool
 LT_INIT
 AC_SUBST(LIBTOOL_DEPS)
 CFLAGS="${ac_save_CFLAGS}"
+
+# libmp3lame is linked with an export list (include/libmp3lame.sym) so that
+# only the public API leaves the shared library.  libtool implements that with
+# whatever the host offers - a linker version script, an exported-symbols list
+# - and a toolchain that offers neither cannot link the library at all.  Ask
+# libtool itself: deciding from the compiler's name, or from whether a version
+# script is accepted, throws the export list away on hosts where it works by a
+# different mechanism.  LT_OUTPUT writes the script now so it can be asked.
+LT_OUTPUT
+if test "x${enable_shared}" = "xno"; then
+	lame_export_list="n/a (static only)"
+else
+	AC_CACHE_CHECK([whether libtool can link a shared library with an export list],
+		[lame_cv_export_list],
+		[cat >conftest_el.c <<_LAME_EOF
+int lame_conftest_public(void);
+int lame_conftest_public(void) { return 0; }
+_LAME_EOF
+		echo lame_conftest_public >conftest_el.sym
+		lame_cv_export_list=no
+		if ./libtool --tag=CC --mode=compile ${CC} ${CFLAGS} -c conftest_el.c \
+			>&AS_MESSAGE_LOG_FD 2>&1 &&
+		   ./libtool --tag=CC --mode=link ${CC} ${CFLAGS} ${LDFLAGS} \
+			-o libconftest_el.la -rpath /usr/lib \
+			-export-symbols conftest_el.sym conftest_el.lo \
+			>&AS_MESSAGE_LOG_FD 2>&1; then
+			lame_cv_export_list=yes
+		fi
+		rm -rf conftest_el.* libconftest_el.* .libs/conftest_el* .libs/libconftest_el*])
+	lame_export_list=${lame_cv_export_list}
+	if test "x${lame_export_list}" = "xno"; then
+		AC_MSG_WARN([this toolchain cannot link a shared library with an export
+	list, so libmp3lame will export every symbol it defines rather than only
+	its public API.])
+	fi
+fi
+AM_CONDITIONAL([WITH_EXPORT_LIST], [test "x${lame_export_list}" = "xyes"])
 
 # increase this when the shared lib becomes totally incompatible
 LIB_MAJOR_VERSION=0
@@ -128,11 +173,14 @@ dnl   Append FLAG to shell VARIABLE if the C compiler accepts it.  -Werror is
 dnl   added so that a flag which only warns (e.g. clang's "unknown argument")
 dnl   still counts as a rejection, and -O2 is added so that flags which are
 dnl   only meaningful with optimization (e.g. _FORTIFY_SOURCE) probe correctly.
+dnl   The probe links rather than only compiling: several of these flags make
+dnl   the compiler emit references to a support library, so a toolchain can
+dnl   accept the flag and still be unable to produce a program with it.
 AC_DEFUN([LAME_CHECK_CFLAG],
 [AC_MSG_CHECKING([whether $CC accepts $1])
 lame_check_flag_save=$CFLAGS
 CFLAGS="$CFLAGS -O2 $1 -Werror"
-AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[]], [[]])],
+AC_LINK_IFELSE([AC_LANG_PROGRAM([[]], [[]])],
   [lame_check_flag_ok=yes], [lame_check_flag_ok=no])
 CFLAGS=$lame_check_flag_save
 AC_MSG_RESULT([$lame_check_flag_ok])
@@ -298,34 +346,6 @@ fi
 
 AC_SYS_LARGEFILE
 
-AC_CHECK_SIZEOF(short)
-AC_CHECK_SIZEOF(unsigned short)
-AC_CHECK_SIZEOF(int)
-AC_CHECK_SIZEOF(unsigned int)
-AC_CHECK_SIZEOF(long)
-AC_CHECK_SIZEOF(unsigned long)
-AC_CHECK_SIZEOF(long long)
-AC_CHECK_SIZEOF(unsigned long long)
-AC_CHECK_SIZEOF(float)
-AC_CHECK_SIZEOF(double)
-
-if test $ac_cv_sizeof_short -eq 0 \
-    -o $ac_cv_sizeof_unsigned_short -eq 0 \
-    -o $ac_cv_sizeof_int -eq 0 \
-    -o $ac_cv_sizeof_unsigned_int -eq 0 \
-    -o $ac_cv_sizeof_long -eq 0 \
-    -o $ac_cv_sizeof_unsigned_long -eq 0 \
-    -o $ac_cv_sizeof_long_long -eq 0 \
-    -o $ac_cv_sizeof_unsigned_long_long -eq 0 \
-    -o $ac_cv_sizeof_float -eq 0 \
-    -o $ac_cv_sizeof_double -eq 0; then
-	echo '*** I have a problem determining the size of some variable types. Either'
-	echo '*** you compiler is broken, or your system+compiler combination is not'
-	echo '*** supportet by the "autoconf" framework we use to generate this'
-	echo '*** configure script.'
-	exit 1
-fi
-
     AC_TYPE_LONG_DOUBLE_WIDER
     ac_cv_c_long_double=$ac_cv_type_long_double_wider
     if test $ac_cv_c_long_double = yes; then
@@ -333,150 +353,6 @@ fi
 	 precision than `double'.])
     fi
   
-if test "${ac_cv_c_long_double}" = "yes" ; then
-	AC_CHECK_SIZEOF(long double)
-fi
-
-AC_CHECK_TYPES([uint8_t, int8_t, uint16_t, int16_t, uint32_t, int32_t, uint64_t, int64_t])
-
-AH_VERBATIM([HAVE_UINT8_T],
-[/* add uint8_t type */
-#undef HAVE_UINT8_T
-#ifndef HAVE_UINT8_T
-	typedef unsigned char uint8_t;
-#endif])
-
-AH_VERBATIM([HAVE_INT8_T],
-[/* add int8_t type */
-#undef HAVE_INT8_T
-#ifndef HAVE_INT8_T
-	typedef char int8_t;
-#endif])
-
-AH_VERBATIM([HAVE_UINT16_T],
-[/* add uint16_t type */
-#undef HAVE_UINT16_T
-#ifndef HAVE_UINT16_T
-	typedef unsigned short uint16_t;
-#endif])
-
-AH_VERBATIM([HAVE_INT16_T],
-[/* add int16_t type */
-#undef HAVE_INT16_T
-#ifndef HAVE_INT16_T
-	typedef short int16_t;
-#endif])
-
-if test "${HAVE_INT32_T}" = yes; then
-	AC_DEFINE(A_UINT32_T,unsigned int32_t)
-else
-	if test "${ac_cv_sizeof_unsigned_short}" = "4"; then
-		AC_DEFINE(A_UINT32_T,unsigned short)
-	else
-		if test "${ac_cv_sizeof_unsigned_int}" = "4"; then
-			AC_DEFINE(A_UINT32_T,unsigned int)
-		else
-			if test "${ac_cv_sizeof_unsigned_long}" = "4"; then
-				AC_DEFINE(A_UINT32_T,unsigned long)
-			else
-				AC_MSG_ERROR([CHECK_TYPE_uint32_t - please report to lame-dev@lists.sourceforge.net])
-			fi
-		fi
-	fi
-fi
-
-AH_VERBATIM([HAVE_UINT32_T],
-[/* add uint32_t type */
-#undef HAVE_UINT32_T
-#ifndef HAVE_UINT32_T
-#undef A_UINT32_T
-	typedef A_UINT32_T uint32_t;
-#endif])
-
-if test "${ac_cv_sizeof_short}" = "4"; then
-	AC_DEFINE(A_INT32_T,short)
-else
-	if test "${ac_cv_sizeof_int}" = "4"; then
-		AC_DEFINE(A_INT32_T,int)
-	else
-		if test "${ac_cv_sizeof_long}" = "4"; then
-			AC_DEFINE(A_INT32_T,long)
-		else
-			AC_MSG_ERROR([CHECK_TYPE_int32_t - please report to lame-dev@lists.sourceforge.net])
-		fi
-	fi
-fi
-
-AH_VERBATIM([HAVE_INT32_T],
-[/* add int32_t type */
-#undef HAVE_INT32_T
-#ifndef HAVE_INT32_T
-#undef A_INT32_T
-	typedef A_INT32_T int32_t;
-#endif])
-
-if test "${HAVE_INT64_T}" = yes; then
-        AC_DEFINE(A_UINT64_T,unsigned int64_t)
-else
-	if test "${ac_cv_sizeof_unsigned_int}" = "8"; then
-		AC_DEFINE(A_UINT64_T,unsigned int)
-	else
-		if test "${ac_cv_sizeof_unsigned_long}" = "8"; then
-			AC_DEFINE(A_UINT64_T,unsigned long)
-		else
-			if test "${ac_cv_sizeof_unsigned_long_long}" = "8"; then
-				AC_DEFINE(A_UINT64_T,unsigned long long)
-			else
-				AC_MSG_ERROR([CHECK_TYPE_uint64_t - please report to lame-dev@lists.sourceforge.net])
-			fi
-		fi
-	fi
-fi
-
-AH_VERBATIM([HAVE_UINT64_T],
-[/* add uint64_t type */
-#undef HAVE_UINT64_T
-#ifndef HAVE_UINT64_T
-#undef A_UINT64_T
-	typedef A_UINT64_T uint64_t;
-#endif])
-
-if test "${ac_cv_sizeof_int}" = "8"; then
-	AC_DEFINE(A_INT64_T,int)
-else
-	if test "${ac_cv_sizeof_long}" = "8"; then
-		AC_DEFINE(A_INT64_T,long)
-	else
-		if test "${ac_cv_sizeof_long_long}" = "8"; then
-			AC_DEFINE(A_INT64_T,long long)
-		else
-			AC_MSG_ERROR([CHECK_TYPE_int64_t - please report to lame-dev@lists.sourceforge.net])
-		fi
-	fi
-fi
-
-AH_VERBATIM([HAVE_INT64_T],
-[/* add int64_t type */
-#undef HAVE_INT64_T
-#ifndef HAVE_INT64_T
-#undef A_INT64_T
-	typedef A_INT64_T int64_t;
-#endif])
-
-alex_IEEE854_FLOAT80
-if test "${alex_cv_ieee854_float80}" = "yes" ; then
-	if test "${ac_cv_c_long_double}" = "yes" ; then
-		AC_CHECK_TYPES(ieee854_float80_t, long double)
-		AH_VERBATIM([HAVE_IEEE854_FLOAT80_T],
-[/* add ieee854_float80_t type */
-#undef HAVE_IEEE854_FLOAT80_T
-#ifndef HAVE_IEEE854_FLOAT80_T
-	typedef long double ieee854_float80_t;
-#endif])
-
-		AC_DEFINE(HAVE_IEEE854_FLOAT80, 1, [system has 80 bit floats])
-	fi
-fi
 AC_CHECK_TYPES([ieee754_float64_t, ieee754_float32_t])
 
 AH_VERBATIM([HAVE_IEEE754_FLOAT64_T],
@@ -501,20 +377,8 @@ if test ${cross_compiling} = "yes"; then
   [**************************************************************************]
   [*                                                                        *]
   [* You are cross compiling:                                               *]
-  [*   - I did not have a change to determine                               *]
-  [*     + the size of:                                                     *]
-  [*       - short                                                          *]
-  [*       - unsigned short                                                 *]
-  [*       - int                                                            *]
-  [*       - unsigned int                                                   *]
-  [*       - long                                                           *]
-  [*       - unsigned long                                                  *]
-  [*       - float                                                          *]
-  [*       - double                                                         *]
-  [*       - long double                                                    *]
-  [*     + the endianess of the system                                      *]
-  [*   - You have to provide appropriate defines for them in config.h, e.g. *]
-  [*     + define SIZEOF_SHORT to 2 if the size of a short is 2             *]
+  [*   - I did not have a chance to determine the endianness of the system  *]
+  [*   - You have to provide the appropriate define in config.h:            *]
   [*     + define WORDS_BIGENDIAN if your system is a big endian system     *]
   [*                                                                        *]
   [**************************************************************************])
@@ -532,13 +396,41 @@ fi
 
 dnl Checks for library functions.
 AC_FUNC_ALLOCA
-AC_CHECK_FUNCS(gettimeofday strtol)
+AC_CHECK_FUNCS(gettimeofday strnlen strtol)
+
+dnl For --preserve-modtime in the frontend.  The header spelling differs -
+dnl POSIX puts utime() in <utime.h>, the Windows compilers in <sys/utime.h> -
+dnl so both are asked and lametime.c includes whichever the answer names.
+dnl utime() itself is asked separately, because a system may ship the header
+dnl and not the function.
+AC_CHECK_HEADERS(utime.h sys/utime.h)
+AC_CHECK_FUNCS(utime)
 
 dnl For the ARM capability probe in libmp3lame/util.c.  The header and the
 dnl function are separate questions - a system can have <sys/auxv.h> and only
 dnl one of the two ways of reading it - so both are asked, and util.c includes
 dnl what the answers say exists rather than guessing from platform macros.
 AC_CHECK_HEADERS(sys/auxv.h machine/elf.h asm/hwcap.h)
+
+dnl For the floating point exception trapping that --enable-debug turns on.
+dnl <fpu_control.h> is a glibc header: Android and musl define __linux__ and do
+dnl not have it, so asking the platform is the wrong question and asking for the
+dnl header is the right one. What the header CONTAINS is a second question,
+dnl asked in util.c where the answer is visible.
+AC_CHECK_HEADERS(fpu_control.h)
+
+dnl The portable half of the same question. C99 <fenv.h> defines the exception
+dnl flags but no way to turn one into a signal; feenableexcept() is the
+dnl extension that does, and it covers the systems the x87 path cannot - the
+dnl BSDs, and Linux on anything that is not an x86. It lives in the math
+dnl library, which this project keeps in CONFIG_MATH_LIB rather than in LIBS,
+dnl so the check borrows it for the duration.
+AC_CHECK_HEADERS(fenv.h)
+lame_save_LIBS="${LIBS}"
+LIBS="${LIBS} -lm"
+AC_CHECK_FUNCS(feenableexcept)
+LIBS="${lame_save_LIBS}"
+
 AC_CHECK_FUNCS(elf_aux_info getauxval sysctlbyname)
 
 if test "X${ac_cv_func_strtol}" != "Xyes"; then
@@ -599,7 +491,7 @@ AC_SUBST(SOCKET_LIBS)
 dnl Initialize configuration variables for the Makefile
 CFLAGS=${CFLAGS}
 CONFIG_DEFS=${CONFIG_DEFS}
-INCLUDES="-I\$(top_srcdir)/include -I\$(srcdir)"
+LAME_CPPFLAGS="-I\$(top_srcdir)/include -I\$(srcdir)"
 FRONTEND_LDFLAGS=
 FRONTEND_CFLAGS=
 LIB_SOURCES=
@@ -670,8 +562,14 @@ dnl AM_ICONV runs further down, once the optional libraries have been located.
 dnl It has to see the same header and library search paths the frontend is
 dnl built with, and here it would run before any of them exist.
 
-dnl math lib
-AC_CHECK_LIB(m, cos, USE_LIBM="-lm")
+dnl Math library, only where the link needs it. AC_SEARCH_LIBS tries the link
+dnl without a library first. It adds what it finds to LIBS; the math library
+dnl goes in CONFIG_MATH_LIB instead, so LIBS is restored.
+USE_LIBM=
+lame_libm_save_LIBS="${LIBS}"
+AC_SEARCH_LIBS([cos], [m],
+  [test "x${ac_cv_search_cos}" = "xnone required" || USE_LIBM="${ac_cv_search_cos}"])
+LIBS="${lame_libm_save_LIBS}"
 dnl free fast math library
 AC_CHECK_LIB(ffm, cos, USE_LIBM="-lffm -lm")
 dnl Compaq fast math library.
@@ -682,6 +580,17 @@ if test "${CONFIG_CPML}" = yes; then
       AC_CHECK_LIB(cpml, cos, USE_LIBM="-lcpml")
 fi
 CONFIG_MATH_LIB="${USE_LIBM}"
+
+dnl pkg-config metadata for libmp3lame's private link dependencies: what a
+dnl consumer has to add to -lmp3lame when it links statically. The list is
+dnl libmp3lame_la_LIBADD and nothing else.
+dnl
+dnl Which of the two fields a dependency goes in is pkg-config's rule, not a
+dnl preference: one that ships a .pc file of its own goes in Requires.private,
+dnl so that its search paths and its own private libraries come with it; one
+dnl that does not goes in Libs.private. The math library has no .pc file.
+PC_REQUIRES_PRIVATE=
+PC_LIBS_PRIVATE="${CONFIG_MATH_LIB}"
 
 dnl configure use of features
 
@@ -742,7 +651,7 @@ if test "${CONFIG_FILEIO}" = "sndfile" ; then
     FRONTEND_LDADD="-lsndfile ${FRONTEND_LDADD}"
 
     if test -n "${SNDFILE_CFLAGS}" ; then
-      INCLUDES="${SNDFILE_CFLAGS} ${INCLUDES}"
+      LAME_CPPFLAGS="${SNDFILE_CFLAGS} ${LAME_CPPFLAGS}"
     fi
 
     AC_DEFINE(LIBSNDFILE, 1, set to 1 if you have libsndfile)
@@ -807,7 +716,11 @@ if test "${HAVE_MPG123}" = "yes" && test "${CONFIG_DECODER}" != "no"; then
 	AC_DEFINE(HAVE_MPG123, 1, set to 1 if you have libmpg123)
 	FRONTEND_LDADD="$mpg123_LIBS $FRONTEND_LDADD"
 	LIBMP3LAME_LDADD="$mpg123_LIBS $LIBMP3LAME_LDADD"
-	INCLUDES="$mpg123_CFLAGS $INCLUDES"
+	LAME_CPPFLAGS="$mpg123_CFLAGS $LAME_CPPFLAGS"
+	dnl Keep this version in step with the PKG_CHECK_MODULES above: a
+	dnl consumer linking libmp3lame statically needs the same libmpg123
+	dnl this build was checked against.
+	PC_REQUIRES_PRIVATE="libmpg123 >= 1.26.0 ${PC_REQUIRES_PRIVATE}"
 else
 	if test "${CONFIG_DECODER}" = "yes" ; then
 		AC_MSG_ERROR([no, libmpg123 not found])
@@ -828,6 +741,7 @@ else
 	WITH_FRONTEND=
 	AC_MSG_RESULT(no)
 fi
+AM_CONDITIONAL([WITH_LAME_FRONTEND], [test -n "${WITH_FRONTEND}"])
 
 
 
@@ -983,7 +897,7 @@ if test "x${enable_internal}" = "xyes"; then
 	if test "x${enable_static}" = "xno"; then
 		AC_MSG_ERROR([--enable-internal needs the static libmp3lame archive, but --disable-static was given. The internal setters are not exported from the shared library, so the frontend must link statically. Re-run without --disable-static.])
 	fi
-	# _ALLOW_INTERNAL_OPTIONS is defined per-target (frontend and the set_get
+	# LAME_INTERNAL_OPTIONS is defined per-target (frontend and the set_get
 	# unit test) via the INTERNAL_OPTS automake conditional, NOT globally: a
 	# global define would pull the internal-option code path of parse.c into the
 	# other unit tests that compile parse.c only for its argument helpers, and
@@ -1515,8 +1429,8 @@ fi
 dnl There is deliberately no --enable-avx512, for the same reason there is none
 dnl for SSE2 or AVX2: what the compiler can build is built, and the CPU decides
 dnl at run time, so one binary runs correctly everywhere and no build is
-dnl half-enabled.  The top rung carries only the constant-bitrate kernels; the
-dnl variable-bitrate one was measured and rejected - see @ref vector_dispatch.
+dnl half-enabled.  The AVX-512 tier has only the quantization loop of
+dnl count_bits().  See @ref vector_dispatch for the other routines.
 VECTOR_AVX512_FLAGS=
 if test "x${WITH_XMM}" = xyes; then
 	AC_MSG_CHECKING(working AVX-512 intrinsics)
@@ -1612,9 +1526,8 @@ fi
 dnl iconv, deliberately last.
 dnl
 dnl Every frontend translation unit is compiled with the include paths
-dnl pkg-config reported for GTK, the decoder and libsndfile - frontend's
-dnl Makefile.am applies them to the whole directory, not just to the analyzer.
-dnl Where those paths lead to a GNU libiconv installed beside the C library's
+dnl pkg-config reported for the decoder and libsndfile, and mp3x's also with
+dnl those for GTK. Where those paths lead to a GNU libiconv installed beside the C library's
 dnl iconv, its <iconv.h> renames iconv_open to libiconv_open, and the frontend
 dnl then needs that library.  AM_ICONV must therefore be asked the question the
 dnl frontend actually asks, which means running it after those paths are known
@@ -1678,7 +1591,7 @@ FRONTEND_CFLAGS="${INCICONV} ${FRONTEND_CFLAGS}"
 FRONTEND_LDADD="${FRONTEND_LDADD} ${LTLIBICONV} ${CONFIG_MATH_LIB}"
 
 
-AC_SUBST(INCLUDES)
+AC_SUBST(LAME_CPPFLAGS)
 
 AC_SUBST(FRONTEND_LDFLAGS)
 AC_SUBST(FRONTEND_UNICODE_LDFLAGS)
@@ -1686,6 +1599,8 @@ AC_SUBST(FRONTEND_CFLAGS)
 AC_SUBST(FRONTEND_LDADD)
 AC_SUBST(LIBMP3LAME_LDADD)
 AC_SUBST(CONFIG_MATH_LIB)
+AC_SUBST(PC_REQUIRES_PRIVATE)
+AC_SUBST(PC_LIBS_PRIVATE)
 AC_SUBST(LDADD)
 
 AC_SUBST(LIB_MAJOR_VERSION)
@@ -1746,7 +1661,6 @@ AC_CONFIG_FILES([Makefile \
 		 ACM/ADbg/Makefile \
 		 ACM/ddk/Makefile \
 		 ACM/tinyxml/Makefile \
-		 lame.spec \
 		 mac/Makefile \
 		 vc_solution/Makefile])
 
@@ -1839,6 +1753,7 @@ echo "      file io ............. ${CONFIG_FILEIO}"
 echo "      analyzer hooks ...... ${CONFIG_ANALYZER:-no}"
 echo "      vector routines ..... ${lame_vector_sets}"
 echo "      hardening ........... ${enable_hardening:-no}"
+echo "      export list ......... ${lame_export_list}"
 echo "      native tuning ....... ${enable_native:-no}"
 echo "      debug ............... ${CONFIG_DEBUG:-no}"
 if test -n "${internal_static_note}"; then

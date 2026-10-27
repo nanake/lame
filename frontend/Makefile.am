@@ -36,11 +36,15 @@ mp3rtp_SOURCES = mp3rtp.c rtp.c $(common_sources)
 # session lifecycle (open/close/replace, async File dialog integration,
 # frontend-global baseline management) lives in mp3x_session.c.
 mp3x_SOURCES = mp3x_ui.c mp3x_plot.c mp3x_core.c mp3x_session.c $(common_sources)
+mp3x_CFLAGS = @GTK_CFLAGS@
 
 EXTRA_DIST = README.mp3x-gtk4
 
-CFLAGS = @CFLAGS@ @GTK_CFLAGS@ @FRONTEND_CFLAGS@ @SNDFILE_CFLAGS@
+CFLAGS = @CFLAGS@ @FRONTEND_CFLAGS@ @SNDFILE_CFLAGS@
 LDFLAGS = @LDFLAGS@ @FRONTEND_LDFLAGS@ @FRONTEND_UNICODE_LDFLAGS@ @SNDFILE_LIBS@
+
+AM_CPPFLAGS = @LAME_CPPFLAGS@ -I$(top_srcdir)/libmp3lame -I$(top_srcdir)/include \
+	-I$(top_srcdir) -I$(top_builddir)
 
 # --enable-internal exposes the developer tuning options in parse.c. The macro
 # is defined here (frontend only), not globally, so other consumers of parse.c
@@ -48,11 +52,8 @@ LDFLAGS = @LDFLAGS@ @FRONTEND_LDFLAGS@ @FRONTEND_UNICODE_LDFLAGS@ @SNDFILE_LIBS@
 # so the frontend can reach the internal setters, which the shared library does
 # not export.
 if INTERNAL_OPTS
-AM_CPPFLAGS = -D_ALLOW_INTERNAL_OPTIONS
+AM_CPPFLAGS += -DLAME_INTERNAL_OPTIONS
 endif
-
-INCLUDES = @INCLUDES@ -I$(top_srcdir)/libmp3lame -I$(top_srcdir)/include \
-	-I$(top_srcdir) -I$(top_builddir)
 
 LDADD = @LDADD@ \
 	$(top_builddir)/libmp3lame/libmp3lame.la \
@@ -77,7 +78,7 @@ LCLINTFLAGS= \
 	-Dlint
 
 lclint.txt: ${lame_SOURCES} ${noinst_HEADERS}
-	@lclint ${LCLINTFLAGS} ${INCLUDES} ${DEFS} ${lame_SOURCES} 2>&1 >lclint.txt || true
+	@lclint ${LCLINTFLAGS} ${AM_CPPFLAGS} ${DEFS} ${lame_SOURCES} 2>&1 >lclint.txt || true
 
 lclint: lclint.txt
 	more lclint.txt

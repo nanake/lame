@@ -25,18 +25,20 @@ EXTRA_DIST = \
 	configMS.h \
 	debian \
 	lame.bat \
-	lame.spec.in \
-	lame.spec \
 	testcase.mp3 \
 	testcase.wav \
 	maintainer/abicheck.sh \
 	maintainer/abi/libmp3lame.abi \
+	maintainer/abi/libmp3lame.abignore \
 	maintainer/check-dist.sh \
 	maintainer/check-dist.ps1 \
 	maintainer/gen-api-docs.sh \
+	maintainer/gen-usage.py \
+	maintainer/check-optdoc.py \
 	maintainer/gen-build-matrix.sh \
 	maintainer/gen-build-matrix.ps1 \
 	maintainer/setup-windows-deps.ps1 \
+	maintainer/smoke-clients.ps1 \
 	maintainer/perf-compare.sh \
 	maintainer/setup-quality-corpus.sh \
 	maintainer/quality-compare.py \

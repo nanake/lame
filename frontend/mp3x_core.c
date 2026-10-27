@@ -24,15 +24,10 @@
  *  \brief The mp3x analyzer engine.
  *  \internal
  *
- *  Mechanically extracted from gtkanal.c so that the encode/decode analysis
- *  work is separated from any particular UI toolkit. It reads one frame of
- *  input, encodes it, and re-synthesizes it with LAME's internal HIP/mpglib
- *  decoder, filling the shared plotting_data ring.
- *
- *  Nothing here includes GTK/GDK; that is the whole point. The frame algorithm
- *  is unchanged from the original gtkmakeframe(): the only differences are that
- *  the encoder handle is now a parameter rather than a file-global, and the
- *  internal-flags pointer is derived locally from it.
+ *  The engine reads one frame of input, encodes it, and decodes it again with
+ *  the internal HIP/mpglib decoder of LAME. It fills the shared plotting_data
+ *  ring. This file does not include GTK or GDK, so that the analysis does not
+ *  depend on a GUI toolkit.
  */
 
 #ifdef HAVE_CONFIG_H
@@ -42,7 +37,7 @@
 #include <assert.h>
 #include <string.h>
 
-#include "main.h"               /* global_reader, ReaderConfig */
+#include "main.h"               /* frontend_config, ReaderConfig */
 #include "lame.h"
 #include "machine.h"
 #include "encoder.h"            /* DECDELAY */
@@ -51,6 +46,7 @@
 #include "lame_global_flags.h"  /* lame_global_flags::internal_flags */
 #include "util.h"               /* lame_internal_flags, hip_set_pinfo */
 #include "console.h"            /* error_printf, error_flush */
+#include "parse.h"              /* frontend_encode_error_text */
 #include "mp3x_core.h"
 
 
@@ -72,9 +68,11 @@ static int disp_back = 0;
  * mp3x_core_init() can establish a genuinely fresh analyzer session.
  */
 typedef struct {
+    audio_reader *reader;         /* the input of the session */
     hip_t       hip;              /* decoder for the just-encoded data */
     int         mpglag;
-    short int   buffer[2][1152];
+    short int   buffer[2][FRAME_BUFFER_SAMPLES];
+    float       bufferf[2][FRAME_BUFFER_SAMPLES]; /* the input frame, for a floating point file */
     int         frame_num;
     int         decoder_flushing; /* encoder flush was fed; HIP may have output queued */
     int         drain_frame_num;  /* synthetic slot number used only for decode mapping */
@@ -156,7 +154,7 @@ accumulate_stats(plotting_data *p)
 }
 
 void
-mp3x_core_init(void)
+mp3x_core_init(audio_reader *reader)
 {
     int i;
 
@@ -164,6 +162,7 @@ mp3x_core_init(void)
         hip_decode_exit(core_state.hip);
 
     memset((char *) &core_state, 0, sizeof core_state);
+    core_state.reader = reader;
     memset((char *) &stats, 0, sizeof stats);
     memset((char *) Pinfo, 0, sizeof(Pinfo));
     memset((char *) mp3x_sfb_l, 0, sizeof mp3x_sfb_l);
@@ -189,13 +188,9 @@ mp3x_core_shutdown(void)
 }
 
 
-/**********************************************************************
- * read one frame and encode it
- *
- * Verbatim from gtkanal.c:gtkmakeframe(). The encoder handle is now the
- * parameter gfp (previously a file-global); gfc is derived from it here,
- * exactly as the frontend used to derive it once in gtkcontrol().
- **********************************************************************/
+/*
+ * Reads one frame and encodes it. gfc is derived here from the parameter gfp.
+ */
 int
 mp3x_core_makeframe(lame_global_flags *gfp)
 {
@@ -220,9 +215,9 @@ mp3x_core_makeframe(lame_global_flags *gfp)
      * and mpg123 will write data into pinfo.  Set these so
      * the libraries put this data in the right place: */
     gfc->pinfo = pinfo;
-    if (is_mpeg_file_format(global_reader.input_format)) {
-        hip_set_pinfo(get_hip(), pplot);
-        iread = get_audio16(gfp, core_state.buffer);
+    if (is_mpeg_file_format(frontend_config.reader.input_format)) {
+        hip_set_pinfo(get_hip(core_state.reader), pplot);
+        iread = get_audio16(core_state.reader, gfp, core_state.buffer);
 
 
         /* add a delay of framesize-DECDELAY, which will make the total delay
@@ -253,7 +248,11 @@ mp3x_core_makeframe(lame_global_flags *gfp)
 
         /* feed data to encoder until encoder produces some output */
         while (lame_get_frameNum(gfp) == pinfo->frameNum) {
-            iread = get_audio16(gfp, core_state.buffer);
+            int const floats = input_is_float(core_state.reader);
+            if (floats)
+                iread = get_audio_float(core_state.reader, gfp, core_state.bufferf);
+            else
+                iread = get_audio16(core_state.reader, gfp, core_state.buffer);
             if (iread > framesize) {
                 /* NOTE: frame analyzer requires that we encode one frame
                  * for each pass through this loop.  If lame_encode_buffer()
@@ -265,12 +264,16 @@ mp3x_core_makeframe(lame_global_flags *gfp)
             if (iread <= 0)
                 break;  /* eof */
 
-            mp3count = lame_encode_buffer(gfp, core_state.buffer[0],
-                                          core_state.buffer[1], iread,
-                                          mp3buffer, sizeof(mp3buffer));
+            if (floats)
+                mp3count = lame_encode_buffer_ieee_float(gfp, core_state.bufferf[0],
+                                                         core_state.bufferf[1], iread,
+                                                         mp3buffer, sizeof(mp3buffer));
+            else
+                mp3count = lame_encode_buffer(gfp, core_state.buffer[0],
+                                              core_state.buffer[1], iread,
+                                              mp3buffer, sizeof(mp3buffer));
             if (mp3count < 0) {
-                error_printf("mp3x: lame_encode_buffer failed with error %d\n",
-                             mp3count);
+                error_printf("Error: %s (error %d)\n", frontend_encode_error_text(mp3count), mp3count);
                 error_flush();
                 return mp3count;
             }
@@ -289,8 +292,7 @@ mp3x_core_makeframe(lame_global_flags *gfp)
              */
             mp3count = lame_encode_flush(gfp, mp3buffer, sizeof(mp3buffer));
             if (mp3count < 0) {
-                error_printf("mp3x: lame_encode_flush failed with error %d\n",
-                             mp3count);
+                error_printf("Error: %s (error %d)\n", frontend_encode_error_text(mp3count), mp3count);
                 error_flush();
                 return mp3count;
             }
@@ -333,14 +335,11 @@ mp3x_core_makeframe(lame_global_flags *gfp)
 }
 
 
-/**********************************************************************
- * advance one frame
- *
- * The ring-buffer stepping the GTK1 frontend used to inline in frameadv1():
- * shift the ring back one slot, read+encode+decode the next frame into the new
- * slot (pinfo), timestamp it, and point pplot at the display frame. A frontend
- * calls this to drive the analyzer; all analysis stays here.
- **********************************************************************/
+/*
+ * Advancing one frame: shift the ring back one slot, read, encode and decode
+ * the next frame into the new slot (pinfo), store its time, and point pplot to
+ * the display frame.
+ */
 static void
 shift_ring(void)
 {
@@ -455,13 +454,12 @@ mp3x_core_drain_step(void)
 }
 
 
-/**********************************************************************
- * display-frame navigation
- *
- * The display frame walks the ring between the newest displayable frame
- * (&Pinfo[READ_AHEAD]) and NUMBACK frames older. Back moves toward history,
- * forward toward the newest; each returns 1 if it actually moved.
- **********************************************************************/
+/*
+ * Navigation of the display frame. It moves in the ring between the newest
+ * frame that can be shown (&Pinfo[READ_AHEAD]) and NUMBACK frames before it.
+ * Back moves to older frames, forward to newer ones. Each returns 1 if it
+ * moved.
+ */
 int
 mp3x_core_disp_back(void)
 {

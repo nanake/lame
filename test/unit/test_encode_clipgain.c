@@ -1,24 +1,26 @@
 /**
  * @file
  * @ingroup unit_tests
- * @brief Unit tests for the clipping figures reported after an encode
- *        (libmp3lame/lame.c).
+ * @brief Unit tests for the clipping figures that the encoder reports after an
+ *        encode (libmp3lame/lame.c).
  *
- * With the peak measurement enabled the encoder decodes its own output and
- * records the loudest sample it sees. Material whose samples are all zero
- * leaves that peak at zero, which is the one value the headroom figure cannot
- * be computed from - the logarithm of zero is not a number, and converting it
- * to an integer is undefined. Silence is ordinary input for this measurement:
- * a leading gap, a muted track, an empty capture.
+ * With the peak measurement on, the encoder decodes its own output. It stores
+ * the loudest sample that it sees. If all samples are zero, the peak stays at
+ * zero. The headroom figure cannot be computed from a peak of zero. The
+ * logarithm of zero is minus infinity, and its conversion to an integer is
+ * undefined. Silence is ordinary input for this measurement, for example a
+ * leading gap, a muted track or an empty capture.
  *
- * Both cases need a build that can decode: without one the request to measure
- * the peak is refused outright, so nothing computes a headroom figure and there
- * is no behaviour here to check. That is asked of the library rather than of a
- * configuration macro, since the refusal is what a caller actually meets.
+ * Both tests need a build that can decode. Without a decoder, the library
+ * rejects the request to measure the peak. Then nothing computes a headroom
+ * figure, and there is no behavior to check. The test asks the library, not a
+ * configuration macro, because the rejection is what a caller sees.
  *
- * The loud case is the control for the silent one: it shows the figures do
- * move, without which a zero would equally be the signature of a measurement
- * that never ran.
+ * The loud case is the control for the silent case. It shows that the figures
+ * change. Without it, a zero can also mean that the measurement never ran.
+ *
+ * One more test checks the peak that the LAME tag stores, for float input far
+ * above full scale: the field holds the peak scaled to 2^23 in 32 bits.
  *
  * Library-level tests: they link libmp3lame and call the exported API directly.
  */
@@ -45,11 +47,13 @@
 #define MP3BUF_SIZE      (5 * SAMPLES_PER_CALL / 4 + 7200)
 
 /**
- * @brief Encodes one buffer repeatedly with the peak measurement on, then
- *        flushes, which is what computes the figures under test.
+ * @brief Encodes one buffer several times with the peak measurement on, and
+ *        then flushes.
+ *
+ * The flush computes the figures that the tests check.
  * @param left,right the block of samples to encode, repeated #CALLS times.
- * @return the encoder instance, still open, for the caller to interrogate, or
- *         NULL where this build refuses to measure the peak at all.
+ * @return the encoder instance, still open, for the caller to check. NULL if
+ *         this build rejects the peak measurement.
  */
 static lame_t
 encode_with_peak_measurement(short const *left, short const *right)
@@ -86,12 +90,13 @@ encode_with_peak_measurement(short const *left, short const *right)
 }
 
 /**
- * @brief Silence reports no clipping and no scaling, and nothing undefined.
+ * @brief Checks that silence reports no clipping, no scaling and no undefined
+ *        value.
  *
- * Before the guard this computed the logarithm of zero and converted the
- * infinity that comes back to an int, which the C standard leaves undefined;
- * what it produced in practice was the most negative int there is, reported to
- * the caller as a headroom of some 214 million decibels.
+ * Without the check for a zero peak, the code takes the logarithm of zero. It
+ * then converts the resulting infinity to an int. The C standard leaves this
+ * conversion undefined. A typical result is the most negative int. The caller
+ * then sees a headroom of about 214 million decibels.
  */
 static void
 test_silence_reports_no_headroom(LAME_UNUSED void **state)
@@ -109,11 +114,11 @@ test_silence_reports_no_headroom(LAME_UNUSED void **state)
 }
 
 /**
- * @brief Material that is not silent moves the figures.
+ * @brief Checks that a signal that is not silent changes the figures.
  *
- * The control for the case above: it shows the measurement runs and writes,
- * so a zero there is the answer for silence rather than the signature of a
- * peak that was never taken.
+ * This is the control for the test above. It shows that the measurement runs
+ * and writes its result. So a zero in the test above is the result for
+ * silence. It does not mean that the peak was never measured.
  */
 static void
 test_signal_reports_a_peak(LAME_UNUSED void **state)
@@ -139,12 +144,83 @@ test_signal_reports_a_peak(LAME_UNUSED void **state)
     assert_int_equal(lame_close(gfp), 0);
 }
 
+/** @brief The peak 1.0 as the LAME tag stores it. */
+#define TAG_PEAK_UNITY 8388608.0
+
+/**
+ * @brief Encodes a float sine of amplitude @p amp times full scale with the
+ *        peak measurement on, and returns the peak field of its LAME tag.
+ * @param amp  the amplitude, in multiples of full scale.
+ * @param peak receives the field, as stored.
+ * @return 1 if this build measures the peak, else 0.
+ */
+static int
+tag_peak_of_float_sine(float amp, unsigned long *peak)
+{
+    static float left[SAMPLES_PER_CALL], right[SAMPLES_PER_CALL];
+    unsigned char mp3buf[MP3BUF_SIZE], tag[2880];
+    lame_t  gfp = lame_init();
+    size_t  n, k;
+    int     i;
+
+    assert_non_null(gfp);
+    for (i = 0; i < SAMPLES_PER_CALL; i++)
+        left[i] = right[i] = amp * (float) ((i % 64) - 32) / 32.0f;
+    assert_int_equal(lame_set_num_channels(gfp, 2), 0);
+    assert_int_equal(lame_set_in_samplerate(gfp, 44100), 0);
+    assert_int_equal(lame_set_brate(gfp, 128), 0);
+    if (lame_set_decode_on_the_fly(gfp, 1) != 0) {
+        (void) lame_close(gfp);
+        return 0;
+    }
+    assert_int_equal(lame_init_params(gfp), 0);
+    for (i = 0; i < CALLS; i++)
+        assert_true(lame_encode_buffer_ieee_float(gfp, left, right, SAMPLES_PER_CALL, mp3buf,
+                                                  (int) sizeof mp3buf) >= 0);
+    assert_true(lame_encode_flush(gfp, mp3buf, (int) sizeof mp3buf) >= 0);
+    n = lame_get_lametag_frame(gfp, tag, sizeof tag);
+    assert_true(n > 0 && n <= sizeof tag);
+    for (k = 0; k + 4 <= n; k++)
+        if (memcmp(tag + k, "Info", 4) == 0)
+            break;
+    /* the Xing part (120 bytes), then the version 9, method 1, lowpass 1 */
+    k += 120 + 9 + 1 + 1;
+    assert_true(k + 4 <= n);
+    *peak = ((unsigned long) tag[k] << 24) | ((unsigned long) tag[k + 1] << 16)
+        | ((unsigned long) tag[k + 2] << 8) | tag[k + 3];
+    assert_int_equal(lame_close(gfp), 0);
+    return 1;
+}
+
+/**
+ * @brief Checks the LAME tag's peak for float input far above full scale.
+ *
+ * At 300 times full scale the scaled peak is above @c INT_MAX and below
+ * 2^32, so the field holds it. At 1000 times it does not fit, and the field
+ * holds its largest value.
+ * @param state cmocka fixture state (unused).
+ */
+static void
+test_tag_peak_above_full_scale(LAME_UNUSED void **state)
+{
+    unsigned long peak;
+
+    if (!tag_peak_of_float_sine(300.0f, &peak)) {
+        skip();         /* no decoder, so no peak measurement to ask for */
+    }
+    assert_true(peak >= (unsigned long) (290 * TAG_PEAK_UNITY));
+    assert_true(peak <= 0xFFFFFFFFul);
+    assert_int_equal(tag_peak_of_float_sine(1000.0f, &peak), 1);
+    assert_true(peak == 0xFFFFFFFFul);
+}
+
 int
 main(void)
 {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test(test_silence_reports_no_headroom),
         cmocka_unit_test(test_signal_reports_a_peak),
+        cmocka_unit_test(test_tag_peak_above_full_scale),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

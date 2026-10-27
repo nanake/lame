@@ -33,6 +33,7 @@
 # include <limits.h>
 #endif
 
+#include <stdarg.h>
 #include <stdio.h>
 
 #ifdef STDC_HEADERS
@@ -59,6 +60,13 @@ char   *strchr(), *strrchr();
 #endif
 
 #ifdef HAVE_MPG123
+/**
+ * @internal
+ * The reader uses the decoder struct of libmp3lame (mpstr_tag from
+ * mpglib/mpglib.h) as the hip_t of lame.h. That struct is not part of the
+ * interface of libmp3lame. The lame program therefore needs the libmp3lame
+ * of the same build.
+ */
 #define hip_global_struct mpstr_tag
 #endif
 #ifdef HAVE_MPG123
@@ -67,8 +75,6 @@ char   *strchr(), *strrchr();
 #include "mpglib/mpglib.h"
 
 #endif
-
-#define         MAX_U_32_NUM            0xFFFFFFFF
 
 
 #include <math.h>
@@ -103,15 +109,32 @@ char   *strchr(), *strrchr();
 #include <dmalloc.h>
 #endif
 
-#ifndef STR
-# define __STR(x)  #x
-# define STR(x)    __STR(x)
-#define __LOC__ __FILE__ "("STR(__LINE__)") : "
-#endif
+/** The delay of the layer III decoder of libmpg123, in samples. */
+#define MP3_DECODER_DELAY 529
 
-
-#define FLOAT_TO_UNSIGNED(f) ((unsigned long)(((long)((f) - 2147483648.0)) + 2147483647L + 1))
 #define UNSIGNED_TO_FLOAT(u) (((double)((long)((u) - 2147483647L - 1))) + 2147483648.0)
+
+static void reader_error(const char *format, ...) CONSOLE_PRINTF(1, 2);
+
+/**
+ * @internal
+ * @brief Prints an error message of the input reader, unless the user asked
+ *        for no messages.
+ *
+ * @param format  the printf() format of the message.
+ * @param ...     the values for @p format.
+ */
+static void
+reader_error(const char *format, ...)
+{
+    va_list args;
+
+    if (frontend_config.ui_config.silent < 10) {
+        va_start(args, format);
+        frontend_errorf(format, args);
+        va_end(args);
+    }
+}
 
 static uint32_t uint32_high_low(unsigned char const *bytes)
 {
@@ -120,6 +143,73 @@ static uint32_t uint32_high_low(unsigned char const *bytes)
     uint32_t const lh = bytes[2];
     uint32_t const ll = bytes[3];
     return (hh << 24) | (hl << 16) | (lh << 8) | ll;
+}
+
+/**
+ * @internal
+ * @brief Returns the 32-bit value of 4 bytes, the least significant first.
+ * @param bytes  the 4 bytes.
+ * @return the value.
+ */
+static uint32_t uint32_low_high(unsigned char const *bytes)
+{
+    uint32_t const ll = bytes[0];
+    uint32_t const lh = bytes[1];
+    uint32_t const hl = bytes[2];
+    uint32_t const hh = bytes[3];
+    return (hh << 24) | (hl << 16) | (lh << 8) | ll;
+}
+
+/**
+ * @internal
+ * @brief Returns the 16-bit value of 2 bytes, the most significant first.
+ * @param bytes  the 2 bytes.
+ * @return the value.
+ */
+static uint16_t uint16_high_low(unsigned char const *bytes)
+{
+    uint16_t const h = bytes[0];
+    uint16_t const l = bytes[1];
+    return (uint16_t) ((h << 8) | l);
+}
+
+/**
+ * @internal
+ * @brief Returns the 16-bit value of 2 bytes, the least significant first.
+ * @param bytes  the 2 bytes.
+ * @return the value.
+ */
+static uint16_t uint16_low_high(unsigned char const *bytes)
+{
+    uint16_t const l = bytes[0];
+    uint16_t const h = bytes[1];
+    return (uint16_t) ((h << 8) | l);
+}
+
+/**
+ * @internal
+ * @brief Returns non-zero for an integer sample width that the readers unpack.
+ * @param bits  the width in bits.
+ * @return non-zero for 8, 16, 24 and 32, 0 otherwise.
+ */
+static int
+pcm_int_width_supported(int bits)
+{
+    return bits == 8 || bits == 16 || bits == 24 || bits == 32;
+}
+
+/**
+ * @internal
+ * @brief Returns the bytes in one sample frame: one sample of each channel.
+ * @param channels  the number of channels.
+ * @param bits      the sample width in bits. A width that is not a whole
+ *                  number of bytes takes up the next whole byte.
+ * @return the frame size in bytes.
+ */
+static uint32_t
+pcm_bytes_per_frame(unsigned int channels, unsigned int bits)
+{
+    return channels * ((bits + 7u) / 8u);
 }
 
 /* The header readers below return 0 on success and -1 once the input runs
@@ -167,12 +257,8 @@ read_16_bits_low_high(FILE * fp, uint16_t * out)
     unsigned char bytes[2] = { 0, 0 };
     if (fread(bytes, 1, 2, fp) != 2)
         return -1;
-    {
-        uint16_t const l = bytes[0];
-        uint16_t const h = bytes[1];
-        *out = (uint16_t) ((h << 8) | l);
-        return 0;
-    }
+    *out = uint16_low_high(bytes);
+    return 0;
 }
 
 
@@ -182,14 +268,8 @@ read_32_bits_low_high(FILE * fp, uint32_t * out)
     unsigned char bytes[4] = { 0, 0, 0, 0 };
     if (fread(bytes, 1, 4, fp) != 4)
         return -1;
-    {
-        uint32_t const ll = bytes[0];
-        uint32_t const lh = bytes[1];
-        uint32_t const hl = bytes[2];
-        uint32_t const hh = bytes[3];
-        *out = (hh << 24) | (hl << 16) | (lh << 8) | ll;
-        return 0;
-    }
+    *out = uint32_low_high(bytes);
+    return 0;
 }
 
 static int
@@ -198,12 +278,8 @@ read_16_bits_high_low(FILE * fp, uint16_t * out)
     unsigned char bytes[2] = { 0, 0 };
     if (fread(bytes, 1, 2, fp) != 2)
         return -1;
-    {
-        uint16_t const h = bytes[0];
-        uint16_t const l = bytes[1];
-        *out = (uint16_t) ((h << 8) | l);
-        return 0;
-    }
+    *out = uint16_high_low(bytes);
+    return 0;
 }
 
 static int
@@ -259,13 +335,13 @@ typedef struct blockAlign_struct {
 } blockAlign;
 
 typedef struct IFF_AIFF_struct {
-    short   numChannels;
     unsigned long numSampleFrames;
-    short   sampleSize;
     double  sampleRate;
     uint32_t sampleType;
     uint32_t sampleFormat;
     blockAlign blkAlgn;
+    short   numChannels;
+    short   sampleSize;
 } IFF_AIFF;
 
 
@@ -306,20 +382,63 @@ freePcmBuffer(PcmBuffer * b)
     }
 }
 
+/**
+ * @internal
+ * @brief Grows both channels of a sample buffer.
+ *
+ * @param b      the buffer.
+ * @param n      the number of samples per channel it must hold.
+ * @param bytes  the size of @p n samples of one channel, in bytes.
+ * @return 0, or -1 when memory runs out. The buffer then keeps its samples.
+ */
 static int
-addPcmBuffer(PcmBuffer * b, void *a0, void *a1, int read)
+growPcmBuffer(PcmBuffer * b, int n, int bytes)
+{
+    void   *ch;
+
+    ch = realloc(b->ch[0], bytes);
+    if (ch == NULL)
+        return -1;
+    b->ch[0] = ch;
+    ch = realloc(b->ch[1], bytes);
+    if (ch == NULL)
+        return -1;
+    b->ch[1] = ch;
+    b->n = n;
+    return 0;
+}
+
+/**
+ * @internal
+ * @brief Adds the samples of one read to a sample buffer.
+ *
+ * The samples to skip at the start are dropped first.
+ *
+ * @param b     the buffer, or NULL.
+ * @param a0    the first channel of the read, or NULL.
+ * @param a1    the second channel of the read, or NULL.
+ * @param read  the number of samples per channel that were read. Negative
+ *              after a read error.
+ * @param used  receives the number of samples that the buffer can hand out.
+ * @return 0, or -1 when memory runs out.
+ */
+static int
+addPcmBuffer(PcmBuffer * b, void *a0, void *a1, int read, int *used)
 {
     int     a_n;
 
+    *used = 0;
     if (b == 0) {
         return 0;
     }
     if (read < 0) {
-        return b->u - b->skip_end;
+        *used = b->u - b->skip_end;
+        return 0;
     }
     if (b->skip_start >= read) {
         b->skip_start -= read;
-        return b->u - b->skip_end;
+        *used = b->u - b->skip_end;
+        return 0;
     }
     a_n = read - b->skip_start;
 
@@ -330,9 +449,8 @@ addPcmBuffer(PcmBuffer * b, void *a0, void *a1, int read)
         int const b_have = b->w * b->n;
         int const b_need = b->w * (b->u + a_n);
         if (b_have < b_need) {
-            b->n = b->u + a_n;
-            b->ch[0] = realloc(b->ch[0], b_need);
-            b->ch[1] = realloc(b->ch[1], b_need);
+            if (growPcmBuffer(b, b->u + a_n, b_need) < 0)
+                return -1;
         }
         b->u += a_n;
         if (b->ch[0] != 0 && a0 != 0) {
@@ -347,7 +465,8 @@ addPcmBuffer(PcmBuffer * b, void *a0, void *a1, int read)
         }
     }
     b->skip_start = 0;
-    return b->u - b->skip_end;
+    *used = b->u - b->skip_end;
+    return 0;
 }
 
 static int
@@ -379,42 +498,61 @@ takePcmBuffer(PcmBuffer * b, void *a0, void *a1, int a_n, int mm)
     return a_n;
 }
 
-/* global data for get_audio.c. */
-typedef struct get_audio_global_data_struct {
+/** @internal @brief The state of one open input file. */
+struct audio_reader {
     int     count_samples_carefully;
     int     pcmbitwidth;
     int     pcmswapbytes;
     int     pcm_is_unsigned_8bit;
     int     pcm_is_ieee_float;
+    int     input_ends_inside_a_frame;
+    int     input_shorter_than_its_tag;
     unsigned long num_samples_read;
+    unsigned long num_samples_above_full_scale;
     FILE   *music_in;
+    unsigned char *in_buffer;   /**< the stdio buffer of music_in, or NULL */
     SNDFILE *snd_file;
-#ifdef HAVE_MPG123
-    mpg123_handle* mh;
-#endif
     hip_t     hip;
     PcmBuffer pcm32;
     PcmBuffer pcm16;
+    PcmBuffer pcmf;
     size_t  in_id3v2_size;
     unsigned char* in_id3v2_tag;
-} get_audio_global_data;
+};
 
-static get_audio_global_data global;
+/**
+ * @internal
+ * @brief Where the samples of one frame go: two channels of one sample type.
+ *
+ * Exactly one of the three pairs is set; the other two are NULL.
+ */
+typedef struct {
+    int    *i[2];               /**< int samples, full scale at the int's range */
+    short  *s[2];               /**< 16 bit samples, for --decode */
+    float  *f[2];               /**< float samples, 1.0 being full scale */
+} frame_dest;
 
 
 
 #ifdef HAVE_MPG123
-int     lame123_decode_initfile(FILE * fd, mp3data_struct * mp3data, int *enc_delay, int *enc_padding);
+int     lame123_decode_initfile(audio_reader * reader, FILE * fd, mp3data_struct * mp3data,
+                                int *enc_delay, int *enc_padding);
 #endif
 
 
-static int read_samples_pcm(FILE * musicin, int sample_buffer[2304], int samples_to_read);
-static int read_samples_mp3(lame_t gfp, FILE * musicin, short int mpg123pcm[2][1152]);
+static int read_samples_pcm(audio_reader * reader, frame_dest const *dest, int num_channels,
+                            int samples_to_read);
+static int read_samples_float(audio_reader * reader, FILE * musicin,
+                              float sample_buffer[2 * FRAME_BUFFER_SAMPLES],
+                              int samples_to_read);
+static int read_samples_mp3(audio_reader * reader, frame_dest const *dest);
 #ifdef LIBSNDFILE
-static SNDFILE *open_snd_file(lame_t gfp, char const *inPath);
+static SNDFILE *open_snd_file(audio_reader * reader, lame_t gfp, char const *inPath);
 #endif
-static FILE *open_mpeg_file(lame_t gfp, char const *inPath, int *enc_delay, int *enc_padding);
-static FILE *open_wave_file(lame_t gfp, char const *inPath, int *enc_delay, int *enc_padding);
+static FILE *open_mpeg_file(audio_reader * reader, lame_t gfp, char const *inPath, int *enc_delay,
+                            int *enc_padding);
+static FILE *open_wave_file(audio_reader * reader, lame_t gfp, char const *inPath, int *enc_delay,
+                            int *enc_padding);
 static int close_input_file(FILE * musicin);
 
 
@@ -427,9 +565,12 @@ min_size_t(size_t a, size_t b)
     return b;
 }
 
-enum ByteOrder machine_byte_order(void);
-
-enum ByteOrder
+/**
+ * @internal
+ * @brief Returns the byte order of this machine.
+ * @return ::ByteOrderBigEndian or ::ByteOrderLittleEndian.
+ */
+static enum ByteOrder
 machine_byte_order(void)
 {
     long    one = 1;
@@ -493,10 +634,8 @@ fskip_long(FILE * fp, long offset, int whence)
     }
 
     if (whence != SEEK_CUR || offset < 0) {
-        if (global_ui_config.silent < 10) {
-            error_printf
-                ("fskip problem: Mostly the return status of functions is not evaluated, so it is more secure to pollute <stderr>.\n");
-        }
+        reader_error("fskip problem: Mostly the return status of functions is not evaluated, "
+                     "so it is more secure to pollute <stderr>.\n");
         return -1;
     }
 
@@ -540,7 +679,7 @@ lame_get_file_size(FILE * fp)
 
 
 FILE   *
-init_outfile(char const *outPath, int decode)
+init_outfile(char const *outPath, LAME_UNUSED int decode)
 {
     FILE   *outf;
 
@@ -570,8 +709,6 @@ init_outfile(char const *outPath, int decode)
                 free(out_path);
             }
         }
-#else
-        (void) decode;
 #endif
     }
     return outf;
@@ -579,27 +716,14 @@ init_outfile(char const *outPath, int decode)
 
 
 static void
-setSkipStartAndEnd(lame_t gfp, int enc_delay, int enc_padding)
+setSkipStartAndEnd(audio_reader * reader, lame_t gfp, int enc_delay, int enc_padding)
 {
     int     skip_start = 0, skip_end = 0;
-    long dec_delay = -1;
 
-    if (global_decoder.mp3_delay_set)
-        skip_start = global_decoder.mp3_delay;
+    if (frontend_config.decoder.mp3_delay_set)
+        skip_start = frontend_config.decoder.mp3_delay;
 
-#if 0
-    /* We should ask mpg123 for the delay, but we know it is 529 samples and
-       will not change unless we enable gapless mode. Also, global.hip is not
-       always the correct handle, so avoid this for now. */
-    /* Will use it for layer III only, mpg123 does not deal with layer I and II
-       gapless stuff (yet?) */
-    mpg123_getstate(global.hip->mh, MPG123_DEC_DELAY, &dec_delay, NULL);
-#else
-    if(dec_delay < 0)
-        dec_delay = 528 + 1; /* Same value as above, actually. */
-#endif
-
-    switch (global_reader.input_format) {
+    switch (frontend_config.reader.input_format) {
     case sf_mp123:
         break;
 
@@ -607,16 +731,16 @@ setSkipStartAndEnd(lame_t gfp, int enc_delay, int enc_padding)
         if (skip_start == 0) {
             if (enc_delay > -1 || enc_padding > -1) {
                 if (enc_delay > -1)
-                    skip_start = (int)(enc_delay + dec_delay);
+                    skip_start = enc_delay + MP3_DECODER_DELAY;
                 if (enc_padding > -1)
-                    skip_end = (int)(enc_padding - dec_delay);
+                    skip_end = enc_padding - MP3_DECODER_DELAY;
             }
             else
-                skip_start = (int)(lame_get_encoder_delay(gfp) + dec_delay);
+                skip_start = lame_get_encoder_delay(gfp) + MP3_DECODER_DELAY;
         }
         else {
             /* user specified a value of skip. just add for decoder */
-            skip_start += dec_delay; /* mp3 decoder has a 528 sample delay, plus user supplied "skip" */
+            skip_start += MP3_DECODER_DELAY;
         }
         break;
     case sf_mp2:
@@ -625,112 +749,333 @@ setSkipStartAndEnd(lame_t gfp, int enc_delay, int enc_padding)
     case sf_mp1:
         skip_start += 240 + 1;
         break;
-    case sf_raw:
-        skip_start += 0; /* other formats have no delay *//* is += 0 not better ??? */
-        break;
-    case sf_wave:
-        skip_start += 0; /* other formats have no delay *//* is += 0 not better ??? */
-        break;
-    case sf_aiff:
-        skip_start += 0; /* other formats have no delay *//* is += 0 not better ??? */
-        break;
     default:
-        skip_start += 0; /* other formats have no delay *//* is += 0 not better ??? */
         break;
     }
     skip_start = skip_start < 0 ? 0 : skip_start;
     skip_end = skip_end < 0 ? 0 : skip_end;
-    global. pcm16.skip_start = global.pcm32.skip_start = skip_start;
-    global. pcm16.skip_end = global.pcm32.skip_end = skip_end;
+    reader->pcmf.skip_start = reader->pcm16.skip_start = reader->pcm32.skip_start = skip_start;
+    reader->pcmf.skip_end = reader->pcm16.skip_end = reader->pcm32.skip_end = skip_end;
 }
 
 
 
-int
+/**
+ * @internal
+ * @brief Opens an input file and reads its header.
+ *
+ * The header sets the sample rate, the channel count and the number of
+ * samples of @p gfp.
+ *
+ * @param gfp     the encoder.
+ * @param inPath  the input file, or "-" for standard input.
+ * @return the reader of the file, or NULL if it cannot be read. Close it with
+ *         close_infile().
+ */
+audio_reader *
 init_infile(lame_t gfp, char const *inPath)
 {
+    audio_reader *const reader = calloc(1, sizeof(*reader));
     int     enc_delay = 0, enc_padding = 0;
-    /* open the input file */
-    global. count_samples_carefully = 0;
-    global. num_samples_read = 0;
-    global. pcmbitwidth = global_raw_pcm.in_bitwidth;
-    global. pcmswapbytes = global_reader.swapbytes;
-    global. pcm_is_unsigned_8bit = global_raw_pcm.in_signed == 1 ? 0 : 1;
-    global. pcm_is_ieee_float = 0;
-    global. hip = 0;
-    global. music_in = 0;
-    global. snd_file = 0;
-    global. in_id3v2_size = 0;
-    global. in_id3v2_tag = 0;
-    if (is_mpeg_file_format(global_reader.input_format)) {
-        global. music_in = open_mpeg_file(gfp, inPath, &enc_delay, &enc_padding);
+
+    if (reader == NULL) {
+        reader_error("Error: out of memory\n");
+        return NULL;
+    }
+    reader->pcmbitwidth = frontend_config.raw_pcm.in_bitwidth;
+    reader->pcmswapbytes = frontend_config.reader.swapbytes;
+    reader->pcm_is_unsigned_8bit = frontend_config.raw_pcm.in_signed == 1 ? 0 : 1;
+    if (is_mpeg_file_format(frontend_config.reader.input_format)) {
+        reader->music_in = open_mpeg_file(reader, gfp, inPath, &enc_delay, &enc_padding);
     }
     else {
 #ifdef LIBSNDFILE
         if (strcmp(inPath, "-") != 0) { /* not for stdin */
-            global. snd_file = open_snd_file(gfp, inPath);
+            reader->snd_file = open_snd_file(reader, gfp, inPath);
         }
 #endif
-        if (global.snd_file == 0) {
-            global. music_in = open_wave_file(gfp, inPath, &enc_delay, &enc_padding);
+        if (reader->snd_file == 0) {
+            reader->music_in = open_wave_file(reader, gfp, inPath, &enc_delay, &enc_padding);
         }
     }
-    initPcmBuffer(&global.pcm32, sizeof(int));
-    initPcmBuffer(&global.pcm16, sizeof(short));
-    setSkipStartAndEnd(gfp, enc_delay, enc_padding);
+    initPcmBuffer(&reader->pcm32, sizeof(int));
+    initPcmBuffer(&reader->pcm16, sizeof(short));
+    initPcmBuffer(&reader->pcmf, sizeof(float));
+    setSkipStartAndEnd(reader, gfp, enc_delay, enc_padding);
     {
         unsigned long n = lame_get_num_samples(gfp);
-        if (n != MAX_U_32_NUM) {
-            unsigned long const discard = global.pcm32.skip_start + global.pcm32.skip_end;
+        if (n != NUM_SAMPLES_UNKNOWN) {
+            unsigned long const discard = reader->pcm32.skip_start + reader->pcm32.skip_end;
             lame_set_num_samples(gfp, n > discard ? n - discard : 0);
         }
     }
-    return (global.snd_file != NULL || global.music_in != NULL) ? 1 : -1;
+    if (reader->snd_file == NULL && reader->music_in == NULL) {
+        close_infile(reader);
+        return NULL;
+    }
+    if (frontend_config.reader.swap_channel && lame_get_num_channels(gfp) != 2) {
+        reader_error("Error: --swap-channel needs an input with two channels\n");
+        close_infile(reader);
+        return NULL;
+    }
+    return reader;
 }
 
 int
-samples_to_skip_at_start(void)
+samples_to_skip_at_start(audio_reader const * reader)
 {
-    return global.pcm32.skip_start;
+    return reader->pcm32.skip_start;
 }
 
 int
-samples_to_skip_at_end(void)
+samples_to_skip_at_end(audio_reader const * reader)
 {
-    return global.pcm32.skip_end;
+    return reader->pcm32.skip_end;
 }
 
+/**
+ * @internal
+ * @brief Returns how many floating point input samples are above full scale
+ *        after the scaling of the encoder.
+ *
+ * @c get_audio_float() counts them while it reads. So the count covers the
+ * part of the file that was read so far. It starts at 0 for each input file. A
+ * sample at exactly full scale is not counted.
+ *
+ * @param reader  the reader of the input file.
+ * @return the number of samples. 0 if no sample was above full scale, or if
+ *         the input has no floating point samples.
+ */
+unsigned long
+samples_above_full_scale(audio_reader const * reader)
+{
+    return reader->num_samples_above_full_scale;
+}
+
+/**
+ * @internal
+ * @brief Tells whether the input file ended inside a sample frame.
+ *
+ * The samples of that last frame are not encoded. The result covers the part
+ * of the file that was read so far, and is 0 again for each new input file.
+ *
+ * @param reader  the reader of the input file.
+ * @return 1 if the input ended inside a frame, else 0.
+ */
+int
+input_ends_inside_a_frame(audio_reader const * reader)
+{
+    return reader->input_ends_inside_a_frame;
+}
+
+/**
+ * @internal
+ * @brief Tells whether the input file holds fewer samples than the encoder
+ *        delay and padding in its LAME tag.
+ *
+ * Such an input gives no samples. The result covers the part of the file that
+ * was read so far, and is 0 again for each new input file.
+ *
+ * @param reader  the reader of the input file.
+ * @return 1 if the input is shorter than its tag says, else 0.
+ */
+int
+input_shorter_than_its_tag(audio_reader const * reader)
+{
+    return reader->input_shorter_than_its_tag;
+}
+
+/**
+ * @internal
+ * @brief Tells whether the open input file contains floating point samples.
+ *
+ * The frontend reads such a file with @c get_audio_float() and encodes it with
+ * @c lame_encode_buffer_ieee_float(). @c get_audio() returns -1 for such a
+ * file.
+ *
+ * @param reader  the reader of the input file.
+ * @return nonzero for floating point samples, 0 otherwise.
+ */
+int
+input_is_float(audio_reader const * reader)
+{
+    return reader->pcm_is_ieee_float;
+}
+
+/**
+ * @internal
+ * @brief Closes the input file of a reader and frees the reader.
+ *
+ * @param reader  the reader from init_infile(), or NULL.
+ */
 void
-close_infile(void)
+close_infile(audio_reader * reader)
 {
+    if (reader == NULL)
+        return;
 #ifdef HAVE_MPG123
-    if (global.hip != 0) {
-        hip_decode_exit(global.hip); /* release mp3decoder memory */
-        global. hip = 0;
+    if (reader->hip != 0) {
+        hip_decode_exit(reader->hip); /* release mp3decoder memory */
     }
 #endif
-    close_input_file(global.music_in);
+    close_input_file(reader->music_in);
+    free(reader->in_buffer);
 #ifdef LIBSNDFILE
-    if (global.snd_file) {
-        if (sf_close(global.snd_file) != 0) {
-            if (global_ui_config.silent < 10) {
-                error_printf("Could not close sound file \n");
-            }
+    if (reader->snd_file) {
+        if (sf_close(reader->snd_file) != 0) {
+            reader_error("Could not close sound file \n");
         }
-        global. snd_file = 0;
     }
 #endif
-    freePcmBuffer(&global.pcm32);
-    freePcmBuffer(&global.pcm16);
-    global. music_in = 0;
-    free(global.in_id3v2_tag);
-    global.in_id3v2_tag = 0;
-    global.in_id3v2_size = 0;
+    freePcmBuffer(&reader->pcm32);
+    freePcmBuffer(&reader->pcm16);
+    freePcmBuffer(&reader->pcmf);
+    free(reader->in_id3v2_tag);
+    free(reader);
 }
 
 
+static int get_audio_common(audio_reader * reader, lame_t gfp, frame_dest const *dest);
+
+
+/**
+ * @internal
+ * @brief Converts a floating point sample to a 16 bit one, for the 16 bit
+ *        PCM that @c --decode writes.
+ *
+ * The function rounds the sample to 32 bits and keeps the top 16 bits.
+ * Integer samples are reduced to 16 bits in the same way. So both readers in
+ * this file return the same value, whichever one @c --with-fileio selected.
+ *
+ * @param u a finite sample, where 1.0 is full scale.
+ * @return the 16 bit sample. A sample at or above full scale gives the largest
+ *         or the smallest 16 bit value.
+ */
+static short
+float_sample_to_16bit(float u)
+{
+    /* Magnitude that a sample of 1.0 would map to at 32 bit. The two
+       full-scale magnitudes differ by one, but neither is representable in a
+       float: both round to 2^31, so a single factor scales both signs. Samples
+       of magnitude 1 or above are taken before scaling, so the product always
+       stays below 2^31 and the conversion cannot overflow. */
+    float const full_scale = -(float) INT_MIN;
+    int     wide;
+    if (u >= 1)
+        return SHRT_MAX;
+    if (u <= -1)
+        return SHRT_MIN;
+    if (u >= 0)
+        wide = (int) (u * full_scale + 0.5f);
+    else
+        wide = (int) (u * full_scale - 0.5f);
+    return (short) (wide >> (8 * sizeof(int) - 16));
+}
+
+/**
+ * @internal
+ * @brief Counts the samples that the encoder gets above full scale.
+ *
+ * Before counting, the function applies the same scaling as the encoder: the
+ * overall scale, the left and right scales, and the mix of two input channels
+ * into one mono output channel. It uses the values that @c lame_init_params()
+ * set. A sample that this scaling brings back within full scale is not
+ * counted.
+ *
+ * @param gfp  the encoder instance, after @c lame_init_params().
+ * @param l    the left channel, where 1.0 is full scale.
+ * @param r    the right channel. Not read for mono input.
+ * @param n    the number of samples per channel.
+ * @return the number of samples above full scale.
+ */
+static unsigned long
+count_above_full_scale(lame_t gfp, float const *l, float const *r, int n)
+{
+    float const gain = lame_get_scale(gfp);
+    float const gain_l = gain * lame_get_scale_left(gfp);
+    float const gain_r = gain * lame_get_scale_right(gfp);
+    unsigned long count = 0;
+    int     i;
+
+    if (lame_get_num_channels(gfp) == 2 && lame_get_mode(gfp) == MONO) {
+        float const mix_l = 0.5f * gain_l, mix_r = 0.5f * gain_r;
+        for (i = 0; i < n; ++i) {
+            float const u = mix_l * l[i] + mix_r * r[i];
+            count += (u > 1.0f) | (u < -1.0f);
+        }
+        return count;
+    }
+    for (i = 0; i < n; ++i) {
+        float const u = gain_l * l[i];
+        count += (u > 1.0f) | (u < -1.0f);
+    }
+    if (lame_get_num_channels(gfp) == 2) {
+        for (i = 0; i < n; ++i) {
+            float const v = gain_r * r[i];
+            count += (v > 1.0f) | (v < -1.0f);
+        }
+    }
+    return count;
+}
+
+/**
+ * @internal
+ * @brief Reads one frame of samples through a sample buffer, and swaps the
+ *        channels when the user asked for it.
+ *
+ * The samples go through the sample buffer only when it holds samples, or has
+ * samples to drop at the start or to hold back at the end. Otherwise they are
+ * read straight into @p dest, with the channels already swapped.
+ *
+ * @param reader  the reader of the input file.
+ * @param gfp     the encoder instance, after @c lame_init_params().
+ * @param pcm     the sample buffer for the sample type of @p dest.
+ * @param dest    the two channels of the output; @p left and @p right are the
+ *                same two arrays.
+ * @param left    the first channel of the output.
+ * @param right   the second channel of the output.
+ * @return the number of samples per channel. 0 at the end of the input, also
+ *         when the input is shorter than the delay and padding in its tag,
+ *         and a negative value on an error.
+ */
 static int
-        get_audio_common(lame_t gfp, int buffer[2][1152], short buffer16[2][1152]);
+read_frame(audio_reader * reader, lame_t gfp, PcmBuffer * pcm, frame_dest const *dest,
+           void *left, void *right)
+{
+    int     used = 0, read = 0;
+    if (pcm->u == 0 && pcm->skip_start == 0 && pcm->skip_end == 0) {
+        frame_dest swapped;
+        if (frontend_config.reader.swap_channel == 0)
+            return get_audio_common(reader, gfp, dest);
+        swapped.i[0] = dest->i[1];
+        swapped.i[1] = dest->i[0];
+        swapped.s[0] = dest->s[1];
+        swapped.s[1] = dest->s[0];
+        swapped.f[0] = dest->f[1];
+        swapped.f[1] = dest->f[0];
+        return get_audio_common(reader, gfp, &swapped);
+    }
+    do {
+        read = get_audio_common(reader, gfp, dest);
+        if (addPcmBuffer(pcm, left, right, read, &used) < 0)
+            return -1;
+    } while (used <= 0 && read > 0);
+    if (read < 0) {
+        return read;
+    }
+    if (used < 0) {
+        if (!reader->input_shorter_than_its_tag) {
+            reader->input_shorter_than_its_tag = 1;
+            reader_error("Error: the input holds fewer samples than the encoder delay and\n"
+                         "       padding in its LAME tag. It gives no samples.\n");
+        }
+        return 0;
+    }
+    if (frontend_config.reader.swap_channel == 0)
+        return takePcmBuffer(pcm, left, right, used, FRAME_BUFFER_SAMPLES);
+    else
+        return takePcmBuffer(pcm, right, left, used, FRAME_BUFFER_SAMPLES);
+}
 
 /************************************************************************
 *
@@ -742,20 +1087,12 @@ static int
 *
 ************************************************************************/
 int
-get_audio(lame_t gfp, int buffer[2][1152])
+get_audio(audio_reader * reader, lame_t gfp, int buffer[2][FRAME_BUFFER_SAMPLES])
 {
-    int     used = 0, read = 0;
-    do {
-        read = get_audio_common(gfp, buffer, NULL);
-        used = addPcmBuffer(&global.pcm32, buffer[0], buffer[1], read);
-    } while (used <= 0 && read > 0);
-    if (read < 0) {
-        return read;
-    }
-    if (global_reader.swap_channel == 0)
-        return takePcmBuffer(&global.pcm32, buffer[0], buffer[1], used, 1152);
-    else
-        return takePcmBuffer(&global.pcm32, buffer[1], buffer[0], used, 1152);
+    frame_dest dest = { { NULL, NULL }, { NULL, NULL }, { NULL, NULL } };
+    dest.i[0] = buffer[0];
+    dest.i[1] = buffer[1];
+    return read_frame(reader, gfp, &reader->pcm32, &dest, buffer[0], buffer[1]);
 }
 
 /*
@@ -763,80 +1100,148 @@ get_audio(lame_t gfp, int buffer[2][1152])
                 16 bit per sample output
 */
 int
-get_audio16(lame_t gfp, short buffer[2][1152])
+get_audio16(audio_reader * reader, lame_t gfp, short buffer[2][FRAME_BUFFER_SAMPLES])
 {
-    int     used = 0, read = 0;
-    do {
-        read = get_audio_common(gfp, NULL, buffer);
-        used = addPcmBuffer(&global.pcm16, buffer[0], buffer[1], read);
-    } while (used <= 0 && read > 0);
-    if (read < 0) {
-        return read;
+    frame_dest dest = { { NULL, NULL }, { NULL, NULL }, { NULL, NULL } };
+    dest.s[0] = buffer[0];
+    dest.s[1] = buffer[1];
+    return read_frame(reader, gfp, &reader->pcm16, &dest, buffer[0], buffer[1]);
+}
+
+/**
+ * @internal
+ * @brief Reads one frame of floating point samples.
+ *
+ * It works like @c get_audio(), which reads integer samples. The samples are
+ * not converted: 1.0 is full scale, as @c lame_encode_buffer_ieee_float()
+ * expects. The function counts the samples that are above full scale after
+ * scaling. @c samples_above_full_scale() returns this count.
+ *
+ * @param reader  the reader of the input file.
+ * @param gfp     the encoder instance, after @c lame_init_params().
+ * @param buffer  receives up to 1152 samples per channel.
+ * @return the number of samples per channel. 0 at the end of the input, and a
+ *         negative value on an error.
+ */
+int
+get_audio_float(audio_reader * reader, lame_t gfp, float buffer[2][FRAME_BUFFER_SAMPLES])
+{
+    frame_dest dest = { { NULL, NULL }, { NULL, NULL }, { NULL, NULL } };
+    int     n;
+
+    dest.f[0] = buffer[0];
+    dest.f[1] = buffer[1];
+    n = read_frame(reader, gfp, &reader->pcmf, &dest, buffer[0], buffer[1]);
+
+    if (n < 0) {
+        return n;
     }
-    if (global_reader.swap_channel == 0)
-        return takePcmBuffer(&global.pcm16, buffer[0], buffer[1], used, 1152);
-    else
-        return takePcmBuffer(&global.pcm16, buffer[1], buffer[0], used, 1152);
+    reader->num_samples_above_full_scale += count_above_full_scale(gfp, buffer[0], buffer[1], n);
+    return n;
 }
 
 /************************************************************************
   get_audio_common - central functionality of get_audio*
     in: gfp
-        buffer    output to the int buffer or 16-bit buffer
    out: buffer    int output    (if buffer != NULL)
-        buffer16  16-bit output (if buffer == NULL) 
+        buffer16  16-bit output (if buffer16 != NULL)
+        bufferf   float output  (if bufferf != NULL)
 returns: samples read
-note: either buffer or buffer16 must be allocated upon call
+note: exactly one of the three is given; a floating point file is read into
+      bufferf, or into buffer16 for --decode, never into buffer, and only a
+      floating point file into bufferf
 */
+
+/**
+ * @internal
+ * @brief Splits interleaved samples into the two channels of @p dst.
+ *
+ * The @p n samples per channel end at @p src_end, which the loop moves back to
+ * their start. Each sample passes through @p CONV. With one channel, the second
+ * channel of @p dst is set to zero.
+ */
+#define DEINTERLEAVE(dst, src_end, n, nch, CONV)                      \
+    do {                                                              \
+        int     k_;                                                   \
+        if ((nch) == 2) {                                             \
+            for (k_ = (n); --k_ >= 0;) {                              \
+                (dst)[1][k_] = CONV(*--(src_end));                    \
+                (dst)[0][k_] = CONV(*--(src_end));                    \
+            }                                                         \
+        }                                                             \
+        else {                                                        \
+            memset((dst)[1], 0, (n) * sizeof((dst)[1][0]));           \
+            for (k_ = (n); --k_ >= 0;)                                \
+                (dst)[0][k_] = CONV(*--(src_end));                    \
+        }                                                             \
+    } while (0)
+/** @internal @brief Keeps a sample as it is, for DEINTERLEAVE(). */
+#define SAMPLE_AS_IS(x)     (x)
+/** @internal @brief Keeps the top 16 bits of an int sample, for DEINTERLEAVE(). */
+#define INT_TO_16BIT(x)     ((x) >> (8 * sizeof(int) - 16))
+
+/**
+ * @internal
+ * @brief Returns the number of samples of a read that make up whole frames.
+ *
+ * A read returns fewer samples than it asked for only at the end of the input.
+ * When that number is not a multiple of the channel count, the input ends
+ * inside a frame. The samples of that frame are left out, and an error
+ * message says so once. The encoding then ends with the last whole frame.
+ *
+ * @param reader        the reader of the input file.
+ * @param samples_read  the number of samples that the read returned.
+ * @param num_channels  the number of channels of the input.
+ * @return the number of samples in whole frames.
+ */
 static int
-get_audio_common(lame_t gfp, int buffer[2][1152], short buffer16[2][1152])
+whole_frame_samples(audio_reader * reader, int samples_read, int num_channels)
 {
-    const int num_channels = lame_get_num_channels(gfp);
-    const int framesize = lame_get_framesize(gfp);
-    /* The input format cannot change while we are reading from it, so ask once:
-       the same answer decides whether buf_tmp16 gets filled and whether it is
-       read back, and saying so lets the compiler see that too. */
-    const int input_is_mpeg = is_mpeg_file_format(global_reader.input_format);
-    int     insamp[2 * 1152];
-    short   buf_tmp16[2][1152];
-    int     samples_read;
-    int     samples_to_read;
-    int     i;
+    int const partial = samples_read % num_channels;
 
-    /* sanity checks, that's what we expect to be true */
-    if ((num_channels < 1 || 2 < num_channels)
-      ||(framesize < 1 || 1152 < framesize)) {
-        if (global_ui_config.silent < 10) {
-            error_printf("Error: internal problem!\n");
-        }
-        return -1;
+    if (partial != 0 && !reader->input_ends_inside_a_frame) {
+        reader->input_ends_inside_a_frame = 1;
+        reader_error("Error: the input ends inside a sample frame. The samples of that frame\n"
+                     "       are not encoded.\n");
     }
+    return samples_read - partial;
+}
 
-    /* 
-     * NOTE: LAME can now handle arbritray size input data packets,
-     * so there is no reason to read the input data in chuncks of
-     * size "framesize".  EXCEPT:  the LAME graphical frame analyzer 
-     * will get out of sync if we read more than framesize worth of data.
-     */
-
-    samples_to_read = framesize;
+/**
+ * @internal
+ * @brief Returns how many samples per channel to read for the next frame.
+ *
+ * That is one frame, or less where the input's sample count says fewer are
+ * left. LAME takes input of any length, but the frame analyzer gets out of
+ * step if a read returns more than one frame.
+ *
+ * @param reader         the reader of the input file.
+ * @param gfp            the encoder.
+ * @param framesize      the samples per channel of one frame.
+ * @param input_is_mpeg  whether the input is MPEG audio.
+ * @return the number of samples per channel to read.
+ */
+static int
+frame_read_limit(audio_reader const * reader, lame_t gfp, int framesize, int input_is_mpeg)
+{
+    int     samples_to_read = framesize;
 
     /* if this flag has been set, then we are carefull to read
      * exactly num_samples and no more.  This is useful for .wav and .aiff
      * files which have id3 or other tags at the end.  Note that if you
-     * are using LIBSNDFILE, this is not necessary 
+     * are using LIBSNDFILE, this is not necessary
      */
-    if (global.count_samples_carefully) {
+    if (reader->count_samples_carefully) {
         unsigned long tmp_num_samples, remaining;
         /* get num_samples */
         if (input_is_mpeg) {
-            tmp_num_samples = global_decoder.mp3input_data.nsamp;
+            tmp_num_samples = frontend_config.decoder.mp3input_data.nsamp;
         }
         else {
             tmp_num_samples = lame_get_num_samples(gfp);
         }
-        if (global.num_samples_read < tmp_num_samples) {
-            remaining = tmp_num_samples - global.num_samples_read;
+        if (reader->num_samples_read < tmp_num_samples) {
+            remaining = tmp_num_samples - reader->num_samples_read;
         }
         else {
             remaining = 0;
@@ -848,132 +1253,215 @@ get_audio_common(lame_t gfp, int buffer[2][1152], short buffer16[2][1152])
                change samples_to_read to the wrong value in this case */
             samples_to_read = (int) remaining; /* bounded by framesize above */
     }
+    return samples_to_read;
+}
 
-    if (input_is_mpeg) {
-        if (buffer != NULL)
-            samples_read = read_samples_mp3(gfp, global.music_in, buf_tmp16);
-        else
-            samples_read = read_samples_mp3(gfp, global.music_in, buffer16);
-        if (samples_read < 0) {
-            return samples_read;
-        }
+/**
+ * @internal
+ * @brief Reads the next frame of floating point PCM input.
+ *
+ * @param reader           the reader of the input file.
+ * @param dest             receives the samples as float, or as 16 bit for
+ *                         @c --decode.
+ * @param num_channels     the number of channels, 1 or 2.
+ * @param samples_to_read  the samples per channel to read.
+ * @return the number of samples per channel, or a negative value on an error.
+ */
+static int
+read_frame_float(audio_reader * reader, frame_dest const *dest, int num_channels,
+                 int samples_to_read)
+{
+    int     samples_read;
+    int     i;
+    /* The samples as stored, 1.0 being full scale. get_audio_common() holds
+       the frame to FRAME_BUFFER_SAMPLES samples of one or two channels. */
+    float   fsamp[2 * FRAME_BUFFER_SAMPLES];
+    float const *q;
+
+    assert(num_channels == 1 || num_channels == 2);
+    if (reader->snd_file) {
+#ifdef LIBSNDFILE
+        samples_read = (int) sf_read_float(reader->snd_file, fsamp,
+                                           num_channels * samples_to_read);
+#else
+        samples_read = 0;
+#endif
     }
     else {
-        int    *p;
-        if (global.snd_file) {
+        samples_read =
+            read_samples_float(reader, reader->music_in, fsamp, num_channels * samples_to_read);
+    }
+    if (samples_read < 0) {
+        return samples_read;
+    }
+    samples_read = whole_frame_samples(reader, samples_read, num_channels);
+    q = fsamp + samples_read;
+    if (dest->f[0] == NULL) {
+        /* --decode writes 16 bit PCM, and a sample that is not a finite
+           number has no 16 bit value */
+        for (i = 0; i < samples_read; ++i) {
+            if (!float_is_finite(fsamp[i])) {
+                reader_error("Error: the input holds a sample that is not a finite number\n");
+                return -1;
+            }
+        }
+    }
+    samples_read /= num_channels;
+    if (dest->f[0] != NULL)
+        DEINTERLEAVE(dest->f, q, samples_read, num_channels, SAMPLE_AS_IS);
+    else
+        DEINTERLEAVE(dest->s, q, samples_read, num_channels, float_sample_to_16bit);
+    return samples_read;
+}
+
+/**
+ * @internal
+ * @brief Reads the next frame of integer PCM input.
+ *
+ * @param reader           the reader of the input file.
+ * @param dest             receives the samples as int, or as 16 bit for
+ *                         @c --decode.
+ * @param num_channels     the number of channels, 1 or 2.
+ * @param samples_to_read  the samples per channel to read.
+ * @return the number of samples per channel, or a negative value on an error.
+ */
+static int
+read_frame_int(audio_reader * reader, frame_dest const *dest, int num_channels,
+               int samples_to_read)
+{
+    assert(num_channels == 1 || num_channels == 2);
+    if (reader->snd_file) {
 #ifdef LIBSNDFILE
-            samples_read = sf_read_int(global.snd_file, insamp, num_channels * samples_to_read);
-#else
-            samples_read = 0;
-#endif
-        }
-        else {
-            samples_read =
-                read_samples_pcm(global.music_in, insamp, num_channels * samples_to_read);
-        }
+        int     insamp[2 * FRAME_BUFFER_SAMPLES];
+        int const items = num_channels * samples_to_read;
+        int     samples_read = sf_read_int(reader->snd_file, insamp, items);
+        int    *p;
+
         if (samples_read < 0) {
             return samples_read;
         }
+        samples_read = whole_frame_samples(reader, samples_read, num_channels);
         p = insamp + samples_read;
         samples_read /= num_channels;
-        if (buffer != NULL) { /* output to int buffer */
-            if (num_channels == 2) {
-                for (i = samples_read; --i >= 0;) {
-                    buffer[1][i] = *--p;
-                    buffer[0][i] = *--p;
-                }
-            }
-            else if (num_channels == 1) {
-                memset(buffer[1], 0, samples_read * sizeof(int));
-                for (i = samples_read; --i >= 0;) {
-                    buffer[0][i] = *--p;
-                }
-            }
-            else
-                assert(0);
-        }
-        else {          /* convert from int; output to 16-bit buffer */
-            if (num_channels == 2) {
-                for (i = samples_read; --i >= 0;) {
-                    buffer16[1][i] = *--p >> (8 * sizeof(int) - 16);
-                    buffer16[0][i] = *--p >> (8 * sizeof(int) - 16);
-                }
-            }
-            else if (num_channels == 1) {
-                memset(buffer16[1], 0, samples_read * sizeof(short));
-                for (i = samples_read; --i >= 0;) {
-                    buffer16[0][i] = *--p >> (8 * sizeof(int) - 16);
-                }
-            }
-            else
-                assert(0);
-        }
+        if (dest->i[0] != NULL)
+            DEINTERLEAVE(dest->i, p, samples_read, num_channels, SAMPLE_AS_IS);
+        else
+            DEINTERLEAVE(dest->s, p, samples_read, num_channels, INT_TO_16BIT);
+        return samples_read;
+#else
+        return 0;
+#endif
+    }
+    return read_samples_pcm(reader, dest, num_channels, samples_to_read);
+}
+
+static int
+get_audio_common(audio_reader * reader, lame_t gfp, frame_dest const *dest)
+{
+    const int num_channels = lame_get_num_channels(gfp);
+    const int framesize = lame_get_framesize(gfp);
+    /* The input format cannot change while we are reading from it, so ask once. */
+    const int input_is_mpeg = is_mpeg_file_format(frontend_config.reader.input_format);
+    int     samples_read;
+    int     samples_to_read;
+
+    /* sanity checks, that's what we expect to be true */
+    if ((num_channels < 1 || 2 < num_channels)
+      ||(framesize < 1 || FRAME_BUFFER_SAMPLES < framesize)
+      ||(dest->f[0] != NULL && !reader->pcm_is_ieee_float)
+      ||(dest->i[0] != NULL && reader->pcm_is_ieee_float)) {
+        reader_error("Error: internal problem!\n");
+        return -1;
     }
 
-    /* LAME mp3 output 16bit -  convert to int, if necessary */
-    if (input_is_mpeg) {
-        if (buffer != NULL) {
-            for (i = samples_read; --i >= 0;)
-                buffer[0][i] = (int) ((unsigned int) buf_tmp16[0][i] << (8 * sizeof(int) - 16));
-            if (num_channels == 2) {
-                for (i = samples_read; --i >= 0;)
-                    buffer[1][i] = (int) ((unsigned int) buf_tmp16[1][i] << (8 * sizeof(int) - 16));
-            }
-            else if (num_channels == 1) {
-                memset(buffer[1], 0, samples_read * sizeof(int));
-            }
-            else
-                assert(0);
-        }
-    }
+    samples_to_read = frame_read_limit(reader, gfp, framesize, input_is_mpeg);
 
+    if (input_is_mpeg)
+        samples_read = read_samples_mp3(reader, dest);
+    else if (reader->pcm_is_ieee_float)
+        samples_read = read_frame_float(reader, dest, num_channels, samples_to_read);
+    else
+        samples_read = read_frame_int(reader, dest, num_channels, samples_to_read);
+    if (samples_read < 0) {
+        return samples_read;
+    }
 
     /* if ... then it is considered infinitely long.
        Don't count the samples */
-    if (global.count_samples_carefully)
-        global. num_samples_read += samples_read;
+    if (reader->count_samples_carefully)
+        reader->num_samples_read += samples_read;
 
     return samples_read;
 }
 
+#undef DEINTERLEAVE
+#undef SAMPLE_AS_IS
+#undef INT_TO_16BIT
 
 
+
+/**
+ * @internal
+ * @brief Decodes the next frame of MPEG input into the two channels of
+ *        @p dest.
+ *
+ * The decoder's interleaved 16 bit samples are split, and for int output
+ * widened to the int's range, in one pass. From a mono stream, int output's
+ * second channel is cleared; 16 bit output's is left as it is.
+ *
+ * @param reader  the reader of the input file.
+ * @param dest    receives the samples as int, or as 16 bit for @c --decode.
+ * @return the number of samples per channel, or a negative value on an error.
+ */
 static int
-read_samples_mp3(LAME_UNUSED lame_t gfp, LAME_UNUSED FILE * musicin,
-                 LAME_UNUSED short int mpg123pcm[2][1152])
+read_samples_mp3(LAME_UNUSED audio_reader * reader, LAME_UNUSED frame_dest const *dest)
 {
     int     out;
 #ifdef HAVE_MPG123
     short int *outbuf;
     size_t outbytes;
+    int const stereo = frontend_config.decoder.mp3input_data.stereo;
+    int const shift = 8 * (int) sizeof(int) - 16;
+    int     i;
     static const char type_name[] = "MP3 file";
 
     /* Need to deinterleave so rather use mpg123_decode_frame() to decode the
        current frame and deinterleave from the internal buffer. */
-    out = mpg123_decode_frame(global.hip->mh, NULL, (unsigned char**)&outbuf, &outbytes);
+    out = mpg123_decode_frame(reader->hip->mh, NULL, (unsigned char**)&outbuf, &outbytes);
     if (out != MPG123_OK && out != MPG123_DONE)
     {
         if (out == MPG123_NEW_FORMAT)
         {
-            if (global_ui_config.silent < 10) {
-                error_printf("Error: format changed in %s - not supported\n",
-                    type_name);
-            }
+            reader_error("Error: format changed in %s - not supported\n", type_name);
         }
         return -1;
     }
-    out = (int)(outbytes/(sizeof(short)*global_decoder.mp3input_data.stereo));
-    if (global_decoder.mp3input_data.stereo == 2) {
-        int i;
-        for (i=0; i<out; ++i) {
-            mpg123pcm[0][i] = *outbuf++;
-            mpg123pcm[1][i] = *outbuf++;
+    out = (int)(outbytes/(sizeof(short)*stereo));
+    if (dest->i[0] != NULL) {
+        int    *const l = dest->i[0];
+        int    *const r = dest->i[1];
+        if (stereo == 2) {
+            for (i = 0; i < out; ++i) {
+                l[i] = (int) ((unsigned int) outbuf[2 * i] << shift);
+                r[i] = (int) ((unsigned int) outbuf[2 * i + 1] << shift);
+            }
+        }
+        else {
+            for (i = 0; i < out; ++i)
+                l[i] = (int) ((unsigned int) outbuf[i] << shift);
+            memset(r, 0, out * sizeof(int));
         }
     }
-    else
-        memcpy(mpg123pcm[0], outbuf, sizeof(short)*out);
-    if(global.hip->pinfo)
-        hip_finish_pinfo(global.hip);
+    else if (stereo == 2) {
+        for (i = 0; i < out; ++i) {
+            dest->s[0][i] = outbuf[2 * i];
+            dest->s[1][i] = outbuf[2 * i + 1];
+        }
+    }
+    else if (out > 0)
+        memcpy(dest->s[0], outbuf, sizeof(short)*out);
+    if(reader->hip->pinfo)
+        hip_finish_pinfo(reader->hip);
 #else
     out = -1;
 #endif
@@ -985,9 +1473,7 @@ int set_input_num_channels(lame_t gfp, int num_channels)
 {
     if (gfp) {
         if (-1 == lame_set_num_channels(gfp, num_channels)) {
-            if (global_ui_config.silent < 10) {
-                error_printf("Unsupported number of channels: %d\n", num_channels);
-            }
+            reader_error("Unsupported number of channels: %d\n", num_channels);
             return 0;
         }
     }
@@ -998,32 +1484,56 @@ static
 int set_input_samplerate(lame_t gfp, int input_samplerate)
 {
     if (gfp) {
-        int sr = global_reader.input_samplerate;
+        int sr = frontend_config.reader.input_samplerate;
         if (sr == 0) sr = input_samplerate;
         if (-1 == lame_set_in_samplerate(gfp, sr)) {
-            if (global_ui_config.silent < 10) {
-                error_printf("Unsupported sample rate: %d\n", sr);
-            }
+            reader_error("Unsupported sample rate: %d\n", sr);
             return 0;
         }
     }
     return 1;
 }
 
+/**
+ * @internal
+ * @brief Returns the data size for the header of a decoded WAV file.
+ *
+ * Prints a message when there are no samples, and when the data is larger
+ * than a WAV header can hold.
+ *
+ * @param frames           the number of samples per channel.
+ * @param bytes_per_frame  the size of one sample of all channels, in bytes.
+ * @return the size of the data in bytes. 0 when there are no samples, and
+ *         @c WAV_DATA_SIZE_MAX when the data is larger.
+ */
+unsigned int
+wav_data_size(double frames, int bytes_per_frame)
+{
+    if (frames <= 0) {
+        reader_error("WAVE file contains 0 PCM samples\n");
+        return 0;
+    }
+    if (frames > WAV_DATA_SIZE_MAX / bytes_per_frame) {
+        reader_error("Very huge WAVE file, can't set filesize accordingly\n");
+        return WAV_DATA_SIZE_MAX;
+    }
+    return (unsigned int) (frames * bytes_per_frame);
+}
+
 int
-WriteWaveHeader(FILE * const fp, int pcmbytes, int freq, int channels, int bits)
+WriteWaveHeader(FILE * const fp, unsigned int pcmbytes, int freq, int channels, int bits)
 {
     int     bytes = (bits + 7) / 8;
 
     /* quick and dirty, but documented */
     fwrite("RIFF", 1, 4, fp); /* label */
-    write_32_bits_low_high(fp, (unsigned int) pcmbytes + 44u - 8u); /* length in bytes without header */
+    write_32_bits_low_high(fp, pcmbytes + 44u - 8u); /* length in bytes without header */
     fwrite("WAVEfmt ", 2, 4, fp); /* 2 labels */
     write_32_bits_low_high(fp, 2 + 2 + 4 + 4 + 2 + 2); /* length of PCM format declaration area */
     write_16_bits_low_high(fp, 1); /* is PCM? */
     write_16_bits_low_high(fp, channels); /* number of channels */
     write_32_bits_low_high(fp, freq); /* sample frequency in [Hz] */
-    write_32_bits_low_high(fp, freq * channels * bytes); /* bytes per second */
+    write_32_bits_low_high(fp, (unsigned int) freq * (unsigned int) (channels * bytes)); /* bytes per second */
     write_16_bits_low_high(fp, channels * bytes); /* bytes per sample time */
     write_16_bits_low_high(fp, bits); /* bits per sample */
     fwrite("data", 1, 4, fp); /* label */
@@ -1040,7 +1550,7 @@ WriteWaveHeader(FILE * const fp, int pcmbytes, int freq, int channels, int bits)
 extern SNDFILE *sf_wchar_open(wchar_t const *wpath, int mode, SF_INFO * sfinfo);
 
 static SNDFILE *
-open_snd_file(lame_t gfp, char const *inPath)
+open_snd_file(audio_reader * reader, lame_t gfp, char const *inPath)
 {
     char const *lpszFileName = inPath;
     SNDFILE *gs_pSndFileIn = NULL;
@@ -1057,14 +1567,19 @@ open_snd_file(lame_t gfp, char const *inPath)
 #else
         gs_pSndFileIn = sf_open(lpszFileName, SFM_READ, &gs_wfInfo);
 #endif
+        if (gs_pSndFileIn != NULL && frontend_config.reader.swapbytes) {
+            reader_error("WARNING: libsndfile takes the byte order from the file's header;\n"
+                         "-x applies only to raw input (-r)\n");
+        }
 
         /* Only a caller who asked for headerless PCM gets it. libsndfile
            cannot recognise raw input, so -r is the only thing that can say
            the file is meant to be read that way; without it an unrecognised
            file is an unrecognised file, and LAME's own reader - which
            refuses it - gets its turn instead. */
-        if (gs_pSndFileIn == NULL && global_reader.input_format == sf_raw) {
-            if (global_raw_pcm.in_signed == 0 && global_raw_pcm.in_bitwidth != 8) {
+        if (gs_pSndFileIn == NULL && frontend_config.reader.input_format == sf_raw) {
+            if (frontend_config.raw_pcm.in_signed == 0
+                && frontend_config.raw_pcm.in_bitwidth != 8) {
                 error_printf("Unsigned input only supported with bitwidth 8\n");
 #if defined( _WIN32 ) && !defined(__MINGW32__)
                 free(file_name);
@@ -1076,17 +1591,17 @@ open_snd_file(lame_t gfp, char const *inPath)
             gs_wfInfo.samplerate = lame_get_in_samplerate(gfp);
             gs_wfInfo.channels = lame_get_num_channels(gfp);
             gs_wfInfo.format = SF_FORMAT_RAW;
-            if ((global_raw_pcm.in_endian == ByteOrderLittleEndian) ^ (global_reader.swapbytes !=
-                                                                       0)) {
+            if ((frontend_config.raw_pcm.in_endian == ByteOrderLittleEndian)
+                ^ (frontend_config.reader.swapbytes != 0)) {
                 gs_wfInfo.format |= SF_ENDIAN_LITTLE;
             }
             else {
                 gs_wfInfo.format |= SF_ENDIAN_BIG;
             }
-            switch (global_raw_pcm.in_bitwidth) {
+            switch (frontend_config.raw_pcm.in_bitwidth) {
             case 8:
                 gs_wfInfo.format |=
-                    global_raw_pcm.in_signed == 0 ? SF_FORMAT_PCM_U8 : SF_FORMAT_PCM_S8;
+                    frontend_config.raw_pcm.in_signed == 0 ? SF_FORMAT_PCM_U8 : SF_FORMAT_PCM_S8;
                 break;
             case 16:
                 gs_wfInfo.format |= SF_FORMAT_PCM_16;
@@ -1113,133 +1628,26 @@ open_snd_file(lame_t gfp, char const *inPath)
         /* Check result */
         if (gs_pSndFileIn == NULL) {
             sf_perror(gs_pSndFileIn);
-            if (global_ui_config.silent < 10) {
-                error_printf("Could not open sound file \"%s\".\n", lpszFileName);
-            }
+            reader_error("Could not open sound file \"%s\".\n", lpszFileName);
             return 0;
         }
-        sf_command(gs_pSndFileIn, SFC_SET_SCALE_FLOAT_INT_READ, NULL, SF_TRUE);
+        switch (gs_wfInfo.format & SF_FORMAT_SUBMASK) {
+        case SF_FORMAT_FLOAT:
+        case SF_FORMAT_DOUBLE:
+            reader->pcm_is_ieee_float = 1;
+            break;
+        default:
+            break;
+        }
 
         if ((gs_wfInfo.format & SF_FORMAT_RAW) == SF_FORMAT_RAW) {
-            global_reader.input_format = sf_raw;
+            frontend_config.reader.input_format = sf_raw;
         }
 
-#ifdef _DEBUG_SND_FILE
-        printf("\n\nSF_INFO structure\n");
-        printf("samplerate        :%d\n", gs_wfInfo.samplerate);
-        printf("samples           :%d\n", gs_wfInfo.frames);
-        printf("channels          :%d\n", gs_wfInfo.channels);
-        printf("format            :");
-
-        /* new formats from sbellon@sbellon.de  1/2000 */
-
-        switch (gs_wfInfo.format & SF_FORMAT_TYPEMASK) {
-        case SF_FORMAT_WAV:
-            printf("Microsoft WAV format (big endian). ");
-            break;
-        case SF_FORMAT_AIFF:
-            printf("Apple/SGI AIFF format (little endian). ");
-            break;
-        case SF_FORMAT_AU:
-            printf("Sun/NeXT AU format (big endian). ");
-            break;
-            /*
-               case SF_FORMAT_AULE:
-               DEBUGF("DEC AU format (little endian). ");
-               break;
-             */
-        case SF_FORMAT_RAW:
-            printf("RAW PCM data. ");
-            break;
-        case SF_FORMAT_PAF:
-            printf("Ensoniq PARIS file format. ");
-            break;
-        case SF_FORMAT_SVX:
-            printf("Amiga IFF / SVX8 / SV16 format. ");
-            break;
-        case SF_FORMAT_NIST:
-            printf("Sphere NIST format. ");
-            break;
-        default:
-            assert(0);
-            break;
-        }
-
-        switch (gs_wfInfo.format & SF_FORMAT_SUBMASK) {
-            /*
-               case SF_FORMAT_PCM:
-               DEBUGF("PCM data in 8, 16, 24 or 32 bits.");
-               break;
-             */
-        case SF_FORMAT_FLOAT:
-            printf("32 bit Intel x86 floats.");
-            break;
-        case SF_FORMAT_ULAW:
-            printf("U-Law encoded.");
-            break;
-        case SF_FORMAT_ALAW:
-            printf("A-Law encoded.");
-            break;
-        case SF_FORMAT_IMA_ADPCM:
-            printf("IMA ADPCM.");
-            break;
-        case SF_FORMAT_MS_ADPCM:
-            printf("Microsoft ADPCM.");
-            break;
-            /*
-               case SF_FORMAT_PCM_BE:
-               DEBUGF("Big endian PCM data.");
-               break;
-               case SF_FORMAT_PCM_LE:
-               DEBUGF("Little endian PCM data.");
-               break;
-             */
-        case SF_FORMAT_PCM_S8:
-            printf("Signed 8 bit PCM.");
-            break;
-        case SF_FORMAT_PCM_U8:
-            printf("Unsigned 8 bit PCM.");
-            break;
-        case SF_FORMAT_PCM_16:
-            printf("Signed 16 bit PCM.");
-            break;
-        case SF_FORMAT_PCM_24:
-            printf("Signed 24 bit PCM.");
-            break;
-        case SF_FORMAT_PCM_32:
-            printf("Signed 32 bit PCM.");
-            break;
-            /*
-               case SF_FORMAT_SVX_FIB:
-               DEBUGF("SVX Fibonacci Delta encoding.");
-               break;
-               case SF_FORMAT_SVX_EXP:
-               DEBUGF("SVX Exponential Delta encoding.");
-               break;
-             */
-        default:
-            assert(0);
-            break;
-        }
-
-        printf("\n");
-        printf("sections          :%d\n", gs_wfInfo.sections);
-        printf("seekable          :%d\n", gs_wfInfo.seekable);
-#endif
-        /* Check result */
-        if (gs_pSndFileIn == NULL) {
-            sf_perror(gs_pSndFileIn);
-            if (global_ui_config.silent < 10) {
-                error_printf("Could not open sound file \"%s\".\n", lpszFileName);
-            }
-            return 0;
-        }
-
-
-        if(gs_wfInfo.frames >= 0 && gs_wfInfo.frames < (sf_count_t)(unsigned)MAX_U_32_NUM)
+        if(gs_wfInfo.frames >= 0 && gs_wfInfo.frames < (sf_count_t)(unsigned)NUM_SAMPLES_UNKNOWN)
             (void) lame_set_num_samples(gfp, gs_wfInfo.frames);
         else
-            (void) lame_set_num_samples(gfp, MAX_U_32_NUM);
+            (void) lame_set_num_samples(gfp, NUM_SAMPLES_UNKNOWN);
         if (!set_input_num_channels(gfp, gs_wfInfo.channels)) {
             sf_close(gs_pSndFileIn);
             return 0;
@@ -1248,18 +1656,8 @@ open_snd_file(lame_t gfp, char const *inPath)
             sf_close(gs_pSndFileIn);
             return 0;
         }
-        global. pcmbitwidth = 32;
+        reader->pcmbitwidth = 32;
     }
-#if 0
-    if (lame_get_num_samples(gfp) == MAX_U_32_NUM) {
-        /* try to figure out num_samples */
-        double const flen = lame_get_file_size(lpszFileName);
-        if (flen >= 0) {
-            /* try file size, assume 2 bytes per sample */
-            lame_set_num_samples(gfp, flen / (2 * lame_get_num_channels(gfp)));
-        }
-    }
-#endif
     return gs_pSndFileIn;
 }
 
@@ -1267,157 +1665,215 @@ open_snd_file(lame_t gfp, char const *inPath)
 
 
 
-/************************************************************************
-unpack_read_samples - read and unpack signed low-to-high byte or unsigned
-                      single byte input. (used for read_samples function)
-                      Output integers are stored in the native byte order
-                      (little or big endian).  -jd
-  in: samples_to_read
-      bytes_per_sample
-      swap_order    - set for high-to-low byte order input stream
- i/o: pcm_in
- out: sample_buffer  (must be allocated up to samples_to_read upon call)
-returns: number of samples read
-*/
+/** @internal @brief The widest integer PCM sample the reader takes, in bytes. */
+#define PCM_MAX_SAMPLE_BYTES 4
+
+/* One integer PCM sample at p, assembled into the high end of an int through
+   unsigned shifts: a byte >= 0x80 shifted into the sign position would
+   otherwise overflow the signed int. unsigned int has the same width as int,
+   so every shift amount here stays below the width; the unsigned result
+   converts back to the same two's-complement sample value on assignment.
+   b is the width of an int in bits. */
+#define PCM_S8(p)       (int) ((unsigned int) (p)[0] << (b - 8))
+#define PCM_U8(p)       (int) ((unsigned int) ((p)[0] ^ 0x80) << (b - 8))
+#define PCM_S16LE(p)    (int) ((unsigned int) (p)[0] << (b - 16) | (unsigned int) (p)[1] << (b - 8))
+#define PCM_S16BE(p)    (int) ((unsigned int) (p)[0] << (b - 8) | (unsigned int) (p)[1] << (b - 16))
+#define PCM_S24LE(p)    (int) ((unsigned int) (p)[0] << (b - 24) | (unsigned int) (p)[1] << (b - 16) \
+                               | (unsigned int) (p)[2] << (b - 8))
+#define PCM_S24BE(p)    (int) ((unsigned int) (p)[0] << (b - 8) | (unsigned int) (p)[1] << (b - 16) \
+                               | (unsigned int) (p)[2] << (b - 24))
+#define PCM_S32LE(p)    (int) ((unsigned int) (p)[0] << (b - 32) | (unsigned int) (p)[1] << (b - 24) \
+                               | (unsigned int) (p)[2] << (b - 16) | (unsigned int) (p)[3] << (b - 8))
+#define PCM_S32BE(p)    (int) ((unsigned int) (p)[0] << (b - 8) | (unsigned int) (p)[1] << (b - 16) \
+                               | (unsigned int) (p)[2] << (b - 24) | (unsigned int) (p)[3] << (b - 32))
+
+/* Converts the n sample frames in raw with SAMPLE into the channels out[0]
+   and out[1]. */
+#define PCM_SPLIT(SAMPLE)                                                   \
+    do {                                                                    \
+        unsigned char const *p_ = raw;                                      \
+        int     k_;                                                         \
+        if (num_channels == 2) {                                            \
+            for (k_ = 0; k_ < n; ++k_, p_ += 2 * bytes) {                   \
+                out[0][k_] = SAMPLE(p_);                                    \
+                out[1][k_] = SAMPLE(p_ + bytes);                            \
+            }                                                               \
+        }                                                                   \
+        else {                                                              \
+            for (k_ = 0; k_ < n; ++k_, p_ += bytes)                         \
+                out[0][k_] = SAMPLE(p_);                                    \
+        }                                                                   \
+    } while (0)
+
+/**
+ * @internal
+ * @brief Reads the next frame of integer PCM through the C library and
+ *        converts it into the two channels of @p dest.
+ *
+ * Every sample width (8, 16, 24 and 32 bits) and both byte orders go through
+ * one pass from the file's bytes to the channels. Mono output gets a second
+ * channel of zeros. Unsigned samples are taken with 8 bits only.
+ *
+ * @param reader           the reader of the input file.
+ * @param dest             receives the samples as int, or as 16 bit for
+ *                         @c --decode.
+ * @param num_channels     the number of channels, 1 or 2.
+ * @param samples_to_read  the samples per channel to read.
+ * @return the number of samples per channel, or a negative value on an error.
+ */
 static int
-unpack_read_samples(const int samples_to_read, const int bytes_per_sample,
-                    const int swap_order, int *sample_buffer, FILE * pcm_in)
+read_samples_pcm(audio_reader * reader, frame_dest const *dest, int num_channels,
+                 int samples_to_read)
 {
-    int     samples_read;
-    int     i;
-    int    *op;              /* output pointer */
-    unsigned char *ip = (unsigned char *) sample_buffer; /* input pointer */
-    const int b = sizeof(int) * 8;
+    unsigned char raw[2 * FRAME_BUFFER_SAMPLES * PCM_MAX_SAMPLE_BYTES];
+    int     narrow[2][FRAME_BUFFER_SAMPLES]; /* the int samples when dest takes 16 bit */
+    int    *out[2];
+    int const bytes = reader->pcmbitwidth / 8;
+    int const b = 8 * (int) sizeof(int);
+    int const items = num_channels * samples_to_read;
+    int     other_form;         /* big endian; for 8 bits, unsigned */
+    int     n;
+    FILE   *musicin = reader->music_in;
 
-    {
-        size_t  samples_read_ = fread(sample_buffer, bytes_per_sample, samples_to_read, pcm_in);
-        assert( samples_read_ <= INT_MAX );
-        samples_read = (int) samples_read_;
-    }
-    op = sample_buffer + samples_read;
-
-#define GA_URS_IFLOOP( ga_urs_bps ) \
-    if( bytes_per_sample == ga_urs_bps ) \
-      for( i = samples_read * bytes_per_sample; (i -= bytes_per_sample) >=0;)
-
-    /* Bytes are assembled into the high end of an int through unsigned shifts:
-       a byte >= 0x80 shifted into the sign position would otherwise overflow the
-       signed int. unsigned int has the same width as int, so every shift amount
-       here stays below the width; the unsigned result converts back to the same
-       two's-complement sample value on assignment. */
-    if (swap_order == 0) {
-        GA_URS_IFLOOP(1)
-            * --op = (int) ((unsigned int) ip[i] << (b - 8));
-        GA_URS_IFLOOP(2)
-            * --op = (int) ((unsigned int) ip[i] << (b - 16) | (unsigned int) ip[i + 1] << (b - 8));
-        GA_URS_IFLOOP(3)
-            * --op = (int) ((unsigned int) ip[i] << (b - 24) | (unsigned int) ip[i + 1] << (b - 16) | (unsigned int) ip[i + 2] << (b - 8));
-        GA_URS_IFLOOP(4)
-            * --op = (int) ((unsigned int) ip[i] << (b - 32) | (unsigned int) ip[i + 1] << (b - 24) | (unsigned int) ip[i + 2] << (b - 16) | (unsigned int) ip[i + 3] << (b - 8));
-    }
-    else {
-        GA_URS_IFLOOP(1)
-            * --op = (int) ((unsigned int) (ip[i] ^ 0x80) << (b - 8) | (unsigned int) 0x7f << (b - 16)); /* convert from unsigned */
-        GA_URS_IFLOOP(2)
-            * --op = (int) ((unsigned int) ip[i] << (b - 8) | (unsigned int) ip[i + 1] << (b - 16));
-        GA_URS_IFLOOP(3)
-            * --op = (int) ((unsigned int) ip[i] << (b - 8) | (unsigned int) ip[i + 1] << (b - 16) | (unsigned int) ip[i + 2] << (b - 24));
-        GA_URS_IFLOOP(4)
-            * --op = (int) ((unsigned int) ip[i] << (b - 8) | (unsigned int) ip[i + 1] << (b - 16) | (unsigned int) ip[i + 2] << (b - 24) | (unsigned int) ip[i + 3] << (b - 32));
-    }
-#undef GA_URS_IFLOOP
-    if (global.pcm_is_ieee_float) {
-        /* Magnitude that a sample of 1.0 would map to. The two full-scale
-           magnitudes differ by one, but neither is representable in a float:
-           both round to 2^31, so a single factor scales both signs. Samples
-           of magnitude 1 or above are clamped before scaling, so the product
-           always stays below 2^31 and the conversion cannot overflow. */
-        ieee754_float32_t const full_scale = -(ieee754_float32_t) INT_MIN;
-        ieee754_float32_t *x = (ieee754_float32_t *) sample_buffer;
-        assert(sizeof(ieee754_float32_t) == sizeof(int));
-        for (i = 0; i < samples_to_read; ++i) {
-            ieee754_float32_t const u = x[i];
-            int     v;
-            if (u >= 1) {
-                v = INT_MAX;
-            }
-            else if (u <= -1) {
-                v = INT_MIN;
-            }
-            else if (u >= 0) {
-                v = (int) (u * full_scale + 0.5f);
-            }
-            else {
-                v = (int) (u * full_scale - 0.5f);
-            }
-            sample_buffer[i] = v;
-        }
-    }
-    return (samples_read);
-}
-
-
-
-/************************************************************************
-*
-* read_samples()
-*
-* PURPOSE:  reads the PCM samples from a file to the buffer
-*
-*  SEMANTICS:
-* Reads #samples_read# number of shorts from #musicin# filepointer
-* into #sample_buffer[]#.  Returns the number of samples read.
-*
-************************************************************************/
-
-static int
-read_samples_pcm(FILE * musicin, int sample_buffer[2304], int samples_to_read)
-{
-    int     samples_read;
-    int     bytes_per_sample = global.pcmbitwidth / 8;
-    int     swap_byte_order; /* byte order of input stream */
-
-    switch (global.pcmbitwidth) {
+    switch (reader->pcmbitwidth) {
     case 32:
     case 24:
     case 16:
-        if (global_raw_pcm.in_signed == 0) {
-            if (global_ui_config.silent < 10) {
-                error_printf("Unsigned input only supported with bitwidth 8\n");
-            }
+        if (frontend_config.raw_pcm.in_signed == 0) {
+            reader_error("Unsigned input only supported with bitwidth 8\n");
             return -1;
         }
-        swap_byte_order = (global_raw_pcm.in_endian != ByteOrderLittleEndian) ? 1 : 0;
-        if (global.pcmswapbytes) {
-            swap_byte_order = !swap_byte_order;
+        other_form = (frontend_config.raw_pcm.in_endian != ByteOrderLittleEndian) ? 1 : 0;
+        if (reader->pcmswapbytes) {
+            other_form = !other_form;
         }
         break;
 
     case 8:
-        swap_byte_order = global.pcm_is_unsigned_8bit;
+        other_form = reader->pcm_is_unsigned_8bit;
         break;
 
     default:
-        if (global_ui_config.silent < 10) {
-            error_printf("Only 8, 16, 24 and 32 bit input files supported \n");
-        }
+        reader_error("Only 8, 16, 24 and 32 bit input files supported \n");
         return -1;
     }
-    if (samples_to_read < 0 || samples_to_read > 2304) {
-        if (global_ui_config.silent < 10) {
-            error_printf("Error: unexpected number of samples to read: %d\n", samples_to_read);
-        }
+    if (items < 0 || items > 2 * FRAME_BUFFER_SAMPLES) {
+        reader_error("Error: unexpected number of samples to read: %d\n", items);
         return -1;
     }
-    samples_read = unpack_read_samples(samples_to_read, bytes_per_sample, swap_byte_order,
-                                       sample_buffer, musicin);
+    {
+        size_t const got = fread(raw, (size_t) bytes, (size_t) items, musicin);
+        assert(got <= (size_t) items);
+        n = (int) got;
+    }
     if (ferror(musicin)) {
-        if (global_ui_config.silent < 10) {
-            error_printf("Error reading input file\n");
-        }
+        reader_error("Error reading input file\n");
         return -1;
     }
+    n = whole_frame_samples(reader, n, num_channels) / num_channels;
 
+    if (dest->i[0] != NULL) {
+        out[0] = dest->i[0];
+        out[1] = dest->i[1];
+    }
+    else {
+        out[0] = narrow[0];
+        out[1] = narrow[1];
+    }
+    if (bytes == 1) {
+        if (other_form)
+            PCM_SPLIT(PCM_U8);
+        else
+            PCM_SPLIT(PCM_S8);
+    }
+    else if (bytes == 2) {
+        if (other_form)
+            PCM_SPLIT(PCM_S16BE);
+        else
+            PCM_SPLIT(PCM_S16LE);
+    }
+    else if (bytes == 3) {
+        if (other_form)
+            PCM_SPLIT(PCM_S24BE);
+        else
+            PCM_SPLIT(PCM_S24LE);
+    }
+    else {
+        if (other_form)
+            PCM_SPLIT(PCM_S32BE);
+        else
+            PCM_SPLIT(PCM_S32LE);
+    }
+    if (num_channels == 1)
+        memset(out[1], 0, n * sizeof(int));
+    if (dest->i[0] == NULL) {
+        int     ch, k;
+        for (ch = 0; ch < 2; ++ch)
+            for (k = 0; k < n; ++k)
+                dest->s[ch][k] = (short) (out[ch][k] >> (b - 16));
+    }
+    return n;
+}
+
+#undef PCM_SPLIT
+#undef PCM_S8
+#undef PCM_U8
+#undef PCM_S16LE
+#undef PCM_S16BE
+#undef PCM_S24LE
+#undef PCM_S24BE
+#undef PCM_S32LE
+#undef PCM_S32BE
+
+
+/**
+ * @internal
+ * @brief Reads 32 bit floating point samples, in the byte order of the host.
+ *
+ * The byte order of the file is decided in the same way as for integer
+ * samples: little endian, unless the format or @c --swap-bytes says otherwise.
+ * If it differs from the byte order of the host, the four bytes of each sample
+ * are reversed.
+ *
+ * @param reader           the reader of the input file.
+ * @param musicin          the input file.
+ * @param sample_buffer    receives the samples, interleaved.
+ * @param samples_to_read  the number of samples to read, at most 2304.
+ * @return the number of samples read. A negative value on an error.
+ */
+static int
+read_samples_float(audio_reader * reader, FILE * musicin,
+                   float sample_buffer[2 * FRAME_BUFFER_SAMPLES],
+                   int samples_to_read)
+{
+    compiletime_assert(sizeof(float) == 4);
+    int     file_is_big_endian =
+        (frontend_config.raw_pcm.in_endian != ByteOrderLittleEndian) ? 1 : 0;
+    int     samples_read, i;
+
+    if (reader->pcmswapbytes) {
+        file_is_big_endian = !file_is_big_endian;
+    }
+    if (samples_to_read < 0 || samples_to_read > 2 * FRAME_BUFFER_SAMPLES) {
+        reader_error("Error: unexpected number of samples to read: %d\n", samples_to_read);
+        return -1;
+    }
+    samples_read = (int) fread(sample_buffer, 4, (size_t) samples_to_read, musicin);
+    if (ferror(musicin)) {
+        reader_error("Error reading input file\n");
+        return -1;
+    }
+    if (file_is_big_endian != (machine_byte_order() == ByteOrderBigEndian)) {
+        unsigned char *b = (unsigned char *) sample_buffer;
+        for (i = 0; i < samples_read; ++i, b += 4) {
+            unsigned char t = b[0];
+            b[0] = b[3];
+            b[3] = t;
+            t = b[1];
+            b[1] = b[2];
+            b[2] = t;
+        }
+    }
     return samples_read;
 }
 
@@ -1451,12 +1907,60 @@ static uint16_t const WAVE_FORMAT_IEEE_FLOAT = 0x0003;
 #ifndef WAVE_FORMAT_EXTENSIBLE
 static uint16_t const WAVE_FORMAT_EXTENSIBLE = 0xFFFE;
 #endif
+#ifndef WAVE_FORMAT_MPEG
+static uint16_t const WAVE_FORMAT_MPEG = 0x0050;
+#endif
+#ifndef WAVE_FORMAT_MPEGLAYER3
+static uint16_t const WAVE_FORMAT_MPEGLAYER3 = 0x0055;
+#endif
+
+/** The number of chunks the WAV reader reads at most to find the data chunk. */
+#define WAV_MAX_CHUNKS 20
 
 
 static uint32_t
 make_even_number_of_bytes_in_length(uint32_t x)
 {
     return x + (x & 0x01);
+}
+
+/**
+ * @internal
+ * @brief Reads the size field of a chunk, and rounds the size up to an even
+ *        number of bytes.
+ *
+ * @param sf          the input file, at the size field.
+ * @param big_endian  1 for an AIFF file, 0 for a WAV file.
+ * @param size        receives the size of the chunk body, padding included.
+ * @return 0, or -1 when the field cannot be read.
+ */
+static int
+read_chunk_size(FILE * sf, int big_endian, uint32_t * size)
+{
+    if (big_endian ? read_32_bits_high_low(sf, size) : read_32_bits_low_high(sf, size))
+        return -1;
+    *size = make_even_number_of_bytes_in_length(*size);
+    return 0;
+}
+
+/**
+ * @internal
+ * @brief Takes the size field and the body of an AIFF chunk from the bytes of
+ *        the FORM chunk that are left.
+ *
+ * @param remaining  the bytes left in the FORM chunk, at least 4.
+ * @param size       the size of the chunk body, padding included.
+ * @param min_size   the smallest body this chunk type can have.
+ * @return 0, or -1 when the body is too small or does not fit.
+ */
+static int
+take_chunk(uint32_t * remaining, uint32_t size, uint32_t min_size)
+{
+    *remaining -= 4;
+    if (size < min_size || *remaining < size)
+        return -1;
+    *remaining -= size;
+    return 0;
 }
 
 
@@ -1470,7 +1974,7 @@ make_even_number_of_bytes_in_length(uint32_t x)
  *****************************************************************************/
 
 static int
-parse_wave_header(lame_global_flags * gfp, FILE * sf)
+parse_wave_header(audio_reader * reader, lame_global_flags * gfp, FILE * sf)
 {
     uint32_t ui32_nSamplesPerSec = 0;
     uint32_t ui32_DataChunkSize = 0;
@@ -1489,7 +1993,7 @@ parse_wave_header(lame_global_flags * gfp, FILE * sf)
     if (ui32_WAVEID != WAV_ID_WAVE || ui32_chunkSize < 1)
         return -1;
 
-    for (loop_sanity = 0; loop_sanity < 20; ++loop_sanity) {
+    for (loop_sanity = 0; loop_sanity < WAV_MAX_CHUNKS; ++loop_sanity) {
         uint32_t ui32_ckID = 0;
         if (read_32_bits_high_low(sf, &ui32_ckID))
             return -1;
@@ -1498,9 +2002,8 @@ parse_wave_header(lame_global_flags * gfp, FILE * sf)
             uint32_t ui32_cksize = 0;
             uint16_t ui16_nBlockAlign = 0;
 
-            if (read_32_bits_low_high(sf, &ui32_cksize))
+            if (read_chunk_size(sf, 0, &ui32_cksize))
                 return -1;
-            ui32_cksize = make_even_number_of_bytes_in_length(ui32_cksize);
             if (ui32_cksize < 16u) {
                 /*DEBUGF("'fmt' chunk too short (only %ld bytes)!", ui32_cksize);*/
                 return -1;
@@ -1516,8 +2019,9 @@ parse_wave_header(lame_global_flags * gfp, FILE * sf)
                other fields already say, so they are cross-checked rather
                than used: writers get them wrong often enough that a
                mismatch must not cost the user the file. */
-            if (global_ui_config.silent < 0 && ui16_nChannels > 0 && ui16_wBitsPerSample > 0) {
-                uint32_t const align = ui16_nChannels * ((ui16_wBitsPerSample + 7u) / 8u);
+            if (frontend_config.ui_config.silent < 0
+                && ui16_nChannels > 0 && ui16_wBitsPerSample > 0) {
+                uint32_t const align = pcm_bytes_per_frame(ui16_nChannels, ui16_wBitsPerSample);
                 if (ui16_nBlockAlign != align)
                     error_printf("Note: block alignment is %u, expected %u\n",
                                  (unsigned int) ui16_nBlockAlign, (unsigned int) align);
@@ -1564,22 +2068,19 @@ parse_wave_header(lame_global_flags * gfp, FILE * sf)
         }
         else {
             uint32_t ui32_cksize = 0;
-            if (read_32_bits_low_high(sf, &ui32_cksize))
+            if (read_chunk_size(sf, 0, &ui32_cksize))
                 return -1;
-            ui32_cksize = make_even_number_of_bytes_in_length(ui32_cksize);
             if (fskip_uint32(sf, ui32_cksize) != 0) {
                 return -1;
             }
         }
     }
     if (is_wav) {
-        if (ui16_wFormatTag == 0x0050 || ui16_wFormatTag == 0x0055) {
+        if (ui16_wFormatTag == WAVE_FORMAT_MPEG || ui16_wFormatTag == WAVE_FORMAT_MPEGLAYER3) {
             return sf_mp123;
         }
         if (ui16_wFormatTag != WAVE_FORMAT_PCM && ui16_wFormatTag != WAVE_FORMAT_IEEE_FLOAT) {
-            if (global_ui_config.silent < 10) {
-                error_printf("Unsupported data format: 0x%04X\n", ui16_wFormatTag);
-            }
+            reader_error("Unsupported data format: 0x%04X\n", ui16_wFormatTag);
             return 0;   /* oh no! non-supported format  */
         }
 
@@ -1593,9 +2094,8 @@ parse_wave_header(lame_global_flags * gfp, FILE * sf)
            check catch the result reports a negative rate that appears
            nowhere in the file. */
         if (ui32_nSamplesPerSec > (uint32_t) INT_MAX) {
-            if (global_ui_config.silent < 10)
-                error_printf("Unsupported sample rate: %u\n",
-                             (unsigned int) ui32_nSamplesPerSec);
+            reader_error("Unsupported sample rate: %u\n",
+                         (unsigned int) ui32_nSamplesPerSec);
             return -1;
         }
         if (!set_input_samplerate(gfp, (int) ui32_nSamplesPerSec))
@@ -1614,21 +2114,19 @@ parse_wave_header(lame_global_flags * gfp, FILE * sf)
             if (ui16_wFormatTag == WAVE_FORMAT_IEEE_FLOAT)
                 width_ok = (ui16_wBitsPerSample == 32);
             else
-                width_ok = (ui16_wBitsPerSample == 8 || ui16_wBitsPerSample == 16
-                            || ui16_wBitsPerSample == 24 || ui16_wBitsPerSample == 32);
+                width_ok = pcm_int_width_supported(ui16_wBitsPerSample);
             if (!width_ok) {
-                if (global_ui_config.silent < 10)
-                    error_printf("Unsupported bits per sample: %d\n", ui16_wBitsPerSample);
+                reader_error("Unsupported bits per sample: %d\n", ui16_wBitsPerSample);
                 return -1;
             }
         }
-        global. pcmbitwidth = ui16_wBitsPerSample;
-        global. pcm_is_unsigned_8bit = 1;
-        global. pcm_is_ieee_float = (ui16_wFormatTag == WAVE_FORMAT_IEEE_FLOAT ? 1 : 0);
-        if (ui32_DataChunkSize == MAX_U_32_NUM)
-            (void) lame_set_num_samples(gfp, MAX_U_32_NUM);
+        reader->pcmbitwidth = ui16_wBitsPerSample;
+        reader->pcm_is_unsigned_8bit = 1;
+        reader->pcm_is_ieee_float = (ui16_wFormatTag == WAVE_FORMAT_IEEE_FLOAT ? 1 : 0);
+        if (ui32_DataChunkSize == NUM_SAMPLES_UNKNOWN)
+            (void) lame_set_num_samples(gfp, NUM_SAMPLES_UNKNOWN);
         else
-            (void) lame_set_num_samples(gfp, ui32_DataChunkSize / (ui16_nChannels * ((ui16_wBitsPerSample + 7u) / 8u)));
+            (void) lame_set_num_samples(gfp, ui32_DataChunkSize / pcm_bytes_per_frame(ui16_nChannels, ui16_wBitsPerSample));
         return 1;
     }
     return -1;
@@ -1647,33 +2145,19 @@ static int
 aiff_check2(IFF_AIFF * const pcm_aiff_data)
 {
     if (pcm_aiff_data->sampleType != IFF_ID_SSND) {
-        if (global_ui_config.silent < 10) {
-            error_printf("ERROR: input sound data is not PCM\n");
-        }
+        reader_error("ERROR: input sound data is not PCM\n");
         return 1;
     }
-    switch (pcm_aiff_data->sampleSize) {
-    case 32:
-    case 24:
-    case 16:
-    case 8:
-        break;
-    default:
-        if (global_ui_config.silent < 10) {
-            error_printf("ERROR: input sound data is not 8, 16, 24 or 32 bits\n");
-        }
+    if (!pcm_int_width_supported(pcm_aiff_data->sampleSize)) {
+        reader_error("ERROR: input sound data is not 8, 16, 24 or 32 bits\n");
         return 1;
     }
     if (pcm_aiff_data->numChannels != 1 && pcm_aiff_data->numChannels != 2) {
-        if (global_ui_config.silent < 10) {
-            error_printf("ERROR: input sound data is not mono or stereo\n");
-        }
+        reader_error("ERROR: input sound data is not mono or stereo\n");
         return 1;
     }
     if (pcm_aiff_data->blkAlgn.blockSize != 0) {
-        if (global_ui_config.silent < 10) {
-            error_printf("ERROR: block size of input sound data is not 0 bytes\n");
-        }
+        reader_error("ERROR: block size of input sound data is not 0 bytes\n");
         return 1;
     }
     /* A bug, since we correctly skip the offset earlier in the code.
@@ -1696,7 +2180,7 @@ aiff_check2(IFF_AIFF * const pcm_aiff_data)
  *****************************************************************************/
 
 static int
-parse_aiff_header(lame_global_flags * gfp, FILE * sf)
+parse_aiff_header(audio_reader * reader, lame_global_flags * gfp, FILE * sf)
 {
     uint32_t  ui32_ChunkSize = 0;
     uint32_t  ui32_TypeID = 0;
@@ -1730,13 +2214,9 @@ parse_aiff_header(lame_global_flags * gfp, FILE * sf)
             uint16_t ui16_numChannels = 0, ui16_sampleSize = 0;
             uint32_t ui32_numSampleFrames = 0;
 
-            if (read_32_bits_high_low(sf, &ui32_cksize))
+            if (read_chunk_size(sf, 1, &ui32_cksize)
+                || take_chunk(&ui32_ChunkSize, ui32_cksize, 18))
                 return -1;
-            ui32_ChunkSize -= 4;
-            ui32_cksize = make_even_number_of_bytes_in_length(ui32_cksize);
-            if (ui32_cksize < 18 || ui32_ChunkSize < ui32_cksize)
-                return -1;
-            ui32_ChunkSize -= ui32_cksize;
             seen_comm_chunk = seen_ssnd_chunk + 1;
 
             if (read_16_bits_high_low(sf, &ui16_numChannels)
@@ -1767,13 +2247,9 @@ parse_aiff_header(lame_global_flags * gfp, FILE * sf)
         }
         else if (ui32_type == IFF_ID_SSND) {
             uint32_t ui32_cksize = 0;
-            if (read_32_bits_high_low(sf, &ui32_cksize))
+            if (read_chunk_size(sf, 1, &ui32_cksize)
+                || take_chunk(&ui32_ChunkSize, ui32_cksize, 8))
                 return -1;
-            ui32_ChunkSize -= 4;
-            ui32_cksize = make_even_number_of_bytes_in_length(ui32_cksize);
-            if (ui32_cksize < 8 || ui32_ChunkSize < ui32_cksize)
-                return -1;
-            ui32_ChunkSize -= ui32_cksize;
             seen_ssnd_chunk = 1;
 
             aiff_info.sampleType = IFF_ID_SSND;
@@ -1796,38 +2272,32 @@ parse_aiff_header(lame_global_flags * gfp, FILE * sf)
         }
         else {
             uint32_t ui32_cksize = 0;
-            if (read_32_bits_high_low(sf, &ui32_cksize))
+            if (read_chunk_size(sf, 1, &ui32_cksize)
+                || take_chunk(&ui32_ChunkSize, ui32_cksize, 0))
                 return -1;
-            ui32_ChunkSize -= 4;
-            ui32_cksize = make_even_number_of_bytes_in_length(ui32_cksize);
-            if (ui32_ChunkSize < ui32_cksize)
-                return -1;
-            ui32_ChunkSize -= ui32_cksize;
             if (fskip_uint32(sf, ui32_cksize) != 0)
                 return -1;
         }
     }
     if (aiff_info.sampleFormat == IFF_ID_2CLE) {
-        global. pcm_is_ieee_float = 0;
-        global. pcmswapbytes = global_reader.swapbytes;
+        reader->pcm_is_ieee_float = 0;
+        reader->pcmswapbytes = frontend_config.reader.swapbytes;
     }
     else if (aiff_info.sampleFormat == IFF_ID_2CBE) {
-        global. pcm_is_ieee_float = 0;
-        global. pcmswapbytes = !global_reader.swapbytes;
+        reader->pcm_is_ieee_float = 0;
+        reader->pcmswapbytes = !frontend_config.reader.swapbytes;
     }
     else if (aiff_info.sampleFormat == IFF_ID_NONE) {
-        global. pcm_is_ieee_float = 0;
-        global. pcmswapbytes = !global_reader.swapbytes;
+        reader->pcm_is_ieee_float = 0;
+        reader->pcmswapbytes = !frontend_config.reader.swapbytes;
     }
     else if (aiff_info.sampleFormat == IFF_ID_FL32) {
-        global. pcm_is_ieee_float = 1;
-        global. pcmswapbytes = !global_reader.swapbytes;
+        reader->pcm_is_ieee_float = 1;
+        reader->pcmswapbytes = !frontend_config.reader.swapbytes;
     }
     else if (aiff_info.sampleFormat == IFF_ID_FL64) {
         /* reading 64 bit floating point samples is not implemented */
-        if (global_ui_config.silent < 10) {
-            error_printf("Unsupported data format: 64 bit floating point\n");
-        }
+        reader_error("Unsupported data format: 64 bit floating point\n");
         return -1;
     }
     else {
@@ -1844,13 +2314,11 @@ parse_aiff_header(lame_global_flags * gfp, FILE * sf)
         if (!set_input_samplerate(gfp, (int) aiff_info.sampleRate))
             return 0;
         (void) lame_set_num_samples(gfp, aiff_info.numSampleFrames);
-        global. pcmbitwidth = aiff_info.sampleSize;
-        global. pcm_is_unsigned_8bit = 0;
+        reader->pcmbitwidth = aiff_info.sampleSize;
+        reader->pcm_is_unsigned_8bit = 0;
         if (pcm_data_pos >= 0) {
             if (fseek(sf, pcm_data_pos, SEEK_SET) != 0) {
-                if (global_ui_config.silent < 10) {
-                    error_printf("Can't rewind stream to audio data position\n");
-                }
+                reader_error("Can't rewind stream to audio data position\n");
                 return 0;
             }
         }
@@ -1877,156 +2345,179 @@ parse_aiff_header(lame_global_flags * gfp, FILE * sf)
 ************************************************************************/
 
 static int
-parse_file_header(lame_global_flags * gfp, FILE * sf)
+parse_file_header(audio_reader * reader, lame_global_flags * gfp, FILE * sf)
 {
     uint32_t ui32_type = 0;
     /*
        DEBUGF(
        "First word of input stream: %08x '%4.4s'\n", ui32_type, (char*) &type);
      */
-    global. count_samples_carefully = 0;
-    global. pcm_is_unsigned_8bit = global_raw_pcm.in_signed == 1 ? 0 : 1;
-    /*global_reader.input_format = sf_raw; commented out, because it is better to fail
+    reader->count_samples_carefully = 0;
+    reader->pcm_is_unsigned_8bit = frontend_config.raw_pcm.in_signed == 1 ? 0 : 1;
+    /*frontend_config.reader.input_format = sf_raw; commented out, because it is better to fail
        here as to encode some hundreds of input files not supported by LAME
        If you know you have RAW PCM data, use the -r switch
      */
 
     if (read_32_bits_high_low(sf, &ui32_type) != 0) {
         /* not even the four identifying bytes are present */
-        if (global_ui_config.silent < 10) {
-            error_printf("Warning: unsupported audio format\n");
-        }
+        reader_error("Warning: unsupported audio format\n");
         return sf_unknown;
     }
 
     if (ui32_type == WAV_ID_RIFF) {
         /* It's probably a WAV file */
-        int const ret = parse_wave_header(gfp, sf);
+        int const ret = parse_wave_header(reader, gfp, sf);
         if (ret == sf_mp123) {
-            global. count_samples_carefully = 1;
+            reader->count_samples_carefully = 1;
             return sf_mp123;
         }
         if (ret > 0) {
-            if (lame_get_num_samples(gfp) == MAX_U_32_NUM || global_reader.ignorewavlength == 1)
+            if (lame_get_num_samples(gfp) == NUM_SAMPLES_UNKNOWN
+                || frontend_config.reader.ignorewavlength == 1)
             {
-                global. count_samples_carefully = 0;
-                lame_set_num_samples(gfp, MAX_U_32_NUM);
+                reader->count_samples_carefully = 0;
+                lame_set_num_samples(gfp, NUM_SAMPLES_UNKNOWN);
             }
             else
-                global. count_samples_carefully = 1;
+                reader->count_samples_carefully = 1;
             return sf_wave;
         }
         if (ret < 0) {
-            if (global_ui_config.silent < 10) {
-                error_printf("Warning: corrupt or unsupported WAVE format\n");
-            }
+            reader_error("Warning: corrupt or unsupported WAVE format\n");
         }
     }
     else if (ui32_type == IFF_ID_FORM) {
         /* It's probably an AIFF file */
-        int const ret = parse_aiff_header(gfp, sf);
+        int const ret = parse_aiff_header(reader, gfp, sf);
         if (ret > 0) {
-            global. count_samples_carefully = 1;
+            reader->count_samples_carefully = 1;
             return sf_aiff;
         }
         if (ret < 0) {
-            if (global_ui_config.silent < 10) {
-                error_printf("Warning: corrupt or unsupported AIFF format\n");
-            }
+            reader_error("Warning: corrupt or unsupported AIFF format\n");
         }
     }
     else {
-        if (global_ui_config.silent < 10) {
-            error_printf("Warning: unsupported audio format\n");
-        }
+        reader_error("Warning: unsupported audio format\n");
     }
     return sf_unknown;
 }
 
 
 static int
-open_mpeg_file_part2(lame_t gfp, LAME_UNUSED FILE * musicin, LAME_UNUSED char const *inPath,
+open_mpeg_file_part2(LAME_UNUSED audio_reader * reader, lame_t gfp, LAME_UNUSED FILE * musicin,
+                     LAME_UNUSED char const *inPath,
                      LAME_UNUSED int *enc_delay, LAME_UNUSED int *enc_padding)
 {
 #ifdef HAVE_MPG123
-    if (-1 == lame123_decode_initfile(musicin, &global_decoder.mp3input_data, enc_delay, enc_padding)) {
-        if (global_ui_config.silent < 10) {
-            error_printf("Error opening MPEG input file %s.\n", inPath);
-        }
+    if (-1 == lame123_decode_initfile(reader, musicin, &frontend_config.decoder.mp3input_data,
+                                      enc_delay, enc_padding)) {
+        reader_error("Error opening MPEG input file %s.\n", inPath);
         return 0;
     }
 #endif
-    if (!set_input_num_channels(gfp, global_decoder.mp3input_data.stereo)) {
+    if (!set_input_num_channels(gfp, frontend_config.decoder.mp3input_data.stereo)) {
         return 0;
     }
-    if (!set_input_samplerate(gfp, global_decoder.mp3input_data.samplerate)) {
+    if (!set_input_samplerate(gfp, frontend_config.decoder.mp3input_data.samplerate)) {
         return 0;
     }
-    (void) lame_set_num_samples(gfp, global_decoder.mp3input_data.nsamp);
+    (void) lame_set_num_samples(gfp, frontend_config.decoder.mp3input_data.nsamp);
     return 1;
 }
 
 
+/** @internal @brief The size of the stdio buffer an input file is read through. */
+#define INPUT_BUFFER_BYTES (64 * 1024)
+
+/**
+ * @internal
+ * @brief Gives a file the reader opened a larger stdio buffer.
+ *
+ * It must be called before the first read. The buffer belongs to the reader,
+ * which frees it after the file is closed. Without memory for it, the file
+ * keeps the C library's buffer.
+ *
+ * @param reader   the reader of the input file.
+ * @param musicin  the file, just opened; not standard input, which stays
+ *                 open after the reader is closed.
+ */
+static void
+set_input_buffer(audio_reader * reader, FILE * musicin)
+{
+    reader->in_buffer = malloc(INPUT_BUFFER_BYTES);
+    if (reader->in_buffer != NULL
+        && setvbuf(musicin, (char *) reader->in_buffer, _IOFBF, INPUT_BUFFER_BYTES) != 0) {
+        free(reader->in_buffer);
+        reader->in_buffer = NULL;
+    }
+}
+
 static FILE *
-open_wave_file(lame_t gfp, char const *inPath, int *enc_delay, int *enc_padding)
+open_wave_file(audio_reader * reader, lame_t gfp, char const *inPath, int *enc_delay,
+               int *enc_padding)
 {
     FILE   *musicin;
 
     /* set the defaults from info incase we cannot determine them from file */
-    lame_set_num_samples(gfp, MAX_U_32_NUM);
+    lame_set_num_samples(gfp, NUM_SAMPLES_UNKNOWN);
 
     if (!strcmp(inPath, "-")) {
         lame_set_stream_binary_mode(musicin = stdin); /* Read from standard input. */
     }
     else {
         if ((musicin = lame_fopen(inPath, "rb")) == NULL) {
-            if (global_ui_config.silent < 10) {
-                error_printf("Could not find \"%s\".\n", inPath);
-            }
+            reader_error("Could not find \"%s\".\n", inPath);
             return 0;
         }
+        set_input_buffer(reader, musicin);
     }
 
-    if (global_reader.input_format == sf_ogg) {
-        if (global_ui_config.silent < 10) {
-            error_printf("sorry, vorbis support in LAME is deprecated.\n");
-        }
+    if (frontend_config.reader.input_format == sf_ogg) {
+        reader_error("sorry, vorbis support in LAME is deprecated.\n");
         close_input_file(musicin);
         return 0;
     }
-    else if (global_reader.input_format == sf_raw) {
+    else if (frontend_config.reader.input_format == sf_raw) {
         /* assume raw PCM */
-        if (global_ui_config.silent < 9) {
+        if (frontend_config.ui_config.silent < 9) {
             console_printf("Assuming raw pcm input file");
-            if (global_reader.swapbytes)
+            if (frontend_config.reader.swapbytes)
                 console_printf(" : Forcing byte-swapping\n");
             else
                 console_printf("\n");
         }
-        global. pcmswapbytes = global_reader.swapbytes;
+        reader->pcmswapbytes = frontend_config.reader.swapbytes;
     }
     else {
-        global_reader.input_format = parse_file_header(gfp, musicin);
+        frontend_config.reader.input_format = parse_file_header(reader, gfp, musicin);
     }
-    if (global_reader.input_format == sf_mp123) {
-        if (open_mpeg_file_part2(gfp, musicin, inPath, enc_delay, enc_padding))
+    if (frontend_config.reader.input_format == sf_mp123) {
+        if (open_mpeg_file_part2(reader, gfp, musicin, inPath, enc_delay, enc_padding))
             return musicin;
         close_input_file(musicin);
         return 0;
     }
-    if (global_reader.input_format == sf_unknown) {
+    if (frontend_config.reader.input_format == sf_unknown) {
+        /* The input type comes from the file name or an input option, and
+           standard input has no name. */
+        if (lame_get_decode_only(gfp))
+            reader_error("To decode an MP3 from standard input, or from a file whose name does\n"
+                         "not end in .mp3, give --mp3input (--mp2input or --mp1input for\n"
+                         "layer II or layer I).\n");
         close_input_file(musicin);
         return 0;
     }
 
-    if (lame_get_num_samples(gfp) == MAX_U_32_NUM && musicin != stdin) {
+    if (lame_get_num_samples(gfp) == NUM_SAMPLES_UNKNOWN && musicin != stdin) {
         int const tmp_num_channels = lame_get_num_channels(gfp);
         double const flen = lame_get_file_size(musicin); /* try to figure out num_samples */
         if (flen >= 0 && tmp_num_channels > 0 ) {
             /* try file size, assume 2 bytes per sample */
             unsigned long fsize = (unsigned long) (flen / (2 * tmp_num_channels));
             (void) lame_set_num_samples(gfp, fsize);
-            global. count_samples_carefully = 0;
+            reader->count_samples_carefully = 0;
         }
     }
     return musicin;
@@ -2035,12 +2526,13 @@ open_wave_file(lame_t gfp, char const *inPath, int *enc_delay, int *enc_padding)
 
 
 static FILE *
-open_mpeg_file(lame_t gfp, char const *inPath, int *enc_delay, int *enc_padding)
+open_mpeg_file(audio_reader * reader, lame_t gfp, char const *inPath, int *enc_delay,
+               int *enc_padding)
 {
     FILE   *musicin;
 
     /* set the defaults from info incase we cannot determine them from file */
-    lame_set_num_samples(gfp, MAX_U_32_NUM);
+    lame_set_num_samples(gfp, NUM_SAMPLES_UNKNOWN);
 
     if (strcmp(inPath, "-") == 0) {
         musicin = stdin;
@@ -2049,29 +2541,27 @@ open_mpeg_file(lame_t gfp, char const *inPath, int *enc_delay, int *enc_padding)
     else {
         musicin = lame_fopen(inPath, "rb");
         if (musicin == NULL) {
-            if (global_ui_config.silent < 10) {
-                error_printf("Could not find \"%s\".\n", inPath);
-            }
+            reader_error("Could not find \"%s\".\n", inPath);
             return 0;
         }
     }
-    if ( 0 == open_mpeg_file_part2(gfp, musicin, inPath, enc_delay, enc_padding) ) {
+    if ( 0 == open_mpeg_file_part2(reader, gfp, musicin, inPath, enc_delay, enc_padding) ) {
         close_input_file(musicin);
         return 0;
     }
-    if (lame_get_num_samples(gfp) == MAX_U_32_NUM && musicin != stdin) {
+    if (lame_get_num_samples(gfp) == NUM_SAMPLES_UNKNOWN && musicin != stdin) {
         double  flen = lame_get_file_size(musicin); /* try to figure out num_samples */
         if (flen >= 0) {
             /* try file size, assume 2 bytes per sample */
-            if (global_decoder.mp3input_data.bitrate > 0) {
+            if (frontend_config.decoder.mp3input_data.bitrate > 0) {
                 double  totalseconds =
-                    (flen * 8.0 / (1000.0 * global_decoder.mp3input_data.bitrate));
+                    (flen * 8.0 / (1000.0 * frontend_config.decoder.mp3input_data.bitrate));
                 unsigned long tmp_num_samples =
                     (unsigned long) (totalseconds * lame_get_in_samplerate(gfp));
 
                 (void) lame_set_num_samples(gfp, tmp_num_samples);
-                global_decoder.mp3input_data.nsamp = tmp_num_samples;
-                global. count_samples_carefully = 0;
+                frontend_config.decoder.mp3input_data.nsamp = tmp_num_samples;
+                reader->count_samples_carefully = 0;
             }
         }
     }
@@ -2088,9 +2578,7 @@ close_input_file(FILE * musicin)
         ret = fclose(musicin);
     }
     if (ret != 0) {
-        if (global_ui_config.silent < 10) {
-            error_printf("Could not close audio input file\n");
-        }
+        reader_error("Could not close audio input file\n");
     }
     return ret;
 }
@@ -2124,7 +2612,8 @@ static void lame123_cleanup_file(LAME_UNUSED void* handle)
 }
 #endif
 
-int lame123_decode_initfile(FILE *fd, mp3data_struct *mp3data, int *enc_delay, int *enc_padding)
+int lame123_decode_initfile(audio_reader * reader, FILE *fd, mp3data_struct *mp3data, int *enc_delay,
+                            int *enc_padding)
 {
     off_t len;
     unsigned char *id3buf;
@@ -2135,19 +2624,19 @@ int lame123_decode_initfile(FILE *fd, mp3data_struct *mp3data, int *enc_delay, i
 
     mpg123_init();
     memset(mp3data, 0, sizeof(mp3data_struct));
-    if (global.hip) {
-        hip_decode_exit(global.hip);
+    if (reader->hip) {
+        hip_decode_exit(reader->hip);
     }
-    global. hip = hip_decode_init();
-    if(!global.hip || !global.hip->mh)
+    reader->hip = hip_decode_init();
+    if(!reader->hip || !reader->hip->mh)
         return -1;
     /* TODO: enforce float format ... optionally be careful for builds
        that only know 16 bit output. */
-    mpg123_param(global.hip->mh, MPG123_ADD_FLAGS, MPG123_STORE_RAW_ID3, 0.);
-    mpg123_param(global.hip->mh, MPG123_ADD_FLAGS, MPG123_QUIET, 0.);
-    mpg123_format_none(global.hip->mh);
+    mpg123_param(reader->hip->mh, MPG123_ADD_FLAGS, MPG123_STORE_RAW_ID3, 0.);
+    mpg123_param(reader->hip->mh, MPG123_ADD_FLAGS, MPG123_QUIET, 0.);
+    mpg123_format_none(reader->hip->mh);
     /* TODO: switch to MPG123_ENC_FLOAT_32, always! */
-    CHECK123(mpg123_format2(global.hip->mh,
+    CHECK123(mpg123_format2(reader->hip->mh,
         0, MPG123_MONO|MPG123_STEREO, MPG123_ENC_SIGNED_16));
     /* TODO: verboseness / silence set up */
 #ifdef _WIN32
@@ -2156,63 +2645,68 @@ int lame123_decode_initfile(FILE *fd, mp3data_struct *mp3data, int *enc_delay, i
        fileno() would produce invalid file numbers for those msvcrt instances.
        So use mpg123_replace_reader_handle() / mpg123_open_handle() here
        instead of mpg123_open_fd(). */
-    CHECK123(mpg123_replace_reader_handle(global.hip->mh, lame123_read_from_file, lame123_seek_in_file, lame123_cleanup_file));
-    CHECK123(mpg123_open_handle(global.hip->mh, fd));
+    CHECK123(mpg123_replace_reader_handle(reader->hip->mh, lame123_read_from_file, lame123_seek_in_file, lame123_cleanup_file));
+    CHECK123(mpg123_open_handle(reader->hip->mh, fd));
 #else
-    CHECK123(mpg123_open_fd(global.hip->mh, fileno(fd)));
+    CHECK123(mpg123_open_fd(reader->hip->mh, fileno(fd)));
 #endif
     /* Seek to get past Info frame and ID3v2. */
-    CHECK123(mpg123_seek(global.hip->mh, SEEK_SET, 0));
+    CHECK123(mpg123_seek(reader->hip->mh, SEEK_SET, 0));
     /* TODO: Figure out if MPG123_GAPLESS is desired or not. */
     /* Guessing seems to be OK, so we do not have to insist on knowing
        if libmpg123 got that info from Info tag or not. */
-    /* I am paranoid about off_t being larger than long or int. */
-    len = mpg123_framelength(global.hip->mh);
-    if(len <= ((unsigned int)-1)/2)     /* totalframes is int, bound to INT_MAX */
+    /* A negative length means that libmpg123 does not know it, as for a
+       stream without an Info tag read from a pipe. */
+    len = mpg123_framelength(reader->hip->mh);
+    if (len < 0)
+        mp3data->totalframes = 0;
+    else if (len <= INT_MAX)
         mp3data->totalframes = (int)len;
     else
         return -1;
-    len = mpg123_length(global.hip->mh);
-    if(len <= ((unsigned int)-1)/2)
+    len = mpg123_length(reader->hip->mh);
+    if (len < 0)
+        mp3data->nsamp = NUM_SAMPLES_UNKNOWN;
+    else if (len <= INT_MAX)
         mp3data->nsamp = len;
     else
         return -1;
     /* Encoder delay and padding are not needed when libmpg123 handles gapless
        decoding itself. So let's see if we get away with that. */
-    mpg123_getstate(global.hip->mh, MPG123_ENC_DELAY, &val, NULL);
+    mpg123_getstate(reader->hip->mh, MPG123_ENC_DELAY, &val, NULL);
     *enc_delay = (int)val;
-    mpg123_getstate(global.hip->mh, MPG123_ENC_PADDING, &val, NULL);
+    mpg123_getstate(reader->hip->mh, MPG123_ENC_PADDING, &val, NULL);
     *enc_padding = (int)val;
-    if(global.in_id3v2_tag)
-        free(global.in_id3v2_tag);
-    global.in_id3v2_size = 0;
-    if( MPG123_OK == mpg123_id3_raw(global.hip->mh, NULL, NULL,
+    if(reader->in_id3v2_tag)
+        free(reader->in_id3v2_tag);
+    reader->in_id3v2_size = 0;
+    if( MPG123_OK == mpg123_id3_raw(reader->hip->mh, NULL, NULL,
         &id3buf, &id3size) && id3buf && id3size ) {
-        global.in_id3v2_tag = malloc(id3size);
-        if(global.in_id3v2_tag) {
-            memcpy(global.in_id3v2_tag, id3buf, id3size);
-            global.in_id3v2_size = id3size;
+        reader->in_id3v2_tag = malloc(id3size);
+        if(reader->in_id3v2_tag) {
+            memcpy(reader->in_id3v2_tag, id3buf, id3size);
+            reader->in_id3v2_size = id3size;
         }
     }
-    CHECK123(mpg123_info(global.hip->mh, &fi));
-    CHECK123(mpg123_getformat(global.hip->mh, &rate, &channels, NULL));
+    CHECK123(mpg123_info(reader->hip->mh, &fi));
+    CHECK123(mpg123_getformat(reader->hip->mh, &rate, &channels, NULL));
     /* How much of this is actually needed for the frontend? */
     mp3data->header_parsed = 1;
     mp3data->stereo = channels; /* Channel count correct? Or is dual mono different? */
     mp3data->samplerate = (int)rate;
     mp3data->mode = fi.mode;
     mp3data->mode_ext = fi.mode_ext;
-    mp3data->framesize = mpg123_spf(global.hip->mh);
+    mp3data->framesize = mpg123_spf(reader->hip->mh);
     mp3data->bitrate = fi.bitrate;
-    if(global_reader.input_format == sf_mp123) switch(fi.layer) {
+    if(frontend_config.reader.input_format == sf_mp123) switch(fi.layer) {
         case 1:
-            global_reader.input_format = sf_mp1;
+            frontend_config.reader.input_format = sf_mp1;
         break;
         case 2:
-            global_reader.input_format = sf_mp2;
+            frontend_config.reader.input_format = sf_mp2;
         break;
         case 3:
-            global_reader.input_format = sf_mp3;
+            frontend_config.reader.input_format = sf_mp3;
         break;
     }
 
@@ -2239,62 +2733,50 @@ is_mpeg_file_format(int input_file_format)
 }
 
 
-#define LOW__BYTE(x) (x & 0x00ff)
-#define HIGH_BYTE(x) ((x >> 8) & 0x00ff)
-
+/**
+ * @internal
+ * @brief Writes decoded 16-bit samples to the output file.
+ *
+ * Two channels are written interleaved. A WAV file is little endian. Raw
+ * output (-t) is little endian, or big endian with -x.
+ *
+ * @param outf    the output file.
+ * @param Buffer  the samples of the first and the second channel.
+ * @param iread   the number of samples per channel.
+ * @param nch     the number of channels, 1 or 2.
+ * @return 0, or -1 when the write or the flush fails.
+ */
 int
-put_audio16(FILE * outf, short Buffer[2][1152], int iread, int nch)
+put_audio16(FILE * outf, short Buffer[2][FRAME_BUFFER_SAMPLES], int iread, int nch)
 {
-    char    data[2 * 1152 * 2];
-    int     i, m = 0;
+    unsigned short data[2 * FRAME_BUFFER_SAMPLES];
+    enum ByteOrder const out_order =
+        (frontend_config.decoder.disable_wav_header && frontend_config.decoder.swapbytes)
+        ? ByteOrderBigEndian : ByteOrderLittleEndian;
+    int const count = nch == 1 ? iread : 2 * iread;
+    int     i;
 
-    if (global_decoder.disable_wav_header && global_reader.swapbytes) {
-        if (nch == 1) {
-            for (i = 0; i < iread; i++) {
-                short   x = Buffer[0][i];
-                /* write 16 Bits High Low */
-                data[m++] = HIGH_BYTE(x);
-                data[m++] = LOW__BYTE(x);
-            }
-        }
-        else {
-            for (i = 0; i < iread; i++) {
-                short   x = Buffer[0][i], y = Buffer[1][i];
-                /* write 16 Bits High Low */
-                data[m++] = HIGH_BYTE(x);
-                data[m++] = LOW__BYTE(x);
-                /* write 16 Bits High Low */
-                data[m++] = HIGH_BYTE(y);
-                data[m++] = LOW__BYTE(y);
-            }
+    if (nch == 1) {
+        for (i = 0; i < iread; i++) {
+            data[i] = (unsigned short) Buffer[0][i];
         }
     }
     else {
-        if (nch == 1) {
-            for (i = 0; i < iread; i++) {
-                short   x = Buffer[0][i];
-                /* write 16 Bits Low High */
-                data[m++] = LOW__BYTE(x);
-                data[m++] = HIGH_BYTE(x);
-            }
-        }
-        else {
-            for (i = 0; i < iread; i++) {
-                short   x = Buffer[0][i], y = Buffer[1][i];
-                /* write 16 Bits Low High */
-                data[m++] = LOW__BYTE(x);
-                data[m++] = HIGH_BYTE(x);
-                /* write 16 Bits Low High */
-                data[m++] = LOW__BYTE(y);
-                data[m++] = HIGH_BYTE(y);
-            }
+        for (i = 0; i < iread; i++) {
+            data[2 * i] = (unsigned short) Buffer[0][i];
+            data[2 * i + 1] = (unsigned short) Buffer[1][i];
         }
     }
-    if (m > 0) {
-        if (fwrite(data, 1, m, outf) != (size_t) m)
+    if (out_order != machine_byte_order()) {
+        for (i = 0; i < count; i++) {
+            data[i] = (unsigned short) ((data[i] << 8) | (data[i] >> 8));
+        }
+    }
+    if (count > 0) {
+        if (fwrite(data, sizeof(data[0]), (size_t) count, outf) != (size_t) count)
             return -1;
     }
-    if (global_writer.flush_write == 1) {
+    if (frontend_config.writer.flush_write == 1) {
         if (fflush(outf) != 0)
             return -1;
     }
@@ -2302,23 +2784,21 @@ put_audio16(FILE * outf, short Buffer[2][1152], int iread, int nch)
 }
 
 hip_t
-get_hip(void)
+get_hip(audio_reader const * reader)
 {
-    return global.hip;
+    return reader->hip;
 }
 
 size_t
-sizeOfOldTag(lame_t gf)
+sizeOfOldTag(audio_reader const * reader)
 {
-    (void) gf;
-    return global.in_id3v2_size;
+    return reader->in_id3v2_size;
 }
 
 unsigned char*
-getOldTag(lame_t gf)
+getOldTag(audio_reader const * reader)
 {
-    (void) gf;
-    return global.in_id3v2_tag;
+    return reader->in_id3v2_tag;
 }
 
 /* end of get_audio.c */

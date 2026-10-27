@@ -1,33 +1,37 @@
 /**
  * @file
  * @ingroup unit_tests
- * @brief Regression tests for two ways a crafted AIFF header is rejected by
- *        @c parse_aiff_header() (@c frontend/get_audio.c).
+ * @brief Regression tests for two checks in @c parse_aiff_header()
+ *        (@c frontend/get_audio.c) that reject a crafted AIFF header.
  *
- * A crafted AIFF/AIFC whose FORM chunk size is < 4 underflowed
- * @c ui32_ChunkSize on the first "- 4" accounting step, wrapping it to ~4.29e9
- * and driving the chunk loop through ~1e9 iterations (one @c fread each) before
- * returning -1. The guard rejects such a file up front.
+ * The first check rejects a FORM chunk size below 4. The parser subtracts 4
+ * from @c ui32_ChunkSize before the chunk loop. Without the check, a size
+ * below 4 wraps to about 4.29e9, and then the FORM size does not limit the
+ * chunk loop. The test input is ::valid_aiff with only the FORM size
+ * changed. So without the check, the loop reads the COMM and SSND chunks and
+ * the parser accepts the file. With the check, it returns -1.
  *
- * A COMM chunk's 80-bit extended sample rate reaches lame as an @c int, and the
- * conversion is undefined for anything outside that type's range: an infinity,
- * a finite value that is merely too large, or a negative one. Each is rejected
- * as a malformed field. The rates below are read back from a stream at run
- * time rather than written as constants, so the fast floating point maths the
- * frontend is built with cannot fold one away before the parser sees it.
+ * The second check rejects a sample rate that does not fit in an @c int. The
+ * COMM chunk stores the sample rate as an 80-bit extended float. The parser
+ * converts it to an @c int for lame. This conversion is undefined for a value
+ * outside the range of @c int: an infinity, a finite value that is too large,
+ * or a negative value. The parser rejects each of them as a malformed field.
+ * The test reads the rates from a stream at run time. It does not write them
+ * as constants. So the fast floating-point math of the frontend build cannot
+ * fold a rate away before the parser sees it.
  *
- * @c parse_aiff_header() is static, so the reader is compiled directly into the
- * test. @c fread() is wrapped because its return value alone cannot distinguish
- * the fix from the bug (both end at -1): once armed, exceeding a fixed read
- * budget @c longjmp()s out, so a regressed (spinning) build fails fast instead
- * of hanging the suite.
+ * @c parse_aiff_header() is static, so the test compiles the reader into
+ * itself. The test also wraps @c fread(). When the trap is armed, a call past
+ * a fixed read budget calls @c longjmp(). So a parser that loops fails the
+ * test fast and does not hang the suite.
  *
- * The test is host byte-order independent. All multi-byte fields are written in
- * AIFF's native big-endian on-disk order (via @c put_be32 and the byte array
- * below), and @c get_audio.c reads them back byte by byte using value
- * arithmetic rather than memory-layout reads, so the fixtures and the code
- * under test behave identically on big- and little-endian hosts (no POSIX
- * @c <endian.h> conversion is needed or used).
+ * The test does not depend on the byte order of the host. It writes all
+ * multi-byte fields in big-endian order, the byte order of AIFF files. It does
+ * this with put_be() and the byte array below. @c get_audio.c reads them
+ * back byte by byte, with arithmetic on values, not with reads of the memory
+ * layout. So the fixtures and the code under test behave the same on
+ * big-endian and little-endian hosts. The test does not need or use the POSIX
+ * @c <endian.h> conversions.
  */
 
 #ifdef HAVE_CONFIG_H
@@ -51,8 +55,14 @@
 #include <string.h>
 #include <cmocka.h>
 
+#include "test_fixture.h"
+#include "test_bytes.h"
+
 /* the code under test (pulls in the static parse_aiff_header + helpers) */
 #include "get_audio.c"
+
+/** @brief The reader the tests read through, as init_infile() would return it. */
+static struct audio_reader reader;
 
 /* --- fread spin-trap --------------------------------------------------- */
 
@@ -64,10 +74,11 @@ static int           spin_trap_armed;
 static jmp_buf       spin_trap;
 
 /**
- * @brief fread() interposer that traps a runaway parser.
+ * @brief Replaces fread() and stops a parser that loops.
  *
- * While armed, once the call count exceeds ::FREAD_BUDGET it @c longjmp()s to
- * ::spin_trap instead of reading; otherwise it forwards to the real fread().
+ * When the trap is armed and the call count exceeds ::FREAD_BUDGET, it calls
+ * @c longjmp() to ::spin_trap and does not read. In all other cases it calls
+ * the real fread().
  */
 size_t
 __wrap_fread(void *ptr, size_t size, size_t nmemb, FILE *stream)
@@ -79,47 +90,18 @@ __wrap_fread(void *ptr, size_t size, size_t nmemb, FILE *stream)
     return __real_fread(ptr, size, nmemb, stream);
 }
 
-/* --- helpers ----------------------------------------------------------- */
-
-/**
- * @brief Builds a rewound temp FILE* holding @p bytes.
- *
- * The stream represents the input positioned right after the 4-byte "FORM"
- * magic, which is where @c parse_aiff_header() begins reading.
- * @param bytes the post-"FORM" header bytes.
- * @param n     number of bytes.
- * @return an open, rewound temp stream.
- */
-static FILE *
-aiff_stream(const unsigned char *bytes, size_t n)
-{
-    FILE *f = tmpfile();
-    assert_non_null(f);
-    if (n > 0)
-        assert_int_equal(fwrite(bytes, 1, n, f), n);
-    rewind(f);
-    return f;
-}
-
-/** @brief Writes @p v into @p p as 4 big-endian bytes (AIFF on-disk order). */
-static void
-put_be32(unsigned char *p, uint32_t v)
-{
-    p[0] = (unsigned char) (v >> 24);
-    p[1] = (unsigned char) (v >> 16);
-    p[2] = (unsigned char) (v >> 8);
-    p[3] = (unsigned char) (v);
-}
-
 /* --- fixtures ---------------------------------------------------------- */
 
 /** @brief Offset of the 80-bit extended sample rate within ::valid_aiff. */
 #define AIFF_RATE_OFFSET 24
 
 /**
- * @brief A minimal well-formed AIFF, from just past the "FORM" magic.
+ * @brief A minimal well-formed AIFF, from the byte after the "FORM" magic.
  *
- * Post-"FORM" bytes: size + "AIFF" + COMM(18) + SSND(8) = 46 bytes.
+ * @c parse_aiff_header() starts to read at this point.
+ * The array has 50 bytes: the FORM size, "AIFF", a COMM chunk with 18 data
+ * bytes and an SSND chunk with 8 data bytes. The FORM size is 46, because it
+ * does not count its own 4 bytes.
  */
 static const unsigned char valid_aiff[] = {
     0x00, 0x00, 0x00, 0x2e,                         /* FORM size = 46 */
@@ -136,7 +118,12 @@ static const unsigned char valid_aiff[] = {
     0x00, 0x00, 0x00, 0x00                          /* blockSize = 0 */
 };
 
-/** @brief The rate ::valid_aiff declares, so ::AIFF_RATE_OFFSET stays anchored. */
+/**
+ * @brief The sample rate in ::valid_aiff.
+ *
+ * A test compares it with the bytes at ::AIFF_RATE_OFFSET. This checks that
+ * the offset is correct.
+ */
 static const unsigned char rate_44100[10] = {
     0x40, 0x0e, 0xac, 0x44, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
 };
@@ -144,8 +131,9 @@ static const unsigned char rate_44100[10] = {
 /* --- tests ------------------------------------------------------------- */
 
 /**
- * @brief FORM sizes 0..3 must be rejected immediately, without spinning.
- * @param state fixture state holding an initialised @c lame_t.
+ * @brief Checks that the parser rejects FORM sizes 0 to 3 at once, without a
+ *        loop.
+ * @param state fixture state that contains an initialized encoder instance.
  */
 static void
 test_undersized_form_size_rejected(void **state)
@@ -156,17 +144,19 @@ test_undersized_form_size_rejected(void **state)
     volatile uint32_t fs;
 
     for (fs = 0; fs < 4; ++fs) {
-        unsigned char hdr[8];
+        unsigned char hdr[sizeof valid_aiff];
         FILE   *sf;
 
-        put_be32(hdr, fs);              /* FORM chunk size = 0..3 */
-        memcpy(hdr + 4, "AIFF", 4);     /* form type */
-        sf = aiff_stream(hdr, sizeof hdr);
+        /* A valid header with only the FORM size changed: without the check,
+           the wrapped size lets the loop read COMM and SSND and accept it. */
+        memcpy(hdr, valid_aiff, sizeof hdr);
+        put_be(hdr, fs, 4);              /* FORM chunk size = 0..3 */
+        sf = bytes_stream(hdr, sizeof hdr);
 
         fread_calls = 0;
         spin_trap_armed = 1;
         if (setjmp(spin_trap) == 0) {
-            int r = parse_aiff_header(gfp, sf);
+            int r = parse_aiff_header(&reader, gfp, sf);
             spin_trap_armed = 0;
             assert_int_equal(r, -1);    /* rejected, not parsed */
         } else {
@@ -179,20 +169,22 @@ test_undersized_form_size_rejected(void **state)
 }
 
 /**
- * @brief A well-formed minimal AIFF must still be accepted (guard is narrow).
- * @param state fixture state holding an initialised @c lame_t.
+ * @brief Checks that the parser accepts a minimal well-formed AIFF.
+ *
+ * This shows that the checks do not reject a valid file.
+ * @param state fixture state that contains an initialized encoder instance.
  */
 static void
 test_valid_aiff_accepted(void **state)
 {
     lame_t gfp = (lame_t) *state;
-    FILE *sf = aiff_stream(valid_aiff, sizeof valid_aiff);
+    FILE *sf = bytes_stream(valid_aiff, sizeof valid_aiff);
     int   r;
 
     fread_calls = 0;
     spin_trap_armed = 1;
     if (setjmp(spin_trap) == 0) {
-        r = parse_aiff_header(gfp, sf);
+        r = parse_aiff_header(&reader, gfp, sf);
         spin_trap_armed = 0;
         assert_int_equal(r, 1);         /* accepted */
     } else {
@@ -202,14 +194,16 @@ test_valid_aiff_accepted(void **state)
 }
 
 /**
- * @brief A sample rate that cannot become an @c int must be rejected.
+ * @brief Checks that the parser rejects a sample rate that does not fit in an
+ *        @c int.
  *
- * Each case is ::valid_aiff with only the rate field replaced, so the header is
- * acceptable in every other respect and the rate is the sole reason for the
- * refusal. Without the range check the value is handed to @c (int) instead,
- * whose result is undefined, and the header parses far enough to return 0.
+ * Each case is ::valid_aiff with only the rate field replaced. The header is
+ * valid in every other way, so the rate is the only reason to reject it.
+ * Without the range check, the parser converts the value with @c (int). The
+ * result of this conversion is undefined. The header then parses to the end,
+ * and the parser returns 0 or 1, not -1.
  *
- * @param state fixture state holding an initialised @c lame_t.
+ * @param state fixture state that contains an initialized encoder instance.
  */
 static void
 test_unrepresentable_sample_rate_rejected(void **state)
@@ -248,9 +242,9 @@ test_unrepresentable_sample_rate_rejected(void **state)
 
         memcpy(hdr, valid_aiff, sizeof hdr);
         memcpy(hdr + AIFF_RATE_OFFSET, cases[i].rate, sizeof cases[i].rate);
-        sf = aiff_stream(hdr, sizeof hdr);
+        sf = bytes_stream(hdr, sizeof hdr);
 
-        r = parse_aiff_header(gfp, sf);
+        r = parse_aiff_header(&reader, gfp, sf);
         if (r != -1) {
             fail_msg("a sample rate of %s was accepted (returned %d)",
                      cases[i].what, r);
@@ -261,36 +255,17 @@ test_unrepresentable_sample_rate_rejected(void **state)
 
 /* --- fixture ----------------------------------------------------------- */
 
-/** @brief Per-test fixture: creates a @c lame_t into @p state. */
-static int
-setup_lame(void **state)
-{
-    lame_t gfp = lame_init();
-    if (gfp == NULL)
-        return -1;
-    *state = gfp;
-    return 0;
-}
-
-/** @brief Per-test fixture teardown: closes the @c lame_t from @p state. */
-static int
-teardown_lame(void **state)
-{
-    lame_close((lame_t) *state);
-    return 0;
-}
-
 /** @brief Registers and runs the AIFF header-rejection test group. */
 int
 main(void)
 {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test_setup_teardown(test_undersized_form_size_rejected,
-                                        setup_lame, teardown_lame),
+                                        lame_fixture_setup, lame_fixture_teardown),
         cmocka_unit_test_setup_teardown(test_valid_aiff_accepted,
-                                        setup_lame, teardown_lame),
+                                        lame_fixture_setup, lame_fixture_teardown),
         cmocka_unit_test_setup_teardown(test_unrepresentable_sample_rate_rejected,
-                                        setup_lame, teardown_lame),
+                                        lame_fixture_setup, lame_fixture_teardown),
     };
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

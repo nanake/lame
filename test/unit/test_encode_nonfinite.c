@@ -3,33 +3,34 @@
  * @ingroup unit_tests
  * @brief Unit tests for the rejection of non-finite PCM input (libmp3lame/lame.c).
  *
- * The floating point encoding entry points refuse a buffer containing a NaN or
- * an infinity with #LAME_BADINPUTDATA. These tests cover each of those entry
- * points, both channels, and a non-finite sample at the end of the buffer as
- * well as at the start, so a screen that stopped after the first sample would
- * be caught.
+ * The floating point encode functions reject a buffer that contains a NaN or
+ * an infinity. They return #LAME_BADINPUTDATA. The tests cover:
+ * - each of these functions,
+ * - both channels,
+ * - a non-finite sample at the start and at the end of the buffer.
  *
- * The boundaries the entry points document must still be accepted: full scale
- * (+/- 1, or +/- 32768 for the short int scaled variant), the smallest denormal
- * and negative zero. The screen looks at the exponent bits, and a test which
- * only fed it NaN would not notice if it rejected ordinary audio as well. The
- * integer entry points cannot express a non-finite value and must be
- * unaffected.
+ * The sample at the end catches a check that stops after the first sample.
  *
- * Input far outside the documented range is not covered here: a sample around
- * 1e30 is 1e30 times full scale, and overflows the psycho acoustic model's own
- * arithmetic long after this screen has passed it. That predates the screen and
- * is not what it is for.
+ * The functions must still accept the values at the documented limits: full
+ * scale (+/- 1, or +/- 32768 for the variant scaled like short int), the
+ * smallest denormal, and negative zero. The check reads the exponent bits. A
+ * test that only passes NaN does not notice if the check also rejects normal
+ * audio. The integer encode functions cannot express a non-finite value. They
+ * must still encode normally.
  *
- * The bit patterns are assembled by hand rather than taken from the @c NAN and
- * @c INFINITY macros, and each one reaches its buffer through a volatile
- * object. These tests are compiled with the same fast floating point maths as
- * the library, under which a constant the compiler can recognise as NaN or
- * infinite is folded away long before the encoder sees it. A test that cannot
- * deliver a non-finite sample says nothing about the screen either way.
+ * This file does not test input far outside the documented range. A separate
+ * check in the library rejects it: a sample louder than 4096 times full scale
+ * also returns #LAME_BADINPUTDATA (see lame_encode_buffer()).
  *
- * These are library-level tests: they link libmp3lame and call the exported
- * API directly, so no frontend translation unit is compiled in.
+ * The tests build the bit patterns by hand and do not use the @c NAN and
+ * @c INFINITY macros. Each value also passes through a volatile object on its
+ * way to the buffer. The tests use the same fast floating point math as the
+ * library. With it, the compiler can remove a constant that it knows is NaN or
+ * infinite, before the encoder sees it. A test that cannot pass a non-finite
+ * sample to the encoder proves nothing about the check.
+ *
+ * These are library-level tests. They link libmp3lame and call the exported
+ * API directly. No frontend translation unit is compiled in.
  */
 
 #ifdef HAVE_CONFIG_H
@@ -48,75 +49,15 @@
 #include "test_unused.h"
 
 #include "lame.h"
+#include "test_fixture.h"
+#include "test_float_bits.h"
 
-/** @brief Samples per channel handed to the encoder in one call. */
+/** @brief Samples per channel passed to the encoder in one call. */
 #define NSAMPLES 4608
-/** @brief Size of the output buffer, per the worst case in lame.h. */
+/** @brief Size of the output buffer, from the worst case in lame.h. */
 #define MP3BUF_SIZE (NSAMPLES * 5 / 4 + 7200)
 
-/** @brief Assembles a float from its IEEE-754 bit pattern, unfoldable by the compiler. */
-static float
-float_from_bits(uint32_t bits)
-{
-    uint32_t volatile opaque = bits;
-    uint32_t pattern;
-    float   f;
-
-    pattern = opaque;
-    memcpy(&f, &pattern, sizeof f);
-    return f;
-}
-
-/** @brief Assembles a double from its IEEE-754 bit pattern, unfoldable by the compiler. */
-static double
-double_from_bits(uint64_t bits)
-{
-    uint64_t volatile opaque = bits;
-    uint64_t pattern;
-    double  d;
-
-    pattern = opaque;
-    memcpy(&d, &pattern, sizeof d);
-    return d;
-}
-
-static float
-float_nan(void)
-{
-    return float_from_bits(0x7FC00000u); /* quiet NaN */
-}
-
-static float
-float_inf(int negative)
-{
-    return float_from_bits(negative ? 0xFF800000u : 0x7F800000u);
-}
-
-static double
-double_nan(void)
-{
-    return double_from_bits(0x7FF8000000000000ull);
-}
-
-/**
- * @brief Creates an encoder configured for the given channel count.
- * @param channels number of input channels.
- * @return an initialized handle; the test fails if setup does not succeed.
- */
-static lame_t
-encoder_new(int channels)
-{
-    lame_t  gfp = lame_init();
-
-    assert_non_null(gfp);
-    assert_int_equal(lame_set_num_channels(gfp, channels), 0);
-    assert_int_equal(lame_set_in_samplerate(gfp, 44100), 0);
-    assert_int_equal(lame_set_VBR(gfp, vbr_default), 0);
-    assert_int_equal(lame_init_params(gfp), 0);
-    return gfp;
-}
-
-/** @brief Fills a buffer with a valid, finite ramp scaled to +/- 1 full scale. */
+/** @brief Fills a float buffer with a finite ramp from -0.25 to +0.25 full scale. */
 static void
 fill_valid_float(float *buf, int n)
 {
@@ -127,7 +68,7 @@ fill_valid_float(float *buf, int n)
     }
 }
 
-/** @brief Fills a buffer with a valid, finite ramp scaled to +/- 1 full scale. */
+/** @brief Does the same as fill_valid_float(), for a double buffer. */
 static void
 fill_valid_double(double *buf, int n)
 {
@@ -141,7 +82,8 @@ fill_valid_double(double *buf, int n)
 /* --- the scaled 'float' entry point ------------------------------------- */
 
 /**
- * @brief Valid input is encoded, so the screen does not reject everything.
+ * @brief Checks that valid input is encoded. So the check does not reject
+ *        everything.
  * @param state cmocka fixture state (unused).
  */
 static void
@@ -149,7 +91,7 @@ test_ieee_float_valid_is_encoded(LAME_UNUSED void **state)
 {
     static float l[NSAMPLES], r[NSAMPLES];
     unsigned char mp3[MP3BUF_SIZE];
-    lame_t  gfp = encoder_new(2);
+    lame_t  gfp = lame_fixture_encoder(2);
 
     fill_valid_float(l, NSAMPLES);
     fill_valid_float(r, NSAMPLES);
@@ -158,64 +100,65 @@ test_ieee_float_valid_is_encoded(LAME_UNUSED void **state)
 }
 
 /**
- * @brief A NaN in the left channel is rejected.
+ * @brief Encodes valid stereo input with one sample replaced, through
+ *        lame_encode_buffer_ieee_float().
+ * @param channel  the channel of the sample: 0 for the left, 1 for the right.
+ * @param index    the index of the sample.
+ * @param bad      the value that replaces it.
+ * @return the result of the encode call.
+ */
+static int
+ieee_float_encode_with(int channel, int index, float bad)
+{
+    static float l[NSAMPLES], r[NSAMPLES];
+    unsigned char mp3[MP3BUF_SIZE];
+    lame_t  gfp = lame_fixture_encoder(2);
+    int     rc;
+
+    fill_valid_float(l, NSAMPLES);
+    fill_valid_float(r, NSAMPLES);
+    if (channel == 0)
+        l[index] = bad;
+    else
+        r[index] = bad;
+    rc = lame_encode_buffer_ieee_float(gfp, l, r, NSAMPLES, mp3, sizeof mp3);
+    lame_close(gfp);
+    return rc;
+}
+
+/**
+ * @brief Checks that a NaN in the left channel is rejected.
  * @param state cmocka fixture state (unused).
  */
 static void
 test_ieee_float_nan_left(LAME_UNUSED void **state)
 {
-    static float l[NSAMPLES], r[NSAMPLES];
-    unsigned char mp3[MP3BUF_SIZE];
-    lame_t  gfp = encoder_new(2);
-
-    fill_valid_float(l, NSAMPLES);
-    fill_valid_float(r, NSAMPLES);
-    l[0] = float_nan();
-    assert_int_equal(lame_encode_buffer_ieee_float(gfp, l, r, NSAMPLES, mp3, sizeof mp3),
-                     LAME_BADINPUTDATA);
-    lame_close(gfp);
+    assert_int_equal(ieee_float_encode_with(0, 0, float_nan()), LAME_BADINPUTDATA);
 }
 
 /**
- * @brief A NaN in the right channel is rejected too, not just the left.
+ * @brief Checks that a NaN in the right channel is also rejected.
  * @param state cmocka fixture state (unused).
  */
 static void
 test_ieee_float_nan_right(LAME_UNUSED void **state)
 {
-    static float l[NSAMPLES], r[NSAMPLES];
-    unsigned char mp3[MP3BUF_SIZE];
-    lame_t  gfp = encoder_new(2);
-
-    fill_valid_float(l, NSAMPLES);
-    fill_valid_float(r, NSAMPLES);
-    r[0] = float_nan();
-    assert_int_equal(lame_encode_buffer_ieee_float(gfp, l, r, NSAMPLES, mp3, sizeof mp3),
-                     LAME_BADINPUTDATA);
-    lame_close(gfp);
+    assert_int_equal(ieee_float_encode_with(1, 0, float_nan()), LAME_BADINPUTDATA);
 }
 
 /**
- * @brief A non-finite sample at the very end is found, so the whole buffer is screened.
+ * @brief Checks that a NaN in the last sample is found. So the check reads the
+ *        whole buffer.
  * @param state cmocka fixture state (unused).
  */
 static void
 test_ieee_float_nan_last_sample(LAME_UNUSED void **state)
 {
-    static float l[NSAMPLES], r[NSAMPLES];
-    unsigned char mp3[MP3BUF_SIZE];
-    lame_t  gfp = encoder_new(2);
-
-    fill_valid_float(l, NSAMPLES);
-    fill_valid_float(r, NSAMPLES);
-    l[NSAMPLES - 1] = float_nan();
-    assert_int_equal(lame_encode_buffer_ieee_float(gfp, l, r, NSAMPLES, mp3, sizeof mp3),
-                     LAME_BADINPUTDATA);
-    lame_close(gfp);
+    assert_int_equal(ieee_float_encode_with(0, NSAMPLES - 1, float_nan()), LAME_BADINPUTDATA);
 }
 
 /**
- * @brief Both infinities are rejected.
+ * @brief Checks that both infinities are rejected.
  * @param state cmocka fixture state (unused).
  */
 static void
@@ -223,7 +166,7 @@ test_ieee_float_infinities(LAME_UNUSED void **state)
 {
     static float l[NSAMPLES], r[NSAMPLES];
     unsigned char mp3[MP3BUF_SIZE];
-    lame_t  gfp = encoder_new(2);
+    lame_t  gfp = lame_fixture_encoder(2);
 
     fill_valid_float(l, NSAMPLES);
     fill_valid_float(r, NSAMPLES);
@@ -239,7 +182,8 @@ test_ieee_float_infinities(LAME_UNUSED void **state)
 }
 
 /**
- * @brief The documented +/- 1 full scale boundary is accepted, at and around it.
+ * @brief Checks that values at and near the documented full scale limit of
+ *        +/- 1 are accepted.
  * @param state cmocka fixture state (unused).
  */
 static void
@@ -247,7 +191,7 @@ test_ieee_float_boundary_accepted(LAME_UNUSED void **state)
 {
     static float l[NSAMPLES], r[NSAMPLES];
     unsigned char mp3[MP3BUF_SIZE];
-    lame_t  gfp = encoder_new(2);
+    lame_t  gfp = lame_fixture_encoder(2);
 
     fill_valid_float(l, NSAMPLES);
     fill_valid_float(r, NSAMPLES);
@@ -261,7 +205,8 @@ test_ieee_float_boundary_accepted(LAME_UNUSED void **state)
 }
 
 /**
- * @brief The documented +/- 32768 boundary of the short int scaled variant is accepted.
+ * @brief Checks that the documented limit of +/- 32768 is accepted by the
+ *        variant scaled like short int.
  * @param state cmocka fixture state (unused).
  */
 static void
@@ -269,7 +214,7 @@ test_buffer_float_boundary_accepted(LAME_UNUSED void **state)
 {
     static float l[NSAMPLES], r[NSAMPLES];
     unsigned char mp3[MP3BUF_SIZE];
-    lame_t  gfp = encoder_new(2);
+    lame_t  gfp = lame_fixture_encoder(2);
     int     i;
 
     for (i = 0; i < NSAMPLES; i++) {
@@ -281,7 +226,8 @@ test_buffer_float_boundary_accepted(LAME_UNUSED void **state)
 }
 
 /**
- * @brief The documented +/- 1 full scale boundary of the double variant is accepted.
+ * @brief Checks that the documented full scale limit of +/- 1 is accepted by
+ *        the double variant.
  * @param state cmocka fixture state (unused).
  */
 static void
@@ -289,7 +235,7 @@ test_ieee_double_boundary_accepted(LAME_UNUSED void **state)
 {
     static double l[NSAMPLES], r[NSAMPLES];
     unsigned char mp3[MP3BUF_SIZE];
-    lame_t  gfp = encoder_new(2);
+    lame_t  gfp = lame_fixture_encoder(2);
     int     i;
 
     for (i = 0; i < NSAMPLES; i++) {
@@ -301,7 +247,8 @@ test_ieee_double_boundary_accepted(LAME_UNUSED void **state)
 }
 
 /**
- * @brief A refused buffer does not leave the encoder in a broken state.
+ * @brief Checks that a rejected buffer does not leave the encoder instance in
+ *        a broken state.
  * @param state cmocka fixture state (unused).
  */
 static void
@@ -309,7 +256,7 @@ test_ieee_float_recovers_after_rejection(LAME_UNUSED void **state)
 {
     static float l[NSAMPLES], r[NSAMPLES];
     unsigned char mp3[MP3BUF_SIZE];
-    lame_t  gfp = encoder_new(2);
+    lame_t  gfp = lame_fixture_encoder(2);
 
     fill_valid_float(l, NSAMPLES);
     fill_valid_float(r, NSAMPLES);
@@ -324,7 +271,7 @@ test_ieee_float_recovers_after_rejection(LAME_UNUSED void **state)
 }
 
 /**
- * @brief The mono path screens its single buffer.
+ * @brief Checks that a NaN in the single buffer of a mono encode is rejected.
  * @param state cmocka fixture state (unused).
  */
 static void
@@ -332,7 +279,7 @@ test_ieee_float_mono_nan(LAME_UNUSED void **state)
 {
     static float l[NSAMPLES];
     unsigned char mp3[MP3BUF_SIZE];
-    lame_t  gfp = encoder_new(1);
+    lame_t  gfp = lame_fixture_encoder(1);
 
     fill_valid_float(l, NSAMPLES);
     l[5] = float_nan();
@@ -344,7 +291,8 @@ test_ieee_float_mono_nan(LAME_UNUSED void **state)
 /* --- the other floating point entry points ------------------------------ */
 
 /**
- * @brief lame_encode_buffer_float(), scaled to short int range, rejects a NaN.
+ * @brief Checks that lame_encode_buffer_float(), which uses the short int
+ *        range, rejects a NaN.
  * @param state cmocka fixture state (unused).
  */
 static void
@@ -352,7 +300,7 @@ test_buffer_float_nan(LAME_UNUSED void **state)
 {
     static float l[NSAMPLES], r[NSAMPLES];
     unsigned char mp3[MP3BUF_SIZE];
-    lame_t  gfp = encoder_new(2);
+    lame_t  gfp = lame_fixture_encoder(2);
     int     i;
 
     for (i = 0; i < NSAMPLES; i++) {
@@ -366,7 +314,8 @@ test_buffer_float_nan(LAME_UNUSED void **state)
 }
 
 /**
- * @brief The interleaved float entry point rejects a NaN in either channel slot.
+ * @brief Checks that the interleaved float function rejects a NaN in the
+ *        right channel slot.
  * @param state cmocka fixture state (unused).
  */
 static void
@@ -374,7 +323,7 @@ test_interleaved_ieee_float_nan(LAME_UNUSED void **state)
 {
     static float pcm[2 * NSAMPLES];
     unsigned char mp3[MP3BUF_SIZE];
-    lame_t  gfp = encoder_new(2);
+    lame_t  gfp = lame_fixture_encoder(2);
 
     fill_valid_float(pcm, 2 * NSAMPLES);
     pcm[1] = float_nan(); /* right channel of the first frame */
@@ -384,7 +333,7 @@ test_interleaved_ieee_float_nan(LAME_UNUSED void **state)
 }
 
 /**
- * @brief The double entry point rejects a NaN.
+ * @brief Checks that the double function rejects a NaN.
  * @param state cmocka fixture state (unused).
  */
 static void
@@ -392,7 +341,7 @@ test_ieee_double_nan(LAME_UNUSED void **state)
 {
     static double l[NSAMPLES], r[NSAMPLES];
     unsigned char mp3[MP3BUF_SIZE];
-    lame_t  gfp = encoder_new(2);
+    lame_t  gfp = lame_fixture_encoder(2);
 
     fill_valid_double(l, NSAMPLES);
     fill_valid_double(r, NSAMPLES);
@@ -403,7 +352,7 @@ test_ieee_double_nan(LAME_UNUSED void **state)
 }
 
 /**
- * @brief The interleaved double entry point rejects a NaN.
+ * @brief Checks that the interleaved double function rejects a NaN.
  * @param state cmocka fixture state (unused).
  */
 static void
@@ -411,7 +360,7 @@ test_interleaved_ieee_double_nan(LAME_UNUSED void **state)
 {
     static double pcm[2 * NSAMPLES];
     unsigned char mp3[MP3BUF_SIZE];
-    lame_t  gfp = encoder_new(2);
+    lame_t  gfp = lame_fixture_encoder(2);
 
     fill_valid_double(pcm, 2 * NSAMPLES);
     pcm[2] = double_nan();
@@ -423,7 +372,8 @@ test_interleaved_ieee_double_nan(LAME_UNUSED void **state)
 /* --- the integer entry points are untouched ----------------------------- */
 
 /**
- * @brief Integer input cannot be non-finite and is still encoded.
+ * @brief Checks that integer input, which cannot be non-finite, is still
+ *        encoded.
  * @param state cmocka fixture state (unused).
  */
 static void
@@ -431,7 +381,7 @@ test_short_int_still_encodes(LAME_UNUSED void **state)
 {
     static short int l[NSAMPLES], r[NSAMPLES];
     unsigned char mp3[MP3BUF_SIZE];
-    lame_t  gfp = encoder_new(2);
+    lame_t  gfp = lame_fixture_encoder(2);
     int     i;
 
     for (i = 0; i < NSAMPLES; i++) {

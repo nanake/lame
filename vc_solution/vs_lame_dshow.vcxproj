@@ -32,27 +32,31 @@
   </ImportGroup>
   <ImportGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'" Label="PropertySheets">
     <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
-    <Import Project="vs_win71sdk_config.props" />
+    <Import Project="vs_dshow_config.props" />
+    <Import Project="vs_clients_config.props" />
     <Import Project="vs_lame_config.props" />
   </ImportGroup>
   <ImportGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'" Label="PropertySheets">
     <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
-    <Import Project="vs_win71sdk_config.props" />
+    <Import Project="vs_dshow_config.props" />
+    <Import Project="vs_clients_config.props" />
     <Import Project="vs_lame_config.props" />
   </ImportGroup>
   <PropertyGroup Label="UserMacros" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
+    <TargetName>lame</TargetName>
     <TargetExt>.ax</TargetExt>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
+    <TargetName>lame</TargetName>
     <TargetExt>.ax</TargetExt>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <ClCompile>
       <Optimization>Disabled</Optimization>
-      <AdditionalIncludeDirectories>..\include;..\DShow;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>..\include;..\DShow;..\Dll;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>DEBUG;INC_OLE2;WINVER=0x0400;_X86_=1;STRICT;_WINDOWS;WIN32;STDC_HEADERS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
-      <RuntimeLibrary>MultiThreadedDebugDLL</RuntimeLibrary>
+      <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
       <CallingConvention>StdCall</CallingConvention>
     </ClCompile>
     <ResourceCompile>
@@ -60,21 +64,18 @@
       <Culture>0x0409</Culture>
     </ResourceCompile>
     <Link>
-      <AdditionalDependencies>strmbasD.lib;vfw32.lib;winmm.lib;version.lib;Comdlg32.lib;comctl32.lib;quartz.lib;%(AdditionalDependencies)</AdditionalDependencies>
-      <OutputFile>$(OutDir)lame.ax</OutputFile>
+      <AdditionalDependencies>strmiids.lib;vfw32.lib;winmm.lib;version.lib;Comdlg32.lib;comctl32.lib;quartz.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <ModuleDefinitionFile>..\DShow\Mpegac.def</ModuleDefinitionFile>
       <SubSystem>Windows</SubSystem>
-      <EntryPointSymbol>DllEntryPoint%4012</EntryPointSymbol>
-      <AdditionalLibraryDirectories>..\DShow;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
     <ClCompile>
       <Optimization>MaxSpeed</Optimization>
       <InlineFunctionExpansion>OnlyExplicitInline</InlineFunctionExpansion>
-      <AdditionalIncludeDirectories>..\include;..\DShow;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>..\include;..\DShow;..\Dll;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>NDEBUG;INC_OLE2;STRICT;WINVER=0x0400;_X86_=1;_WINDOWS;WIN32;STDC_HEADERS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
-      <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
+      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
       <CallingConvention>StdCall</CallingConvention>
     </ClCompile>
     <ResourceCompile>
@@ -82,12 +83,9 @@
       <Culture>0x0409</Culture>
     </ResourceCompile>
     <Link>
-      <AdditionalDependencies>strmbase.lib;vfw32.lib;winmm.lib;version.lib;Comdlg32.lib;comctl32.lib;quartz.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>strmiids.lib;vfw32.lib;winmm.lib;version.lib;Comdlg32.lib;comctl32.lib;quartz.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <ModuleDefinitionFile>..\DShow\Mpegac.def</ModuleDefinitionFile>
       <SubSystem>Windows</SubSystem>
-      <EntryPointSymbol>DllEntryPoint%4012</EntryPointSymbol>
-      <OutputFile>$(OutDir)lame.ax</OutputFile>
-      <AdditionalLibraryDirectories>..\DShow;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
@@ -97,6 +95,9 @@
     <ClCompile Include="..\DShow\PropPage.cpp" />
     <ClCompile Include="..\DShow\PropPage_adv.cpp" />
     <ClCompile Include="..\DShow\REG.CPP" />
+    <ClCompile Include="..\DShow\SystemFontPage.cpp" />
+    <ClCompile Include="..\ACM\DialogFont.cpp" />
+    <ClCompile Include="..\ACM\SettingText.cpp" />
   </ItemGroup>
   <ItemGroup>
     <None Include="..\DShow\Mpegac.def" />
@@ -112,17 +113,21 @@
     <ClInclude Include="..\DShow\Mpegac.h" />
     <ClInclude Include="..\DShow\PropPage.h" />
     <ClInclude Include="..\DShow\PropPage_adv.h" />
+    <ClInclude Include="..\DShow\SystemFontPage.h" />
+    <ClInclude Include="..\ACM\DialogFont.h" />
+    <ClInclude Include="..\ACM\SettingText.h" />
     <ClInclude Include="..\DShow\reg.h" />
     <ClInclude Include="..\DShow\resource.h" />
     <ClInclude Include="..\DShow\uids.h" />
+    <ClInclude Include="..\Dll\lametag_scan.h" />
     <ClInclude Include="..\include\lame.h" />
   </ItemGroup>
   <ItemGroup>
-    <Image Include="..\DShow\elogo.ico" />
+    <Image Include="..\ACM\lame.ico" />
   </ItemGroup>
   <ItemGroup>
-    <ProjectReference Include="vs_libmp3lame.vcxproj">
-      <Project>{20536101-3b0e-43ef-94f9-080d595dac57}</Project>
+    <ProjectReference Include="vs_libmp3lame_nodec.vcxproj">
+      <Project>{e1ef883d-7969-4f80-a91e-f260807f2961}</Project>
     </ProjectReference>
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
